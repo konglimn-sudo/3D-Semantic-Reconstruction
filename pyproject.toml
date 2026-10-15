@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "garage-recon"
+version = "0.1.0"
+description = "Vehicle-based 3D reconstruction and automatic semantic labelling of multi-level underground parking garages"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.22",
+  "scipy>=1.8",
+  "pyyaml>=6",
+  "opencv-python>=4.6",
+  "scikit-image>=0.20",
+  "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+las = ["laspy>=2.4"]
+rosbag = ["rosbags>=0.9"]
+dev = ["pytest>=7", "rosbags>=0.9"]
+
+[project.scripts]
+garage-recon = "garage_recon.cli:main"
+
+[tool.scikit-build]
+wheel.packages = ["python/garage_recon"]
+cmake.build-type = "Release"
+
+[tool.scikit-build.cmake.define]
+GR_BUILD_TESTS = "OFF"
+GR_INPLACE = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]

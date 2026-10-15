@@ -1,0 +1,22 @@
+# Reconstruction settings for the FusionPortableV2 handheld rig (STIM300,
+# Ouster OS1-128), from the trial on handheld_underground00 (2026-10-14).
+# Use with: recon --config this.yaml (after convert with
+# fusionportable_v2_handheld.yaml).
+#
+# Tactical-grade IMU: turn-on accelerometer bias of a few mg. On a long
+# straight walk the horizontal accelerometer bias cannot be told from a tilt,
+# and the default (consumer-grade) prior of 0.2 m/s^2 let the bias absorb
+# the LiDAR pitch drift (path tilted by 3 %).
+backend:
+  accel_bias_prior: 0.03
+  gyro_bias_prior: 0.002
+# The plane BA bent this 400 m loop-free corridor by +-2 m vertically against
+# the tracker ground truth, with or without IMU factors, and also with
+# range / incidence weighting (ba.angular_sigma): the sweeps carry a
+# systematic error (floor 3-7 cm high at 15-20 m in every direction). Off
+# until the LiDAR intrinsics are calibrated.
+ba:
+  enabled: false
+# 1800+ images per camera: label every 10th.
+frames:
+  frame_stride: 10

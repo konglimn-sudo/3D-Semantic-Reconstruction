@@ -1,0 +1,14 @@
+# Google C++ style (https://google.github.io/styleguide/cppguide.html).
+BasedOnStyle: Google
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<.*\.h>'                # C system headers
+    Priority: 1
+  - Regex: '^<'                      # C++ standard library
+    Priority: 2
+  - Regex: '^"(Eigen|pybind11)/'     # other libraries
+    Priority: 3
+  - Regex: '.*'                      # this project
+    Priority: 4

@@ -1,0 +1,268 @@
+"""Section 4 orchestration: trips -> pose set -> static map -> levels -> BEV.
+
+Odometry, loop closure, the pose graph (IMU preintegration, wheel and bias
+factors), the continuous-time trajectory, camera calibration, map
+accumulation and dynamic points run in the C++ core; the stages here load
+the inputs, call it and write the work directory.
+
+Stages:
+    odometry     per-trip LiDAR odometry and keyframe sweeps (kf/)
+    graph        loops + pose graph (IMU bias and velocity per keyframe) +
+                 LiDAR bundle adjustment (plane factors)
+    trajectory   the pose set (continuous trajectories + rig calibration);
+                 keyframe sweeps deskewed again with it (kf_final/)
+    calibration  camera time offsets and extrinsics (needs a matcher)
+    map          static point map (observations fused, sigma per point),
+                 levels, dynamic points
+    bev          per-level rasters
+    texture      floor orthophoto from the fisheyes
+
+Work directory layout:
+    trips/<trip>/odometry.{npz,tum}, kf/, kf_final/, poses.{npz,tum}
+    graph/kf_poses.npz, loops.json, summary.json
+    pose_set/pose_set.json, <trip>.npz;  calibration.json
+    map/point_map.npz, levels.json, floor_grids.npz
+    bev/level_<i>.npz (+ PNG previews)
+    provenance.json
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import time
+
+import numpy as np
+
+from garage_recon import config as config_lib
+from garage_recon import core_config
+from garage_recon import provenance
+from garage_recon.data import dataset
+from garage_recon.models import registry
+from garage_recon.recon import backend
+from garage_recon.recon import bev
+from garage_recon.recon import calibration
+from garage_recon.recon import floor_texture
+from garage_recon.recon import keyframes as keyframes_lib
+from garage_recon.recon import levels as levels_lib
+from garage_recon.recon import odometry
+from garage_recon.recon import pose_set as pose_set_lib
+from garage_recon.recon import static_map
+from garage_recon.recon import trajectory
+
+STAGES = ("odometry", "graph", "trajectory", "calibration", "map", "bev",
+          "texture")
+
+
+class ReconPipeline:
+    """Runs and resumes the section 4 stages on a work directory."""
+
+    def __init__(self, trip_dirs, work_dir, cfg, log=print,
+                 models: registry.ModelSuite | None = None):
+        self.datasets = [dataset.TripDataset(d) for d in trip_dirs]
+        self.work = pathlib.Path(work_dir)
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.cfg = cfg
+        self.log = log
+        self.models = models or registry.ModelSuite()
+        self._pose_set = None
+        config_lib.save_config(cfg, self.work / "config.used.yaml")
+
+    # ------------------------------------------------------------- helpers
+    def trip_dir(self, data: dataset.TripDataset) -> pathlib.Path:
+        return self.work / "trips" / data.trip_id
+
+    def odometries(self) -> list[odometry.TripOdometry]:
+        return [odometry.TripOdometry.load(d.trip_id, self.trip_dir(d))
+                for d in self.datasets]
+
+    def keyframes(self, final: bool = True) -> keyframes_lib.KeyframeSet:
+        """Keyframes; `final` selects the sweeps of the final trajectory."""
+        odoms = self.odometries()
+        final_dir = self.trip_dir(self.datasets[0]) / keyframes_lib.FINAL_SWEEPS
+        sweeps = (keyframes_lib.FINAL_SWEEPS if final and final_dir.is_dir()
+                  else keyframes_lib.ODOMETRY_SWEEPS)
+        return keyframes_lib.KeyframeSet.from_odometry(odoms, sweeps)
+
+    def pose_set(self) -> pose_set_lib.PoseSet:
+        """The current pose set (cached until a stage replaces it)."""
+        if self._pose_set is None:
+            self._pose_set = pose_set_lib.PoseSet.load(self.work,
+                                                       self.datasets)
+        return self._pose_set
+
+    def _set_pose_set(self, pose_set: pose_set_lib.PoseSet) -> None:
+        pose_set.save(self.work)
+        self._pose_set = pose_set
+
+    def kf_poses(self, keyframes: keyframes_lib.KeyframeSet | None = None
+                 ) -> np.ndarray:
+        """(K, 4, 4) world <- lidar of the keyframes, from the pose set."""
+        keyframes = keyframes or self.keyframes()
+        return calibration.keyframe_poses(keyframes, self.pose_set())
+
+    def vehicle_poses(self, data: dataset.TripDataset
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        """(stamps, world <- vehicle) at the LiDAR frames, from the pose set."""
+        trip = self.pose_set().trips[self.pose_set().index(data.trip_id)]
+        return trip.knot_stamps, trip.knot_poses
+
+    def point_map(self) -> static_map.PointMap:
+        return static_map.PointMap.load(self.work / "map" / "point_map.npz")
+
+    def levels(self) -> levels_lib.LevelModel:
+        return levels_lib.LevelModel.load(self.work / "map")
+
+    def record(self, stage: str, uses_cameras: bool) -> None:
+        provenance.record(self.work, f"recon.{stage}", self.pose_set(),
+                          uses_cameras)
+
+    def run(self, stages=STAGES) -> None:
+        for stage in stages:
+            start = time.time()
+            getattr(self, f"stage_{stage}")()
+            self.log(f"== stage {stage} done in {time.time() - start:.1f}s")
+
+    # -------------------------------------------------------------- stages
+    def stage_odometry(self) -> None:
+        """Per-trip LiDAR odometry and keyframe sweeps."""
+        for data in self.datasets:
+            odometry.run_trip_odometry(data, self.cfg, self.trip_dir(data),
+                                       self.log)
+
+    def stage_graph(self) -> None:
+        """Loops and the pose graph; IMU bias / velocity per keyframe."""
+        odoms = self.odometries()
+        keyframes = keyframes_lib.KeyframeSet.from_odometry(odoms)
+        result = backend.run_graph(keyframes, self.datasets, odoms, self.cfg,
+                                   self.log)
+        poses = result["poses"]
+        out = self.work / "graph"
+        out.mkdir(parents=True, exist_ok=True)
+        np.savez(out / "kf_poses.npz", poses=poses, odom=keyframes.odom,
+                 trip=keyframes.trip, frame=keyframes.frame,
+                 stamp=keyframes.stamp, velocity=result["velocities"],
+                 bias=result["biases"],
+                 inertial_valid=result["inertial_valid"])
+        (out / "loops.json").write_text(
+            json.dumps([backend.loop_json(lp) for lp in result["loops"]]))
+        summary = dict(result["summary"])
+        summary.update({"keyframes": len(keyframes),
+                        "loops": len(result["loops"]),
+                        "anchors": len(result["anchors"]),
+                        "gravity_factors": len(result["gravity"]),
+                        "loops_tested": result["loops_tested"],
+                        "loops_verified": result["loops_verified"],
+                        "ba_rounds": result["ba_rounds"]})
+        valid = np.asarray(result["inertial_valid"], bool)
+        for t, data in enumerate(self.datasets):
+            mine = valid & (keyframes.trip == t) if valid.any() else valid
+            if not mine.any():
+                continue
+            mean = np.asarray(result["biases"])[mine].mean(axis=0)
+            summary[f"imu_bias_{data.trip_id}"] = {
+                "gyro_deg_s": np.degrees(mean[:3]).round(4).tolist(),
+                "accel_m_s2": mean[3:].round(4).tolist()}
+        (out / "summary.json").write_text(json.dumps(summary, indent=2))
+        for t, (data, odom) in enumerate(zip(self.datasets, odoms)):
+            lidar = backend.frame_poses(keyframes, poses, t, odom.stamps,
+                                        odom.lidar_poses)
+            trajectory.save_frame_poses(self.work, data.trip_id, odom.stamps,
+                                        lidar,
+                                        data.rig.primary_lidar.T_vehicle_lidar)
+
+    def stage_trajectory(self) -> None:
+        """Builds the pose set and re-deskews the keyframe sweeps."""
+        with np.load(self.work / "graph" / "kf_poses.npz") as z:
+            table = {k: z[k] for k in z.files}
+        frame_poses = []
+        for data in self.datasets:
+            with np.load(self.trip_dir(data) / "poses.npz") as z:
+                frame_poses.append((z["stamps"], z["lidar"]))
+        pose_set = trajectory.build_pose_set(self.datasets, frame_poses, table)
+        self._set_pose_set(pose_set)
+        stats = trajectory.redeskew_keyframes(pose_set, self.odometries(),
+                                              self.cfg, self.log)
+        self.log(f"[trajectory] pose set {pose_set.pose_set_id}: "
+                 f"{stats['keyframes']} sweeps re-deskewed, median point "
+                 f"shift {stats['median_shift_cm']} cm")
+        self.record("trajectory", uses_cameras=False)
+
+    def stage_calibration(self) -> None:
+        """Camera time offsets and extrinsics; a new pose set."""
+        if not self.cfg.calibration.enabled or self.models.matcher is None:
+            self.log("[calibration] skipped (disabled or no image matcher); "
+                     "cameras keep the rig.yaml calibration")
+            return
+        pose_set, report = calibration.calibrate_cameras(
+            self.pose_set(), self.keyframes(), self.models.matcher, self.cfg,
+            self.log)
+        self._set_pose_set(pose_set)
+        (self.work / "calibration.json").write_text(json.dumps(
+            {"pose_set_id": pose_set.pose_set_id, "cameras": report},
+            indent=1))
+        self.record("calibration", uses_cameras=True)
+
+    def stage_map(self) -> None:
+        """Static point map, levels and dynamic points."""
+        cfg = self.cfg
+        keyframes = self.keyframes()
+        poses = self.kf_poses(keyframes)
+        point_map = static_map.accumulate(
+            keyframes, poses, float(cfg.map.voxel), float(cfg.map.max_range),
+            core_config.fusion_config(cfg))
+        static_map.compute_normals(point_map, poses,
+                                   float(cfg.map.normal_radius))
+        paths = [self.vehicle_poses(d)[1] for d in self.datasets]
+        levels = levels_lib.detect_levels(paths, point_map.xyz,
+                                          point_map.normals, cfg, self.log)
+        point_map.level, point_map.height, point_map.on_ramp = levels.assign(
+            point_map.xyz)
+        if cfg.map.dynamic.enabled:
+            ego = [p[:, :3, 3] for p in paths]  # Vehicle origin on the floor.
+            point_map.dynamic = static_map.carve_dynamic(
+                point_map, keyframes, poses, cfg, self.log, ego_paths=ego)
+        else:
+            point_map.dynamic = np.zeros(len(point_map), bool)
+            point_map.dynamic_kind = np.zeros(len(point_map), np.uint8)
+        out = self.work / "map"
+        out.mkdir(parents=True, exist_ok=True)
+        point_map.save(out / "point_map.npz")
+        levels.save(out)
+        self.log(f"[map] {len(point_map)} points at {cfg.map.voxel} m")
+        self.record("map", uses_cameras=False)
+
+    def stage_bev(self) -> None:
+        """Per-level rasters (intensity, heights)."""
+        point_map, levels = self.point_map(), self.levels()
+        for lv in range(levels.n):
+            grid = bev.level_grid(point_map, lv, float(self.cfg.bev.res),
+                                  float(self.cfg.bev.margin))
+            rasters = bev.level_rasters(point_map, levels, grid, self.cfg)
+            path = self.work / "bev" / f"level_{lv}.npz"
+            bev.save_bev(path, grid, rasters)
+            bev.to_png(path.with_name(f"level_{lv}_intensity.png"),
+                       rasters["intensity"])
+            bev.to_png(path.with_name(f"level_{lv}_height.png"),
+                       rasters["height_max"], 0.0, 2.5)
+            self.log(f"[bev] level {lv}: {grid.width}x{grid.height} cells")
+        self.record("bev", uses_cameras=False)
+
+    def stage_texture(self) -> None:
+        """Floor orthophoto from the fisheye images."""
+        if not self.cfg.floor_texture.enabled or not any(
+                d.rig.fisheye_cameras for d in self.datasets):
+            self.log("[texture] skipped (disabled or no fisheye cameras)")
+            return
+        point_map, levels = self.point_map(), self.levels()
+        for lv in range(levels.n):
+            path = self.work / "bev" / f"level_{lv}.npz"
+            grid, rasters = bev.load_bev(path)
+            rgb, score, observations = floor_texture.fuse_floor_texture(
+                self.pose_set(), grid, rasters["floor_z"],
+                float(levels.z[lv]), point_map, self.cfg, self.log)
+            rasters.update({"rgb": rgb, "texture_score": score,
+                            "texture_nobs": observations})
+            bev.save_bev(path, grid, rasters)
+            bev.to_png(path.with_name(f"level_{lv}_rgb.png"), rgb)
+        self.record("texture", uses_cameras=True)

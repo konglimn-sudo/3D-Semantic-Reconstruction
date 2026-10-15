@@ -1,0 +1,367 @@
+# Default pipeline configuration. Override with `--config my.yaml`; nested keys
+# are deep-merged. Distances in metres, angles in degrees unless noted.
+
+odometry:
+  voxel_size: 0.4            # local map voxel (indoor: 0.3-0.5)
+  max_range: 50.0
+  min_range: 1.5             # drop returns from the vehicle body
+  initial_threshold: 1.0
+  min_motion_th: 0.1
+  max_icp_iters: 50
+  deskew: true
+  use_wheel_prior: true      # wheel speed + gyro motion prior when available
+  use_gyro_prior: true       # without wheels: gyro rotation + last velocity
+  external_trajectory: null  # TUM file per trip from an external LIO, e.g. "{trip}/lio.tum"
+
+keyframes:
+  distance: 1.0
+  angle: 10.0
+  voxel: 0.05                # storage resolution of keyframe sweeps
+
+loops:
+  enabled: true
+  stride: 2                  # test every n-th keyframe
+  min_index_gap: 30          # same-trip separation (keyframes)
+  search_radius: 12.0        # around the current estimate
+  level_gate: 1.5            # |dz| allowed between candidates
+  sc_rings: 20
+  sc_sectors: 60
+  sc_max_radius: 30.0
+  sc_threshold: 0.35
+  top_k: 3
+  submap_half_window: 3      # keyframes on each side of the target
+  icp_voxel: 0.2
+  icp_schedule: [2.0, 1.0, 0.5, 0.3]
+  min_fitness: 0.55
+  max_rmse: 0.12
+  max_correction: 4.0        # metres between odometry prior and ICP result
+  pcm_threshold: 0.5         # metres-equivalent cycle error
+  pcm_drift_per_m: 0.01
+
+backend:
+  odom_sigma_t: 0.02         # per keyframe step + drift per metre below
+  odom_sigma_t_per_m: 0.005
+  odom_sigma_r: 0.2
+  odom_sigma_r_per_m: 0.05
+  loop_sigma_t: 0.05
+  loop_sigma_r: 0.5
+  loop_robust_scale: 1.0     # Cauchy, sqrt(chi2) units
+  anchor_sigma_t: 0.05       # initial pose (INS at the entrance)
+  anchor_sigma_r: 0.3
+  gnss_sigma_scale: 1.0
+  # IMU preintegration between consecutive keyframes (velocity + bias per
+  # keyframe): roll / pitch through gravity, and the IMU bias estimate.
+  imu_factors: true
+  # Effective noise densities: the sensor's white noise inflated for
+  # vibration, scale / misalignment and timing errors (calibrate per vehicle:
+  # Allan variance times an inflation factor). Too small values let these
+  # errors bend the trajectory; too large ones lose roll / pitch.
+  imu_gyro_noise: 1.0e-2     # rad/s/sqrt(Hz)
+  imu_accel_noise: 0.2       # m/s^2/sqrt(Hz)
+  imu_gyro_bias_walk: 2.0e-5
+  imu_accel_bias_walk: 2.0e-4
+  gyro_bias_prior: 0.01      # rad/s around zero
+  accel_bias_prior: 0.2      # m/s^2 around zero
+  imu_max_dt: 5.0            # s; longer keyframe gaps get no IMU factor
+  wheel_factors: true        # wheel speed + non-holonomic body velocity
+  wheel_sigma: 0.05          # m/s along the vehicle x axis
+  wheel_lateral_sigma: 0.3   # m/s; loose: side-slip, and the vehicle frame
+                             # is not exactly aligned with the motion
+  # Accelerometer roll/pitch factors (the v1 alternative to the IMU factors;
+  # they ignore the accelerometer bias, do not enable both).
+  gravity: false
+  gravity_sigma_deg: 0.2
+  gravity_window: 0.25       # s, averaging around each keyframe
+  gravity_max_dev: 0.3       # m/s^2, reject windows with unexplained acceleration
+  gravity_max_yaw_rate: 3.0  # deg/s, no gravity factors while turning (side-slip)
+  iterations: 50
+
+ba:                          # LiDAR bundle adjustment (plane factors, joint with the IMU)
+  enabled: true
+  sweep_voxel: 0.1           # keyframe sweeps used
+  min_range: 1.0
+  max_range: 30.0            # distant structure constrains the ramp direction
+  voxel: 1.0                 # octree root voxel; split down to voxel / 2^max_depth
+  max_depth: 2
+  max_thickness: 0.04        # candidate plane: sqrt(l_min) of all points
+  min_extent: 0.1            # sqrt(l_mid) / voxel size
+  inlier_gate: 0.05          # refit on points within this of the plane ...
+  min_inlier_fraction: 0.9   # ... accepted if most points are inliers ...
+  max_rms: 0.02              # ... and thin; otherwise the voxel is split
+  min_points: 6              # per keyframe and plane
+  min_keyframes: 2
+  max_keyframes: 20          # per plane, evenly subsampled
+  point_sigma: 0.02
+  angular_sigma: 0.0         # rad; >0 down-weights distant grazing clusters (beam angle errors)
+  max_cluster_weight: 30     # information cap per keyframe and plane (points)
+  robust_scale: 3.0
+  rounds: 2
+  iterations: 10
+
+refine:                      # scan-to-map refinement, used when ba is disabled
+  enabled: false
+  iterations: 2
+  voxel: 0.2
+  max_corr: 0.5
+  sigma_t: 0.02
+  sigma_r: 0.2
+
+calibration:                 # camera time offset + extrinsic on the pose set
+  enabled: true              # needs an image matcher (models section)
+  cameras: null              # null: every camera of the rig
+  frame_stride: 1
+  anchor_step: 2             # every n-th image starts tracks ...
+  track_length: 4            # ... matched into the next images (views per track)
+  tracks_per_anchor: 60
+  query_grid: 8              # px between query points (matchers without their own)
+  surface_voxel: 0.05        # LiDAR surface for the landmark plane factors
+  normal_radius: 0.2
+  min_landmarks: 100         # quality gates; failing cameras keep rig.yaml
+  max_rms_after: 2.0         # px
+  solver:
+    estimate_time_offset: true
+    estimate_rotation: true
+    estimate_translation: true
+    pixel_sigma: 0.5
+    huber: 1.5
+    max_reprojection: 6.0
+    min_parallax_deg: 1.0
+    plane_sigma: 0.02
+    plane_radius: 0.2
+    time_offset_prior: 0.05
+    rotation_prior_deg: 2.0
+    translation_prior: 0.1
+    iterations: 15
+
+models:
+  backend: auto              # auto | oracle | none (oracle = synthetic ground truth)
+  oracle:
+    segmenter: {min_pixels: 20, split_probability: 0.05}
+    encoder: {dimension: 64, mask_noise: 0.35, text_noise: 0.1, confusion: 0.1}
+    matcher: {grid_step: 8, pixel_noise: 0.3, max_matches: 400}
+
+map:
+  voxel: 0.05
+  max_range: 20.0            # keyframe returns used for the map
+  normal_radius: 0.2
+  fusion:                    # per voxel: weighted mean of the observations, sigma per point
+    fuse: true               # false: the nearest observation wins (v1 map)
+    range_ratio: 2.0         # only observations within ratio x nearest range + margin
+    range_margin: 3.0
+    range_sigma: 0.01        # m, LiDAR ranging noise
+    angle_sigma_deg: 0.02    # pose / beam angle, sigma grows with range
+    sigma_floor: 0.003       # m, pose / calibration residual
+  dynamic:
+    enabled: true
+    ray_voxel: 0.1           # sweep downsampling for the range images
+    az_res: 0.8              # range-image bins (deg); ~LiDAR azimuth step
+    el_res: null             # null: match the measured beam spacing
+    el_min: -30.0
+    el_max: 20.0
+    max_range: 30.0
+    margin_abs: 0.3
+    margin_rel: 0.02
+    min_cos: 0.25            # ignore grazing rays
+    min_through: 2
+    min_ratio: 0.6           # within one session
+    min_height: 0.15         # never remove points below this height above floor
+    ego_radius: 0.9          # the ego vehicle's swept path is free space (half width)
+    ego_height: 2.0          # up to this height above the floor
+
+levels:
+  min_separation: 2.2
+  flat_slope: 0.03           # |dz/ds| below this = level floor
+  min_samples: 20
+  grid_res: 0.5
+  floor_band: 0.3
+  ceiling_band: 0.15
+
+bev:
+  res: 0.05
+  margin: 1.0
+  floor_tolerance: 0.06
+  object_max_height: 2.2     # height_max raster: objects on the floor, not the ceiling / services
+
+floor_texture:
+  enabled: true
+  res: 0.05
+  top_k: 5
+  max_range: 7.0
+  min_cos: 0.25
+  occlusion_test: true
+  depth_tol: 0.15
+
+stereo:
+  enabled: false
+  matcher: sgbm
+
+structure:
+  slice_heights: [0.5, 1.0, 1.5, 2.0, 2.4]
+  slice_thickness: 0.12
+  raster_res: 0.05
+  column_min: 0.2
+  column_max: 1.6
+  wall_min_length: 2.0
+  wall_max_thickness: 0.8
+  parapet_min_length: 6.0    # low walls must be longer than any car
+  grid_snap_tol: 0.35
+  measure_faces: true        # column faces fitted on the map points (false: raster box snapped to the grid)
+  mep_band: [0.05, 1.2]      # below the ceiling
+
+markings:
+  tophat_size: 0.6
+  min_contrast: 0.08
+  mad_k: 4.0                 # robust threshold: median + k * MAD of the top-hat
+  line_close_length: 0.5     # bridge gaps between LiDAR ring samples along a line
+  line_open_length: 0.5      # paint must form line pieces this long
+  min_length: 0.8
+  max_width: 0.35
+  min_width: 0.05
+  merge_gap: 2.5             # collinear fragments (occluded by cars) are joined
+  merge_angle: 4.0
+  merge_offset: 0.15
+  lane_min_length: 8.0
+  subpixel: true             # re-measure centre lines and ends on the orthophoto (vector_fit)
+  max_axis_angle: 5.0         # lines must follow the grid (relax for angled bays)
+
+slots:
+  width_range: [2.2, 3.4]
+  depth_range: [4.4, 6.2]
+  min_separator_length: 1.0  # partially visible separators still count
+  typical_depth: 5.3         # used to complete rows whose back ends are hidden
+  angle_tol: 10.0
+  row_overlap: 0.6
+  infer_tolerance: 0.25
+  occupied_height: 0.5
+  occupied_fraction: 0.25
+  visible_separator_share: 0.7  # a hidden separator this much on seen, empty floor ...
+  paint_ridge_share: 0.4        # ... and with less paint contrast than this share of the row's -> no inferred slots
+  inferred_max_overlap: 0.1     # inferred slots may overlap kept slots this much (area share)
+  inferred_min_evidence: 0.5    # share of an inferred slot on observed floor or under a parked car
+
+objects:
+  frame_stride: 1            # keyframes
+  cluster_res: 0.15
+  min_points: 30
+  height_range: [0.3, 2.6]
+  detect_max_range: 20.0
+  match_gate: 2.0
+  max_missed: 4
+  min_hits: 2
+  static_displacement: 1.0
+  typical_vehicle_size: [4.6, 1.85, 1.5]
+  moving_fraction: 0.15        # cluster share of moved points that marks a moving object
+  parked_min_points: 150       # aggregated points needed for a parked object
+  parked_min_extent: 1.0       # m, observed footprint
+  vehicle_max_height: 2.3
+  max_flat_height_span: 1.2    # m, spread of horizontal surfaces on one parked object
+  nms_radius: 2.5              # m, per-frame suppression of fragments of one object
+  structure_dilation: 1
+
+occupancy:
+  enabled: true
+  frame_stride: 4
+  range: [-10.0, 10.0, -10.0, 10.0, -0.4, 3.0]
+  voxel: 0.1
+  camera_stride: 6
+  camera_max_range: 12.0
+
+frames:
+  enabled: true
+  frame_stride: 1
+  max_range: 12.0
+  sample_step: 0.02
+  depth_abs_tol: 0.15
+  depth_rel_tol: 0.03
+  render_spacing: 0.05
+  write_label_images: true
+
+# Language route (2D models decide "what", the 3D identity field keeps the
+# views consistent): features -> identities -> language.
+features:
+  enabled: true
+  frame_stride: 1
+identities:                  # C++ IdentityAssociator
+  carrier_voxel: 0.1         # static map points that carry identities
+  max_range: 12.0
+  point_spacing: 0.1
+  depth_abs_tol: 0.15        # occlusion test of the covered points; map
+  depth_rel_tol: 0.03        # normals cull back faces and add tolerance at
+  grazing_pixels: 2.0        # grazing angles (pixel footprints / cos)
+  boundary: 1
+  min_mask_points: 8
+  min_common_points: 5
+  min_share: 0.6             # share of a mask's identified points to join
+  min_known_fraction: 0.1
+  merge_share: 0.2           # identities this large in one mask are merged ...
+  merge_coverage: 0.5        # ... if the mask covers this much of each one in view
+language:
+  min_score: 0.3             # cosine to the best class text embedding
+  range_scale: 5.0           # view weight 1 / (1 + range / range_scale)
+  border_weight: 0.5         # masks cut by the image border
+  write_label_images: false
+
+numbers:                     # slot numbers / zones read by OCR (models.ocr)
+  enabled: true
+  frame_stride: 2
+  max_range: 10.0            # m along the camera ray
+  max_distance: 0.5          # text on the floor within this of a slot outline (m)
+  min_score: 1.0             # summed OCR score of the winning text
+
+nav:                         # semantic navigation map (stage nav)
+  enabled: true
+  res: 0.1                   # grid (m)
+  margin: 2.0                # grid margin around the level's points (m)
+  vehicle:
+    width: 1.9               # the route keeps width / 2 + margin from obstacles
+    length: 4.8
+    height: 1.9
+    margin: 0.3              # lateral safety margin (m)
+    top_margin: 0.2          # overhead margin above the vehicle height (m)
+  floor_tolerance: 0.08      # |height| of floor points (m)
+  obstacle_min_height: 0.12  # static points from here up to height + top_margin block
+  obstacle_min_points: 2     # per cell
+  min_cell_observations: 6   # unclassified points: fused observations per cell to block
+  floor_closing: 2           # cells; closes the gaps between LiDAR rings
+  max_hole_area: 20.0        # m2; enclosed unobserved floor patches count as floor
+  min_spur: 3.0              # m; shorter dead ends of the aisle skeleton are dropped
+  simplify: 0.1              # m; polyline tolerance
+  entrance_offset: 0.3       # slot node this far outside the entrance (m)
+  max_approach: 10.0         # m from a slot entrance to the aisle centre line
+  max_ramp_attach: 12.0      # m from a ramp end to the aisle graph
+  max_origin_attach: 20.0
+  max_bridge: 30.0           # m; pieces of an aisle graph closer than this are joined by grid A* ...
+  bridge_tight_cost: 2.0     # ... through cells below the comfortable clearance (cost factor) ...
+  bridge_slot_cost: 4.0      # ... and across slots
+  blocked_cells: 4           # structure cells inside a slot that flag it ...
+  slot_inset: 0.3            # ... counted this far inside the outline (m)
+  max_driven_share: 0.3      # slots the vehicle drove through more than this are listed for review
+  coverage_radius: 1.5       # driven positions within this of an aisle edge count
+  origin: null               # [x, y, level]; null: where the first trip starts
+  level_names: null          # e.g. [B1, B2] (level 0 = top); null: L0, L1, ...
+  zones: []                  # [{name: A, level: 0, polygon: [[x, y], ...]}]
+
+rules:
+  slot_width_range: [2.2, 3.4]
+  slot_depth_range: [4.4, 6.2]
+  column_overlap_area: 0.1
+  aisle_max_distance: 4.0
+
+export:
+  las: true
+  lanelet2: true
+  map_origin: {lat: 31.2304, lon: 121.4737, alt: 0.0}  # placeholder origin for OSM lat/lon
+
+acceptance:                  # survey acceptance against a handheld result (cli accept)
+  method: control            # control: frame from control points only | auto: ICP of the whole map
+  control_columns_per_level: 4   # without surveyed control points: columns at the grid corners
+  icp_schedule: [1.0, 0.5, 0.25, 0.1]
+  icp_voxel: 0.1
+  surface_radius: 0.15       # local plane of the handheld surface
+  surface_max_distance: 0.3  # farther map points are unmatched (changes, clutter)
+  heatmap_cell: 0.25
+  thresholds:                # plan section 7 (initial values)
+    checkpoint_rmse: 0.02
+    surface_p95: 0.03
+    slot_corner_rms: 0.02
+    completeness: 0.9        # floor reproduced within 10 cm, where the vehicle observed it

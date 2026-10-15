@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>重建结果查看器</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: rgba(22, 26, 33, 0.92); --line: #2a313c;
+    --text: #e6e9ef; --muted: #9aa4b2; --accent: #4c9aff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 268px; max-height: calc(100% - 24px);
+    overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; backdrop-filter: blur(6px); }
+  #panel.collapsed > :not(header) { display: none; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  button { background: #1d2430; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 9px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; }
+  .row > label { color: var(--muted); flex: 0 0 34px; white-space: nowrap; }
+  .row > select { flex: 1; width: auto; min-width: 0; }
+  .row > input[type=range] { flex: 1; width: auto; min-width: 0; }
+  .subtitle { color: var(--text); margin-bottom: 2px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  select { width: 150px; background: #1d2430; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 6px; font: inherit; }
+  input[type=range] { width: 150px; accent-color: var(--accent); }
+  .checks label { display: flex; align-items: center; gap: 6px; color: var(--text); margin: 4px 0; }
+  .buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+  #legend { display: grid; grid-template-columns: 12px 1fr; gap: 3px 6px; align-items: center; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+  .ramp { height: 10px; border-radius: 3px; grid-column: 1 / -1;
+    background: linear-gradient(90deg, #30123b, #4686fb, #1ae4b6, #a2fc3c, #fabb39, #e4460a, #7a0403); }
+  .ramp-labels { grid-column: 1 / -1; display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  #stats { color: var(--muted); font-size: 12px; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted);
+    pointer-events: none; font-size: 14px; padding: 16px; text-align: center; }
+  .value { color: var(--text); font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
+  .goto { display: flex; gap: 6px; margin-top: 6px; }
+  .goto input { flex: 1; min-width: 0; background: #1d2430; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 7px; font: inherit; }
+  #route { margin-top: 6px; color: var(--muted); font-size: 12px; }
+  #route b { color: var(--text); font-weight: 600; }
+  @media (max-width: 600px) {
+    #panel { left: 8px; right: 8px; top: 8px; width: auto; max-height: 45%; }
+  }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="status">正在加载…</div>
+<div id="panel">
+  <header>
+    <h1>重建结果查看器</h1>
+    <button id="collapse" title="收起 / 展开面板">收起</button>
+  </header>
+  <div class="section">
+    <div class="row"><label for="dataset">数据</label><select id="dataset"></select></div>
+    <div class="row"><label for="mode">着色</label>
+      <select id="mode">
+        <option value="0">高程</option>
+        <option value="1">反射强度</option>
+        <option value="2">趟次</option>
+        <option value="3">语义类别</option>
+        <option value="4">点位精度 σ</option>
+        <option value="5">动态 / 变化</option>
+      </select></div>
+    <div class="row"><label for="size">点径</label><input id="size" type="range" min="1" max="12" step="0.5" value="3"><span class="value" id="sizeValue"></span></div>
+  </div>
+  <div class="section">
+    <div class="subtitle">离地高度范围</div>
+    <div class="row"><label for="clipLo">下限</label><input id="clipLo" type="range" min="-0.5" max="8" step="0.05" value="-0.5"><span class="value" id="clipLoValue"></span></div>
+    <div class="row"><label for="clipHi">上限</label><input id="clipHi" type="range" min="-0.5" max="8" step="0.05" value="8"><span class="value" id="clipHiValue"></span></div>
+    <div class="hint">把上限调到 2 m 左右可去掉顶板，看清车库内部。</div>
+  </div>
+  <div class="section checks">
+    <label><input type="checkbox" id="showDynamic"> 显示动态 / 变化的点</label>
+    <label><input type="checkbox" id="showTracks" checked> 轨迹</label>
+    <label><input type="checkbox" id="showSlots" checked> 车位</label>
+    <label><input type="checkbox" id="showMarkings" checked> 标线</label>
+    <label><input type="checkbox" id="showStructure" checked> 柱与墙</label>
+    <label><input type="checkbox" id="showNav" checked> 路网与车位目标点</label>
+  </div>
+  <div class="section" id="navSection">
+    <div class="subtitle">导航到车位</div>
+    <div class="goto"><input id="goal" list="goalList" placeholder="例如 B1 A区 12号，或车位编号" autocomplete="off"><button id="plan">规划</button></div>
+    <datalist id="goalList"></datalist>
+    <div id="route">从入口出发，沿路网规划到车位（路网与墙、柱保持半车宽以上的间距）。</div>
+  </div>
+  <div class="section">
+    <div class="buttons">
+      <button id="topView">俯视</button>
+      <button id="perspective">斜视</button>
+      <button id="reset">复位</button>
+    </div>
+  </div>
+  <div class="section"><div id="legend"></div></div>
+  <div class="section" id="stats"></div>
+  <div class="section hint">左键拖动旋转 · 右键或 Shift+左键拖动平移 · 滚轮在光标处缩放 · 双击点击处设为旋转中心</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+
+// ---------------------------------------------------------------- renderer
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x0e1116);
+$('view').appendChild(renderer.domElement);
+
+const scene3d = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.05, 5000);
+camera.up.set(0, 0, 1);  // Data is z-up.
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.zoomToCursor = true;
+controls.zoomSpeed = 2.0;
+controls.screenSpacePanning = true;
+controls.maxDistance = 3000;
+
+// ----------------------------------------------------------------- shaders
+const vertexShader = `
+  attribute float intensity; attribute float trip; attribute float label;
+  attribute float dynamic; attribute float sigma; attribute float height;
+  uniform int uMode; uniform float uSize; uniform float uProj; uniform vec2 uZ;
+  uniform vec2 uClip; uniform float uShowDynamic;
+  uniform vec3 uLabels[32]; uniform vec3 uTrips[8];
+  varying vec3 vColor;
+  vec3 turbo(float x) {
+    x = clamp(x, 0.0, 1.0);
+    vec4 kR = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+    vec4 kG = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+    vec4 kB = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+    vec2 kR2 = vec2(-152.94239396, 59.28637943);
+    vec2 kG2 = vec2(4.27729857, 2.82956604);
+    vec2 kB2 = vec2(-89.90310912, 27.34824973);
+    vec4 v4 = vec4(1.0, x, x * x, x * x * x);
+    vec2 v2 = v4.zw * v4.z;
+    return vec3(dot(v4, kR) + dot(v2, kR2), dot(v4, kG) + dot(v2, kG2),
+                dot(v4, kB) + dot(v2, kB2));
+  }
+  void main() {
+    float h = height * 0.02;  // m above the level floor; 255 = unknown.
+    bool clipped = height < 254.5 && (h < uClip.x || h > uClip.y);
+    if (clipped || (uShowDynamic < 0.5 && dynamic > 0.5)) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return;
+    }
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    // World-sized points (uSize cm), at least 1.5 px.
+    gl_PointSize = max(1.5, uSize * 0.01 * uProj / max(-mv.z, 0.05));
+    float z = (modelMatrix * vec4(position, 1.0)).z;
+    if (uMode == 0) vColor = turbo((z - uZ.x) / max(uZ.y - uZ.x, 1e-3));
+    else if (uMode == 1) vColor = vec3(pow(intensity / 255.0, 0.55));
+    else if (uMode == 2) vColor = uTrips[int(mod(trip, 8.0))];
+    else if (uMode == 3) vColor = label < 0.5 ? vec3(0.42) : uLabels[int(min(label, 31.0))];
+    else if (uMode == 4) vColor = sigma > 254.5 ? vec3(0.35) : turbo(sigma / 50.0);
+    else vColor = dynamic < 0.5 ? vec3(0.55) : (dynamic < 1.5 ? vec3(1.0, 0.2, 0.45) : vec3(1.0, 0.72, 0.1));
+  }`;
+const fragmentShader = `
+  varying vec3 vColor;
+  void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    if (dot(c, c) > 0.25) discard;
+    gl_FragColor = vec4(vColor, 1.0);
+  }`;
+
+const material = new THREE.ShaderMaterial({
+  vertexShader, fragmentShader,
+  uniforms: {
+    uMode: { value: 0 }, uSize: { value: 3 }, uProj: { value: 1 },
+    uZ: { value: new THREE.Vector2(0, 1) }, uClip: { value: new THREE.Vector2(-1, 99) },
+    uShowDynamic: { value: 0 },
+    uLabels: { value: Array.from({ length: 32 }, () => new THREE.Color(0.5, 0.5, 0.5)) },
+    uTrips: { value: Array.from({ length: 8 }, () => new THREE.Color(1, 1, 1)) },
+  },
+});
+
+function updateProjection() {
+  const h = renderer.domElement.height;
+  material.uniforms.uProj.value = h / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+}
+
+// ------------------------------------------------------------------ state
+let current = null;  // { meta, points, groups: {...}, attrs }
+const groups = { tracks: new THREE.Group(), slots: new THREE.Group(),
+                 markings: new THREE.Group(), structure: new THREE.Group(),
+                 nav: new THREE.Group(), route: new THREE.Group() };
+Object.values(groups).forEach((g) => scene3d.add(g));
+
+const rgb = (c) => new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
+const LABEL_NAMES = {
+  floor: '地面', ramp: '坡道', ceiling: '顶板', wall: '墙', column: '柱', beam: '梁',
+  parking_line: '车位线', lane_marking: '车道线', arrow: '箭头', speed_bump: '减速带',
+  wheel_stopper: '挡轮器', vehicle: '车辆（停放）', vehicle_moving: '车辆（移动）',
+  pedestrian: '行人', two_wheeler: '两轮车', mep: '管线设备', sign: '标志', light: '灯',
+  barrier: '护栏', other: '其他',
+};
+
+function lineGroup(group, polylines, color, opacity = 1) {
+  const material = new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity });
+  for (const pts of polylines) {
+    const geometry = new THREE.BufferGeometry().setFromPoints(pts.map((p) => new THREE.Vector3(p[0], p[1], p[2])));
+    group.add(new THREE.Line(geometry, material));
+  }
+}
+
+function clearGroups() {
+  for (const g of Object.values(groups)) {
+    for (const child of [...g.children]) {
+      child.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+      g.remove(child);
+    }
+  }
+}
+
+async function loadDataset(entry) {
+  statusEl.textContent = `正在加载 ${entry.name} …`;
+  statusEl.style.display = 'grid';
+  const base = entry.path + '/';
+  const meta = await (await fetch(base + 'scene.json')).json();
+  const buffer = await (await fetch(base + 'points.bin')).arrayBuffer();
+  const n = meta.points;
+  const geometry = new THREE.BufferGeometry();
+  const attrs = {};
+  for (const item of meta.layout) {
+    if (item.name === 'position') {
+      const array = new Int16Array(buffer, item.offset, n * 3);
+      geometry.setAttribute('position', new THREE.Int16BufferAttribute(array, 3));
+      attrs.position = array;
+    } else {
+      const array = new Uint8Array(buffer, item.offset, n);
+      geometry.setAttribute(item.name, new THREE.Uint8BufferAttribute(array, 1));
+      attrs[item.name] = array;
+    }
+  }
+  geometry.computeBoundingSphere();
+  if (current) { scene3d.remove(current.points); current.points.geometry.dispose(); }
+  clearGroups();
+  const points = new THREE.Points(geometry, material);
+  points.scale.setScalar(meta.scale);
+  points.frustumCulled = false;
+  scene3d.add(points);
+
+  // Colour tables.
+  const labels = material.uniforms.uLabels.value;
+  for (const l of meta.labels) if (l.id < 32) labels[l.id] = rgb(l.color);
+  const trips = material.uniforms.uTrips.value;
+  meta.trips.forEach((t, i) => { if (i < 8) trips[i] = rgb(t.color); });
+  material.uniforms.uZ.value.set(meta.z_range[0], meta.z_range[1]);
+
+  // Trajectories and vectors.
+  if (meta.tracks.length) {
+    const tb = await (await fetch(base + 'tracks.bin')).arrayBuffer();
+    for (const t of meta.tracks) {
+      const a = new Float32Array(tb, t.offset, t.count * 3);
+      const pts = [];
+      for (let i = 0; i < t.count; i += 1) pts.push([a[3 * i], a[3 * i + 1], a[3 * i + 2] + 0.05]);
+      lineGroup(groups.tracks, [pts], rgb(meta.trips[t.trip].color));
+    }
+  }
+  const v = meta.vectors;
+  lineGroup(groups.slots, v.slots.filter((s) => !s.inferred).map((s) => s.points), 0x3ddc84);
+  lineGroup(groups.slots, v.slots.filter((s) => s.inferred).map((s) => s.points), 0x3ddc84, 0.45);
+  lineGroup(groups.markings, v.markings.map((m) => m.points), 0xffffff);
+  const structure = [];
+  for (const c of v.columns) {
+    structure.push([...c.bottom, c.bottom[0]], [...c.top, c.top[0]]);
+    for (let i = 0; i < 4; i += 1) structure.push([c.bottom[i], c.top[i]]);
+  }
+  lineGroup(groups.structure, structure, 0xffd23f);
+  lineGroup(groups.structure, v.walls.map((w) => w.points), 0xe0b070);
+  const nav = meta.nav;
+  if (nav) {
+    const lift = (pts) => pts.map((p) => [p[0], p[1], p[2] + 0.08]);
+    lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'aisle').map((e) => lift(e.points)), 0xff4fd8);
+    lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'ramp').map((e) => lift(e.points)), 0xff9f1a);
+    lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'bridge').map((e) => lift(e.points)), 0x33d6ff);
+    lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'connector').map((e) => lift(e.points)), 0x3ddc84, 0.35);
+    const ticks = nav.goals.map((g) => {
+      const [x, y, z] = g.park;
+      return [[x, y, z + 0.08], [x + Math.cos(g.yaw), y + Math.sin(g.yaw), z + 0.08]];
+    });
+    lineGroup(groups.nav, ticks, 0x9cf0c0, 0.8);
+    const list = $('goalList');
+    list.innerHTML = '';
+    for (const g of nav.goals.slice(0, 2000)) {
+      const o = document.createElement('option'); o.value = g.address; list.appendChild(o);
+    }
+  }
+  $('navSection').style.display = nav ? '' : 'none';
+  $('route').textContent = nav
+    ? `从入口出发，沿路网规划到车位（共 ${nav.goals.length} 个目标点）。`
+    : '';
+
+  current = { meta, points, attrs };
+  applyToggles();
+  fitView('perspective');
+  renderLegend();
+  renderStats();
+  statusEl.style.display = 'none';
+}
+
+// --------------------------------------------------------------- controls
+function fitView(kind) {
+  if (!current) return;
+  const b = current.meta.bounds;
+  const size = Math.max(b.max[0] - b.min[0], b.max[1] - b.min[1], 1);
+  const target = new THREE.Vector3((b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, current.meta.z_range[0]);
+  controls.target.copy(target);
+  const d = size * 0.9;
+  if (kind === 'top') camera.position.set(target.x, target.y - d * 1e-3, target.z + d * 1.1);
+  else camera.position.set(target.x - d * 0.55, target.y - d * 0.55, target.z + d * 0.45);
+  camera.near = Math.max(size / 20000, 0.02);
+  camera.far = size * 20;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function applyToggles() {
+  material.uniforms.uShowDynamic.value = $('showDynamic').checked ? 1 : 0;
+  groups.tracks.visible = $('showTracks').checked;
+  groups.slots.visible = $('showSlots').checked;
+  groups.markings.visible = $('showMarkings').checked;
+  groups.structure.visible = $('showStructure').checked;
+  groups.nav.visible = $('showNav').checked;
+}
+
+function renderLegend() {
+  const legend = $('legend');
+  const mode = Number($('mode').value);
+  legend.innerHTML = '';
+  const add = (color, text) => {
+    const s = document.createElement('div'); s.className = 'swatch';
+    s.style.background = `rgb(${color.join(',')})`;
+    const t = document.createElement('div'); t.textContent = text;
+    legend.append(s, t);
+  };
+  const ramp = (lo, hi) => {
+    legend.innerHTML = `<div class="ramp"></div><div class="ramp-labels"><span>${lo}</span><span>${hi}</span></div>`;
+  };
+  const m = current.meta;
+  if (mode === 0) ramp(`${m.z_range[0].toFixed(1)} m`, `${m.z_range[1].toFixed(1)} m`);
+  else if (mode === 1) legend.innerHTML = '<div class="ramp" style="background:linear-gradient(90deg,#000,#fff)"></div><div class="ramp-labels"><span>弱</span><span>强</span></div>';
+  else if (mode === 2) m.trips.forEach((t) => add(t.color, `${t.name}（${t.duration_s} s）`));
+  else if (mode === 3) {
+    if (!m.labels.length || (m.labels.length === 1 && m.labels[0].id === 0)) legend.textContent = '该数据没有语义结果';
+    m.labels.filter((l) => l.id > 0).forEach((l) => add(l.color, LABEL_NAMES[l.name] || l.name));
+  } else if (mode === 4) ramp('0 cm', '≥ 5 cm');
+  else { add([140, 140, 140], '静态'); add([255, 51, 115], '本趟内移动'); add([255, 184, 26], '两趟之间变化'); }
+}
+
+function renderStats() {
+  const m = current.meta;
+  const v = m.vectors;
+  $('stats').innerHTML = `${m.name}：显示 ${m.points.toLocaleString()} 点（原始 ${m.points_full.toLocaleString()}）<br>
+    ${m.trips.length} 条轨迹 · ${v.slots.length} 个车位 · ${v.markings.length} 条标线 · ${v.columns.length} 根柱` +
+    (m.nav ? `<br>路网 ${m.nav.edges.length} 条边 · ${m.nav.goals.filter((g) => g.reachable).length}/${m.nav.goals.length} 个车位可达` : '');
+}
+
+// Double-click: the visible point under the cursor becomes the pivot.
+const raycaster = new THREE.Raycaster();
+renderer.domElement.addEventListener('dblclick', (event) => {
+  if (!current) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1,
+                                -((event.clientY - rect.top) / rect.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  raycaster.params.Points.threshold = Math.max(camera.position.distanceTo(controls.target) * 0.004, 0.03);
+  const hits = raycaster.intersectObject(current.points);
+  const lo = Number($('clipLo').value), hi = Number($('clipHi').value);
+  const showDyn = $('showDynamic').checked;
+  for (const hit of hits) {
+    const hq = current.attrs.height[hit.index];
+    if (hq < 255 && (hq * 0.02 < lo || hq * 0.02 > hi)) continue;
+    if (!showDyn && current.attrs.dynamic[hit.index] > 0) continue;
+    const offset = hit.point.clone().sub(controls.target);
+    controls.target.add(offset);
+    camera.position.add(offset);
+    break;
+  }
+});
+
+// --------------------------------------------------------------- routing
+// Address queries as in garage_recon.nav.address: level name, zone, number.
+const CN_DIGITS = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+function parseQuery(text, names) {
+  let q = text.trim().toUpperCase()
+    .replace(/负\s*([一二三四五六七八九十]|\d+)\s*[层楼]/g, (_, d) => ` B${CN_DIGITS[d] || d} `)
+    .replace(/(停车位|车位|号|区|层|楼|[-_/,，、#])/g, ' ');
+  const upper = names.map((n) => n.toUpperCase());
+  const out = { level: null, zone: null, number: null };
+  for (const t of q.split(/\s+/).filter(Boolean)) {
+    let m;
+    if (upper.includes(t) && out.level === null) out.level = upper.indexOf(t);
+    else if (/^[BLF]\d$/.test(t) && out.level === null) out.level = -1;
+    else if (/^\d+$/.test(t) && out.number === null) out.number = t;
+    else if (/^[A-Z]+$/.test(t) && out.zone === null) out.zone = t;
+    else if ((m = t.match(/^([A-Z]+)(\d+)$/)) && out.number === null) { out.zone = out.zone || m[1]; out.number = m[2]; }
+  }
+  return out;
+}
+function findGoals(nav, text) {
+  const key = text.trim().toUpperCase();
+  const direct = nav.goals.filter((g) => g.id.toUpperCase() === key || g.address.toUpperCase() === key);
+  if (direct.length) return direct;
+  const q = parseQuery(text, nav.level_names);
+  if (q.number === null) return [];
+  return nav.goals.filter((g) => g.number !== null && g.number !== undefined
+    && parseInt(String(g.number).replace(/\D/g, ''), 10) === parseInt(q.number, 10)
+    && (q.level === null || g.level === q.level)
+    && (q.zone === null || (g.zone || '').toUpperCase() === q.zone));
+}
+function shortestPath(nav, source, target) {
+  const n = nav.nodes.length;
+  const adj = Array.from({ length: n }, () => []);
+  nav.edges.forEach((e, i) => {
+    adj[e.a].push([e.b, i]);
+    if (!e.one_way) adj[e.b].push([e.a, i]);
+  });
+  const dist = new Float64Array(n).fill(Infinity);
+  const prev = new Int32Array(n).fill(-1), prevEdge = new Int32Array(n).fill(-1);
+  const done = new Uint8Array(n);
+  dist[source] = 0;
+  for (;;) {  // O(n^2) Dijkstra: graphs have a few thousand nodes at most.
+    let u = -1;
+    for (let i = 0; i < n; i += 1) if (!done[i] && dist[i] < Infinity && (u < 0 || dist[i] < dist[u])) u = i;
+    if (u < 0 || u === target) break;
+    done[u] = 1;
+    for (const [w, e] of adj[u]) {
+      const d = dist[u] + nav.edges[e].length;
+      if (d < dist[w]) { dist[w] = d; prev[w] = u; prevEdge[w] = e; }
+    }
+  }
+  if (!Number.isFinite(dist[target])) return null;
+  const segments = [];  // Edges from the source to the target, oriented.
+  for (let v = target; v !== source; v = prev[v]) {
+    const e = nav.edges[prevEdge[v]];
+    segments.unshift(e.b === v ? e.points : [...e.points].reverse());
+  }
+  const pts = [];
+  segments.forEach((seg, i) => pts.push(...(i ? seg.slice(1) : seg)));
+  return { length: dist[target], points: pts };
+}
+function planRoute() {
+  const out = $('route');
+  for (const child of [...groups.route.children]) {
+    child.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+    groups.route.remove(child);
+  }
+  const nav = current && current.meta.nav;
+  if (!nav) return;
+  const text = $('goal').value;
+  const found = findGoals(nav, text);
+  if (!found.length) { out.innerHTML = `没有找到“${text}”对应的车位。`; return; }
+  if (found.length > 1) { out.innerHTML = `“${text}”对应 ${found.length} 个车位，请补充楼层或分区。`; return; }
+  const goal = found[0];
+  if (nav.origin === null || goal.node === null) { out.innerHTML = `${goal.address}：没有接入路网。`; return; }
+  const path = shortestPath(nav, nav.origin, goal.node);
+  if (!path) { out.innerHTML = `<b>${goal.address}</b>：从入口不可达。`; return; }
+  const curve = new THREE.CurvePath();
+  const lifted = path.points.map((p) => new THREE.Vector3(p[0], p[1], p[2] + 0.3));
+  for (let i = 1; i < lifted.length; i += 1) {
+    if (lifted[i].distanceTo(lifted[i - 1]) > 1e-3) curve.add(new THREE.LineCurve3(lifted[i - 1], lifted[i]));
+  }
+  if (curve.curves.length) {
+    const tube = new THREE.TubeGeometry(curve, Math.max(8, curve.curves.length * 4), 0.18, 6, false);
+    groups.route.add(new THREE.Mesh(tube, new THREE.MeshBasicMaterial({ color: 0xffe14d, depthTest: false })));
+  }
+  const [x, y, z] = goal.park;
+  const dir = new THREE.Vector3(Math.cos(goal.yaw), Math.sin(goal.yaw), 0);
+  groups.route.add(new THREE.ArrowHelper(dir, new THREE.Vector3(x, y, z + 0.3).addScaledVector(dir, -1.5), 3.0, 0x00e676, 1.0, 0.8));
+  // The route stays visible through the point cloud.
+  groups.route.traverse((o) => {
+    o.renderOrder = 10;
+    if (o.material) o.material.depthTest = false;
+  });
+  const occupied = goal.occupied ? '（采集时有车）' : '';
+  out.innerHTML = `<b>${goal.address}</b>${occupied}：路线 <b>${path.length.toFixed(1)} m</b>，` +
+    `${path.points.length} 个路点。绿色箭头为车头进的停车朝向。`;
+  // Frame the route from above.
+  const box = new THREE.Box3().setFromPoints(lifted.length ? lifted : [new THREE.Vector3(x, y, z)]);
+  const c = box.getCenter(new THREE.Vector3());
+  const size = Math.max(box.max.x - box.min.x, box.max.y - box.min.y, 10);
+  controls.target.copy(c);
+  camera.position.set(c.x, c.y - size * 0.35, c.z + size * 1.1);
+  controls.update();
+}
+
+// -------------------------------------------------------------------- UI
+function bindRange(id, fn, fmt) {
+  const el = $(id), out = $(id + 'Value');
+  const update = () => { fn(Number(el.value)); if (out) out.textContent = fmt(Number(el.value)); };
+  el.addEventListener('input', update); update();
+}
+bindRange('size', (v) => { material.uniforms.uSize.value = v; }, (v) => `${v} cm`);
+bindRange('clipLo', (v) => { material.uniforms.uClip.value.x = v; }, (v) => `${v.toFixed(2)} m`);
+bindRange('clipHi', (v) => { material.uniforms.uClip.value.y = v; }, (v) => `${v.toFixed(2)} m`);
+$('mode').addEventListener('change', () => { material.uniforms.uMode.value = Number($('mode').value); if (current) renderLegend(); });
+for (const id of ['showDynamic', 'showTracks', 'showSlots', 'showMarkings', 'showStructure', 'showNav']) {
+  $(id).addEventListener('change', applyToggles);
+}
+$('plan').addEventListener('click', planRoute);
+$('goal').addEventListener('keydown', (e) => { if (e.key === 'Enter') planRoute(); });
+$('topView').addEventListener('click', () => fitView('top'));
+$('perspective').addEventListener('click', () => fitView('perspective'));
+$('reset').addEventListener('click', () => fitView('perspective'));
+$('collapse').addEventListener('click', () => {
+  const p = $('panel'); p.classList.toggle('collapsed');
+  $('collapse').textContent = p.classList.contains('collapsed') ? '展开' : '收起';
+});
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  updateProjection();
+});
+updateProjection();
+
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene3d, camera);
+})();
+
+// ------------------------------------------------------------------ start
+try {
+  const manifest = await (await fetch('manifest.json')).json();
+  const select = $('dataset');
+  manifest.datasets.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = `${d.name}（${(d.points / 1e6).toFixed(1)} 百万点）`;
+    select.appendChild(o);
+  });
+  select.addEventListener('change', () => loadDataset(manifest.datasets[Number(select.value)]));
+  await loadDataset(manifest.datasets[0]);
+} catch (error) {
+  statusEl.textContent = '无法读取数据。请通过 HTTP 打开（garage-recon viewer --serve），不要直接双击 HTML 文件。';
+  console.error(error);
+}
+</script>
+</body>
+</html>
