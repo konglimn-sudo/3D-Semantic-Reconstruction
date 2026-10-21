@@ -18,13 +18,21 @@ struct ImuSamples {
   std::vector<double> stamps;
   std::vector<Vec3> gyro;   // rad/s
   std::vector<Vec3> accel;  // Specific force, m/s^2.
+  // The IMU origin in the vehicle frame. The accelerometer measures there:
+  // where the vehicle origin is far from it (a handheld rig's lies on the
+  // ground, 1.8 m below), rotation alone reads as acceleration (w x (w x r)),
+  // so inertial factors use the IMU point as their body origin.
+  Vec3 position = Vec3::Zero();
 
   size_t size() const { return stamps.size(); }
   bool empty() const { return stamps.empty(); }
   // Rows [t, gx, gy, gz, ax, ay, az] in the IMU frame (imu.csv); requires at
-  // least 7 columns when there are rows.
+  // least 7 columns when there are rows. Stored in the vehicle axes.
   static ImuSamples FromRows(const Eigen::MatrixXd& rows,
-                             const Mat3& vehicle_from_imu_rotation);
+                             const Mat3& vehicle_from_imu_rotation,
+                             const Vec3& position = Vec3::Zero());
+  // Vehicle axes at the IMU origin: the body frame of inertial factors.
+  Pose VehicleFromBody() const { return Pose(Mat3::Identity(), position); }
 };
 
 // Linear interpolation of a vector-valued series per component, clamped at

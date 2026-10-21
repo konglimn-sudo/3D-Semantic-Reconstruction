@@ -1,0 +1,25 @@
+# Reconstruction settings for the Mandeye / Livox Mid-360 handheld rig, from
+# the trial on the Skierniewice underground garage (2026-10-16).
+# Use with: recon --config this.yaml (after convert --mandeye with
+# mandeye_mid360_skierniewice.yaml).
+#
+# The plane BA bent this map vertically with returns from 1 m on: the low
+# ceiling (0.6 m above the sensor, grazing incidence) reads 0.4-0.8 cm short
+# at 1.5-5 m, and these dense near returns bent the ends of the 85 m
+# out-and-back corridor down by 20 cm. The default ba.min_range is now 5 m.
+# Against the Z+F TLS cloud (accept --method auto, cars removed by semantics):
+#                         no BA    BA 1 m   BA 5 m (default)
+#   surface median / p95  1.5/5.9  2.8/18.6  1.4/5.2 cm
+#   horizontal p95        4.2      21.2      4.4 cm
+#   vertical p95          7.8      6.7       6.3 cm
+#   floor within 5 cm     79       54        79 %
+# The default BA is kept.
+#
+# Dynamic points: the map clears the volume the vehicle drove through
+# (map.dynamic.ego_radius 0.9 m, a car's half width). A person walks next to
+# parked cars and walls, so that rule removed 93 % of this map's dynamic
+# points, 70 % of them within 5 cm of the TLS surfaces (static structure).
+# The operator never shows up in the sweeps beyond odometry.min_range.
+map:
+  dynamic:
+    ego_radius: 0.0

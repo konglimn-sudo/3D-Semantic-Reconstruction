@@ -24,8 +24,15 @@ namespace gr {
 struct LidarBaConfig {
   bool enabled = true;
   double sweep_voxel = 0.1;  // Keyframe sweep resolution used (m).
-  double min_range = 1.0;    // Returns used (m); distant structure
-  double max_range = 30.0;   // constrains corridors and ramps.
+  // Returns used (m). Distant structure constrains corridors and ramps.
+  // Near returns are dense, so they dominate the planes, and they carry
+  // range biases of a few mm (the ceiling just above a handheld sensor, seen
+  // at grazing incidence). The vertical bending of a long corridor is
+  // constrained so weakly that these biases bent a 85 m handheld corridor by
+  // 20 cm at min_range 1 m; returns from 5 m on keep it straight and leave the
+  // vehicle garages unchanged.
+  double min_range = 5.0;
+  double max_range = 30.0;
   double voxel = 1.0;        // Root voxel of the octree (m).
   int max_depth = 2;         // Subdivisions below the root (1 m -> 0.25 m).
   // A voxel is a plane candidate if sqrt(l_min) of all its points is below

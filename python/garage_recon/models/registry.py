@@ -3,10 +3,11 @@
 `models.backend`:
     none     No models: calibration and the language route are skipped.
     oracle   Ground-truth oracles of a synthetic dataset (needs its gt/).
+    real     The GPU models of the config (models.da3, ...), imported lazily.
     auto     oracle when a gt/ directory is given, otherwise none.
-Adapters of the real models (SAM 2, SigLIP 2, DINO / RoMa, Depth Anything 3,
-OCR) implement the protocols of interfaces.py and are added here when the
-GPU stages are set up.
+Real adapters implement the protocols of interfaces.py: Depth Anything 3
+(da3.py), RoMa and DINOv2 (dino.py); SAM 2, SigLIP 2 and OCR are added with
+their stages.
 """
 
 from __future__ import annotations
@@ -17,6 +18,25 @@ import pathlib
 from garage_recon.data.synthetic import ground_truth
 from garage_recon.models import interfaces
 from garage_recon.models import oracle
+
+
+class _Lazy:
+    """A model adapter built on first attribute access."""
+
+    def __init__(self, module: str, cls: str, settings):
+        self._spec = (module, cls, dict(settings))
+        self._model = None
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if self._model is None:
+            import importlib
+            module, cls, settings = self._spec
+            adapter = getattr(importlib.import_module(
+                f"garage_recon.models.{module}"), cls)
+            self._model = adapter(**settings)
+        return getattr(self._model, name)
 
 
 @dataclasses.dataclass
@@ -50,6 +70,19 @@ def build(models_cfg, gt_dir: str | pathlib.Path | None = None) -> ModelSuite:
         backend = "oracle" if gt_dir is not None else "none"
     if backend == "none":
         return ModelSuite()
+    if backend == "real":
+        # Each model only when configured (null disables it), and loaded on
+        # first use: a stage that needs one model does not hold the others
+        # in GPU memory.
+        suite = ModelSuite(name="real")
+        if models_cfg.get("da3"):
+            suite.depth = _Lazy("da3", "Da3DepthPrior", models_cfg.get("da3"))
+        if models_cfg.get("roma"):
+            suite.matcher = _Lazy("dino", "RomaMatcher", models_cfg.get("roma"))
+        if models_cfg.get("dino"):
+            suite.features = _Lazy("dino", "Dinov2Features",
+                                   models_cfg.get("dino"))
+        return suite
     if backend != "oracle":
         raise ValueError(f"unknown model backend: {backend}")
     if gt_dir is None:

@@ -147,6 +147,41 @@ void BindRegistration(py::module_& m) {
 }
 
 void BindOdometry(py::module_& m) {
+  py::class_<LioConfig>(m, "LioConfig")
+      .def(py::init<>())
+      .def_readwrite("map_voxel", &LioConfig::map_voxel)
+      .def_readwrite("max_points_per_voxel", &LioConfig::max_points_per_voxel)
+      .def_readwrite("map_radius", &LioConfig::map_radius)
+      .def_readwrite("scan_voxel", &LioConfig::scan_voxel)
+      .def_readwrite("insert_voxel", &LioConfig::insert_voxel)
+      .def_readwrite("max_iterations", &LioConfig::max_iterations)
+      .def_readwrite("convergence", &LioConfig::convergence)
+      .def_readwrite("plane_radius", &LioConfig::plane_radius)
+      .def_readwrite("max_plane_radius", &LioConfig::max_plane_radius)
+      .def_readwrite("min_plane_points", &LioConfig::min_plane_points)
+      .def_readwrite("min_planarity", &LioConfig::min_planarity)
+      .def_readwrite("max_plane_thickness", &LioConfig::max_plane_thickness)
+      .def_readwrite("max_residual", &LioConfig::max_residual)
+      .def_readwrite("point_sigma", &LioConfig::point_sigma)
+      .def_readwrite("robust_scale", &LioConfig::robust_scale)
+      .def_readwrite("point_weight", &LioConfig::point_weight)
+      .def_readwrite("zupt_window", &LioConfig::zupt_window)
+      .def_readwrite("zupt_max_gyro", &LioConfig::zupt_max_gyro)
+      .def_readwrite("zupt_max_accel", &LioConfig::zupt_max_accel)
+      .def_readwrite("zupt_sigma", &LioConfig::zupt_sigma)
+      .def_readwrite("max_speed", &LioConfig::max_speed)
+      .def_readwrite("speed_sigma", &LioConfig::speed_sigma)
+      .def_readwrite("gyro_noise", &LioConfig::gyro_noise)
+      .def_readwrite("accel_noise", &LioConfig::accel_noise)
+      .def_readwrite("gyro_bias_walk", &LioConfig::gyro_bias_walk)
+      .def_readwrite("accel_bias_walk", &LioConfig::accel_bias_walk)
+      .def_readwrite("gravity", &LioConfig::gravity)
+      .def_readwrite("init_velocity_sigma", &LioConfig::init_velocity_sigma)
+      .def_readwrite("init_tilt_sigma_deg", &LioConfig::init_tilt_sigma_deg)
+      .def_readwrite("init_gyro_bias_sigma", &LioConfig::init_gyro_bias_sigma)
+      .def_readwrite("init_accel_bias_sigma",
+                     &LioConfig::init_accel_bias_sigma);
+
   py::class_<OdometryConfig>(m, "OdometryConfig")
       .def(py::init<>())
       .def_readwrite("max_range", &OdometryConfig::max_range)
@@ -160,7 +195,9 @@ void BindOdometry(py::module_& m) {
       .def_readwrite("icp_conv", &OdometryConfig::icp_conv)
       .def_readwrite("deskew", &OdometryConfig::deskew)
       .def_readwrite("use_wheel_prior", &OdometryConfig::use_wheel_prior)
-      .def_readwrite("use_gyro_prior", &OdometryConfig::use_gyro_prior);
+      .def_readwrite("use_gyro_prior", &OdometryConfig::use_gyro_prior)
+      .def_readwrite("use_lio", &OdometryConfig::use_lio)
+      .def_readwrite("lio", &OdometryConfig::lio);
 
   py::class_<Odometry>(m, "Odometry")
       .def(py::init([](const OdometryConfig& config, const Mat4& initial) {
@@ -500,6 +537,33 @@ void BindCameras(py::module_& m) {
 
 void BindProjection(py::module_& m) {
   m.def(
+      "render_surface_depth",
+      [](const CameraModel& camera, const py::object& camera_from_world,
+         const PointsIn& points, double point_spacing, int min_radius,
+         int max_radius, double min_range, double max_range, double abs_tol,
+         double rel_tol, int mean_radius) {
+        const CameraExposure exposure =
+            ExposureFrom(camera_from_world, camera.height(), true);
+        const Points p = ToPoints(points);
+        std::vector<float> depth;
+        {
+          py::gil_scoped_release release;
+          depth = RenderSurfaceDepth(camera, exposure, p, point_spacing,
+                                     min_radius, max_radius, min_range,
+                                     max_range, abs_tol, rel_tol,
+                                     mean_radius);
+        }
+        return ToImage(depth, camera.height(), camera.width());
+      },
+      "camera"_a, "T_cam_world"_a, "points"_a, "point_spacing"_a = 0.05,
+      "min_radius"_a = 1, "max_radius"_a = 4, "min_range"_a = 0.1,
+      "max_range"_a = 100.0, "abs_tol"_a = 0.05, "rel_tol"_a = 0.01,
+      "mean_radius"_a = 1,
+      "First-surface range per pixel as the mean of its points (HxW float32, "
+      "NaN where none): the z-buffer picks the surface, its nearest point "
+      "would be biased towards the camera. T_cam_world as for render_points.");
+
+  m.def(
       "render_points",
       [](const CameraModel& camera, const py::object& camera_from_world,
          const PointsIn& points, const py::object& labels, double point_spacing,
@@ -768,6 +832,27 @@ void BindGeometry(py::module_& m) {
       },
       "points"_a, "radius"_a, "min_neighbors"_a = 5, "max_neighbors"_a = 64,
       "Returns (normals, planarity, thickness, neighbor_count).");
+  m.def(
+      "project_to_local_planes",
+      [](const PointsIn& points, double radius, int min_neighbors,
+         int max_neighbors, double min_planarity, double max_shift) {
+        Require(radius > 0.0, "radius must be positive");
+        const Points p = ToPoints(points);
+        Points projected;
+        std::vector<double> shift;
+        {
+          py::gil_scoped_release release;
+          projected = ProjectToLocalPlanes(p, radius, min_neighbors,
+                                           max_neighbors, min_planarity,
+                                           max_shift, &shift);
+        }
+        return py::make_tuple(PointsToArray(projected), ToArray(shift));
+      },
+      "points"_a, "radius"_a, "min_neighbors"_a = 8, "max_neighbors"_a = 64,
+      "min_planarity"_a = 0.3, "max_shift"_a = 0.1,
+      "Returns (points moved onto their local planes (N, 3), signed moves "
+      "(N,)): one moving-least-squares step where the neighbourhood is "
+      "planar and the move is at most max_shift.");
   m.def(
       "ransac_plane",
       [](const PointsIn& points, double threshold, int iterations, int seed) {

@@ -191,11 +191,13 @@ Offset SearchAround(const std::vector<Cell>& source,
   return best;
 }
 
-// Shift (in bins) of `b` that best matches `a`: a[i] ~ b[i - shift].
-int BestShift(const std::vector<double>& a, const std::vector<double>& b,
-              int min_shift, int max_shift) {
-  int best_shift = 0;
-  double best = -1.0;
+// Shifts (in bins) of `b` that match `a` (a[i] ~ b[i - shift]): the local
+// maxima of the correlation reaching `ratio` of the best one, best first
+// (the best alone with ratio >= 1).
+std::vector<int> PeakShifts(const std::vector<double>& a,
+                            const std::vector<double>& b, int min_shift,
+                            int max_shift, double ratio) {
+  std::vector<double> correlation;
   for (int s = min_shift; s <= max_shift; ++s) {
     double sum = 0.0;
     for (int i = 0; i < static_cast<int>(a.size()); ++i) {
@@ -203,12 +205,37 @@ int BestShift(const std::vector<double>& a, const std::vector<double>& b,
       if (j < 0 || j >= static_cast<int>(b.size())) continue;
       sum += a[static_cast<size_t>(i)] * b[static_cast<size_t>(j)];
     }
-    if (sum > best) {
-      best = sum;
-      best_shift = s;
-    }
+    correlation.push_back(sum);
   }
-  return best_shift;
+  const auto best = std::max_element(correlation.begin(), correlation.end());
+  std::vector<std::pair<double, int>> peaks = {
+      {*best, min_shift + static_cast<int>(best - correlation.begin())}};
+  if (ratio < 1.0) {
+    // Peaks on the 3-bin sum: a surface pair straddling a bin boundary
+    // splits its peak over two shifts.
+    const int n = static_cast<int>(correlation.size());
+    std::vector<double> window(correlation.size(), 0.0);
+    for (int k = 0; k < n; ++k) {
+      for (int d = std::max(k - 1, 0); d <= std::min(k + 1, n - 1); ++d) {
+        window[static_cast<size_t>(k)] += correlation[static_cast<size_t>(d)];
+      }
+    }
+    const double top = *std::max_element(window.begin(), window.end());
+    peaks.clear();
+    for (int k = 0; k < n; ++k) {
+      const double c = window[static_cast<size_t>(k)];
+      const bool left = k == 0 || c >= window[static_cast<size_t>(k - 1)];
+      const bool right = k + 1 == n || c > window[static_cast<size_t>(k + 1)];
+      if (left && right && c >= ratio * top) {
+        peaks.emplace_back(c, min_shift + k);
+      }
+    }
+    std::sort(peaks.begin(), peaks.end(),
+              [](const auto& x, const auto& y) { return x.first > y.first; });
+  }
+  std::vector<int> out;
+  for (const auto& peak : peaks) out.push_back(peak.second);
+  return out;
 }
 
 }  // namespace
@@ -216,12 +243,21 @@ int BestShift(const std::vector<double>& a, const std::vector<double>& b,
 std::optional<CoarseAlignment> AlignGravityAligned(
     const Points& source, const Points& reference,
     const CoarseAlignConfig& config) {
+  const std::vector<CoarseAlignment> candidates =
+      AlignGravityAlignedCandidates(source, reference, config, 1.0);
+  if (candidates.empty()) return std::nullopt;
+  return candidates.front();
+}
+
+std::vector<CoarseAlignment> AlignGravityAlignedCandidates(
+    const Points& source, const Points& reference,
+    const CoarseAlignConfig& config, double z_peak_ratio) {
   GR_CHECK(config.coarse_cell > config.fine_cell && config.fine_cell > 0.0);
   const Structure s = Analyze(source, config);
   const Structure r = Analyze(reference, config);
   constexpr size_t kMinVertical = 200;
   if (s.vertical.size() < kMinVertical || r.vertical.size() < kMinVertical) {
-    return std::nullopt;
+    return {};
   }
   // Yaw modulo 90 deg from the wall directions: rotating the source by psi
   // adds psi to its azimuths.
@@ -269,12 +305,13 @@ std::optional<CoarseAlignment> AlignGravityAligned(
   }
   std::sort(candidates.begin(), candidates.end(),
             [](const auto& a, const auto& b) { return a.first > b.first; });
-  CoarseAlignment out;
-  out.score = candidates[0].first;
-  out.ambiguity = out.score > 0.0 ? candidates[1].first / out.score : 1.0;
-  out.reference_from_source = candidates[0].second;
+  const double ambiguity = candidates[0].first > 0.0
+                               ? candidates[1].first / candidates[0].first
+                               : 1.0;
 
-  // Height from the horizontal surfaces (floors, ceilings).
+  // Height from the horizontal surfaces (floors, ceilings); levels of the
+  // same layout give one correlation peak per level spacing.
+  std::vector<double> heights = {0.0};
   if (!s.horizontal.empty() && !r.horizontal.empty()) {
     const auto [s_lo, s_hi] =
         std::minmax_element(s.horizontal.begin(), s.horizontal.end());
@@ -292,8 +329,22 @@ std::optional<CoarseAlignment> AlignGravityAligned(
     for (double z : r.horizontal) {
       zr[static_cast<size_t>((z - z0) / config.z_bin)] += 1.0;
     }
-    const int shift = BestShift(zr, zs, -(z_bins - 1), z_bins - 1);
-    out.reference_from_source.translation.z() = shift * config.z_bin;
+    heights.clear();
+    for (int shift :
+         PeakShifts(zr, zs, -(z_bins - 1), z_bins - 1, z_peak_ratio)) {
+      heights.push_back(shift * config.z_bin);
+    }
+  }
+  std::vector<CoarseAlignment> out;
+  for (const auto& [score, pose] : candidates) {
+    for (double z : heights) {
+      CoarseAlignment alignment;
+      alignment.score = score;
+      alignment.ambiguity = ambiguity;
+      alignment.reference_from_source = pose;
+      alignment.reference_from_source.translation.z() = z;
+      out.push_back(alignment);
+    }
   }
   return out;
 }

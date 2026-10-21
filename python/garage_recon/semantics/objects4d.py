@@ -475,8 +475,12 @@ def static_objects_from_map(pm, labels: np.ndarray, levels: LevelModel, yaw: flo
                 continue
             Q = P[sel]
             span = np.ptp(Q[:, :2] @ rot2(-yaw).T, axis=0)
-            if span.max() > 7.0:  # streak of a moving object, handled by tracking
-                moving_pts[gidx[sel]] = True
+            if span.max() > 7.0:
+                # The streak of a moving object (handled by tracking) holds
+                # moved points; without any, it is a row of touching parked
+                # cars or clutter along a wall, and stays static.
+                if np.mean(kind[gidx[sel]] == 1) >= oc.streak_min_moved:
+                    moving_pts[gidx[sel]] = True
                 continue
             if span.max() < oc.parked_min_extent:
                 continue

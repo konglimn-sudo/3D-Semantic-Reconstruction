@@ -27,9 +27,11 @@ Vec3 InterpolateSeries(const std::vector<double>& stamps,
 }
 
 ImuSamples ImuSamples::FromRows(const Eigen::MatrixXd& rows,
-                                const Mat3& vehicle_from_imu_rotation) {
+                                const Mat3& vehicle_from_imu_rotation,
+                                const Vec3& position) {
   GR_CHECK(rows.rows() == 0 || rows.cols() >= 7);
   ImuSamples samples;
+  samples.position = position;
   const size_t n = static_cast<size_t>(rows.rows());
   samples.stamps.resize(n);
   samples.gyro.resize(n);

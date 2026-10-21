@@ -16,12 +16,24 @@ struct NormalsResult {
   std::vector<double> planarity;  // (l2 - l3) / l1, eigenvalues l1 >= l2 >= l3.
   std::vector<double> thickness;  // sqrt(l3): spread along the normal (m).
   std::vector<int> neighbors;
+  std::vector<Vec3> centroids;  // Mean of the neighbours.
 };
 
 // Normals from the neighbours within `radius` (the closest `max_neighbors`).
 // Normals are not oriented; callers flip them towards the sensor if needed.
 NormalsResult EstimateNormals(const Points& points, double radius,
                               int min_neighbors, int max_neighbors = 64);
+
+// Each point moved along its local normal onto the plane of its neighbours
+// within `radius` (moving least squares, one step), where the neighbourhood
+// is planar (planarity >= `min_planarity`) and the move is at most
+// `max_shift`; other points stay. A rendering of flat discs on a noisy layer
+// of points stops at the front of the noise, so the anchors of the 3DGS start
+// from the denoised surface. `shift` (optional) receives the signed moves.
+Points ProjectToLocalPlanes(const Points& points, double radius,
+                            int min_neighbors, int max_neighbors,
+                            double min_planarity, double max_shift,
+                            std::vector<double>* shift = nullptr);
 
 struct PlaneFit {
   Vec3 normal = Vec3::UnitZ();

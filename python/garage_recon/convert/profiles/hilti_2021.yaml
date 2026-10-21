@@ -1,0 +1,125 @@
+# Hilti SLAM Challenge 2021 (Helmberger et al., RA-L 2022;
+# huggingface.co/datasets/Hilti-Research/hilti-slam-challenge-2021,
+# CC BY-NC-SA 3.0): handheld "Phasma" rig with an Ouster OS0-64, a Livox
+# MID70 (livox_ros_driver/CustomMsg, not read), an Alphasense with five
+# global shutter grey cameras (1440 x 1080) and a BMI085 IMU, and an
+# ADIS16445 IMU. Ground truth: sparse 3-DoF total-station points of the pole
+# tip or prism while the rig stands still (ground_truth/<seq>_<frame>.txt).
+#
+# Calibration: calibration.yaml (V2, 26.08.2021). Each entry is the sensor
+# in its parent frame (p_parent = R p_sensor + t; quaternion xyzw): the side
+# cameras sit on the side they look at, the stereo pair is 10.7 cm apart
+# along y. The tree is rooted at the Alphasense IMU (`imu`), whose z axis
+# points down (the pole tip is at z = +1.67 m); the Ouster is upright.
+# Points are published in os_sensor = os_lidar . (0, 0, -0.036).
+# Time: all sensors within 1 ms (hardware / PTP synchronisation). The bag's
+# /tf_static holds the older calibration_v1 (same convention, mm apart).
+#
+# The rig is carried from the first second on. Parking_1: convert with
+# --start 2; 2-4 s is the quietest window (gyro 0.05 rad/s, right before
+# the first total-station point G5 at 3.8 s) and levels the vehicle frame.
+garage_id: hilti_parking_deck
+reference: imu
+vehicle:
+  level: true
+  floor: auto
+  forward: [1.0, 0.0, 0.0]   # The camera stereo pair looks along imu +x.
+  level_window: 2.0
+lidars:
+  ouster:
+    topic: /os_cloud_node/points
+    T_reference_sensor:      # T_imu_os_lidar . T_os_lidar_os_sensor
+      - [0.999975732, 0.002455644, -0.006519672, 0.010254377]
+      - [0.002457854, -0.999996925, 0.000330945, -0.006657388]
+      - [-0.006518839, -0.000346961, -0.999978692, 0.130729657]
+      - [0.0, 0.0, 0.0, 1.0]
+    stamp: start
+    time_field: t
+    time_scale: 1.0e-9
+    intensity_field: reflectivity   # 16 bit, range-compensated
+    intensity_scale: 0.00025        # median 1050, p99 3860 on Parking_1
+    min_range: 0.8           # The operator.
+    max_range: 60.0
+    storage_step: 0.002
+    sweep_duration: 0.1
+imu:
+  topic: /alphasense/imu_adis   # ADIS16445: far lower bias instability.
+  T_reference_sensor:        # calibration.yaml imu_adis
+    - [-0.007051991, -0.999956225, -0.006149673, -0.028227033]
+    - [-0.999975042, 0.007054505, -0.000387101, -0.006375545]
+    - [0.000430467, 0.006146790, -0.999981016, -0.031719661]
+    - [0.0, 0.0, 0.0, 1.0]
+cameras:
+  cam0:
+    topic: /alphasense/cam0/image_raw
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [701.6682111281, 701.55526909, 703.6097253263, 530.4665279367,
+             -0.0395909069, -0.0041727433, 0.0030288415, -0.0012784168]
+    T_reference_sensor:
+      quaternion_wxyz: [0.49826434600894337, -0.5003218001035493,
+                        0.5012125349997221, -0.5001966939080825]
+      translation: [0.05067834857850693, 0.0458784339890185,
+                    -0.005943648304780761]
+    scale: 0.5
+    max_rate: 2.0
+  cam1:
+    topic: /alphasense/cam1/image_raw
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [696.7174426776, 696.4862496732, 708.4206218964, 535.6712007522,
+             -0.0465180371, 0.0160363324, -0.0170339468, 0.0050095489]
+    T_reference_sensor:
+      quaternion_wxyz: [0.49985108193130245, 0.4987817834395415,
+                        0.5018413260691813, 0.4995206821044571]
+      translation: [0.0507054642910155, -0.060959522169800155,
+                    -0.005930631162279414]
+    scale: 0.5
+    max_rate: 2.0
+  cam2:                      # Looks up (imu -z).
+    topic: /alphasense/cam2/image_raw
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [702.3538912351, 702.1759854802, 718.7749348353, 535.2856167618,
+             -0.0392852639, -0.0023244164, -0.0005553017, 0.0002238156]
+    T_reference_sensor:
+      quaternion_wxyz: [-0.0051288529553438975, -0.0036172226140807136,
+                        0.9999797730734545, 0.0010315095176143168]
+      translation: [0.0066556070130705325, -0.007297504322474243,
+                    -0.035615803708099754]
+    scale: 0.5
+    max_rate: 2.0
+  cam3:
+    topic: /alphasense/cam3/image_raw
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [703.2325755934, 703.2405654818, 703.0078028901, 537.7049174331,
+             -0.041473724, 0.000366189, -0.0008241712, -0.0002216933]
+    T_reference_sensor:
+      quaternion_wxyz: [0.7062976111816349, -0.7079136763853694,
+                        0.0008791895155068065, 0.0010668886832242107]
+      translation: [-0.007959549138437914, 0.06467457049779392,
+                    -0.006489835360873981]
+    scale: 0.5
+    max_rate: 2.0
+  cam4:
+    topic: /alphasense/cam4/image_raw
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [701.4723842948, 701.6419154268, 700.4808652897, 541.8573746426,
+             -0.0405675926, 0.0010964136, -0.0027765896, 0.0006435363]
+    T_reference_sensor:
+      quaternion_wxyz: [0.7083437671108971, 0.7058442060370936,
+                        0.004905163975235881, -0.003000627498377676]
+      translation: [-0.009899820375326171, -0.07835193358130926,
+                    -0.006247994340411725]
+    scale: 0.5
+    max_rate: 2.0
+# The Alphasense is mounted upside down (imu z down), so are its images:
+# cam1 is right of cam0 in image coordinates.
+stereo_pairs: [[cam0, cam1]]

@@ -16,6 +16,7 @@ namespace {
 
 struct Pca {
   Vec3 normal = Vec3::Zero();
+  Vec3 centroid = Vec3::Zero();
   double l1 = 0.0;  // Eigenvalues, descending.
   double l2 = 0.0;
   double l3 = 0.0;
@@ -43,6 +44,7 @@ Pca ComputePca(int n, Getter get) {
   out.l2 = std::max(eigenvalues[1], 0.0);
   out.l1 = std::max(eigenvalues[2], 0.0);
   out.normal = solver.eigenvectors().col(0).normalized();
+  out.centroid = mean;
   out.ok = out.l1 > 0.0;
   return out;
 }
@@ -65,6 +67,7 @@ NormalsResult EstimateNormals(const Points& points, double radius,
   result.planarity.assign(n, 0.0);
   result.thickness.assign(n, 0.0);
   result.neighbors.assign(n, 0);
+  result.centroids.assign(n, Vec3::Zero());
   if (n == 0) return result;
   const double inv = 1.0 / radius;
   const double r2 = radius * radius;
@@ -109,10 +112,31 @@ NormalsResult EstimateNormals(const Points& points, double radius,
     const Pca pca = PcaOfIndices(points, neighbors);
     if (!pca.ok) continue;
     result.normals[i] = pca.normal;
+    result.centroids[i] = pca.centroid;
     result.planarity[i] = (pca.l2 - pca.l3) / pca.l1;
     result.thickness[i] = std::sqrt(pca.l3);
   }
   return result;
+}
+
+Points ProjectToLocalPlanes(const Points& points, double radius,
+                            int min_neighbors, int max_neighbors,
+                            double min_planarity, double max_shift,
+                            std::vector<double>* shift) {
+  const NormalsResult local =
+      EstimateNormals(points, radius, min_neighbors, max_neighbors);
+  Points out = points;
+  if (shift != nullptr) shift->assign(points.size(), 0.0);
+  for (size_t i = 0; i < points.size(); ++i) {
+    if (local.normals[i].isZero() || local.planarity[i] < min_planarity) {
+      continue;
+    }
+    const double d = local.normals[i].dot(points[i] - local.centroids[i]);
+    if (std::abs(d) > max_shift) continue;
+    out[i] = points[i] - d * local.normals[i];
+    if (shift != nullptr) (*shift)[i] = d;
+  }
+  return out;
 }
 
 PlaneFit FitPlaneRansac(const Points& points, double threshold, int iterations,

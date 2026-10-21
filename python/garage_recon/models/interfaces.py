@@ -9,7 +9,8 @@ correspondence use these protocols:
 * DenseFeatures    patch features (DINOv2 / DINOv3).
 * Matcher          image correspondences (DINO-based dense matching, e.g.
                    RoMa), refined to sub-pixel accuracy.
-* DepthPrior       pose-conditioned multi-view depth (Depth Anything 3).
+* DepthPrior       pose-conditioned multi-view depth (Depth Anything 3,
+                   da3.py).
 * OcrReader        text on the floor, columns and signs.
 
 Every call receives `Frame` records: real models read `image`, the oracle
@@ -64,10 +65,15 @@ class Matches:
 
 @dataclasses.dataclass
 class DepthMap:
-    """Metric depth (range along the ray, m) with a confidence per pixel."""
+    """Metric depth (range along the ray, m) with a confidence per pixel.
+
+    `pose_estimate` is the model's own world <- camera estimate, aligned to
+    the given poses by a similarity (a diagnostic), when it makes one.
+    """
 
     depth: np.ndarray  # (H, W) float32, NaN where unknown.
     confidence: np.ndarray  # (H, W) float32 in [0, 1].
+    pose_estimate: np.ndarray | None = None
 
 
 @dataclasses.dataclass
@@ -126,9 +132,13 @@ class Matcher(Protocol):
 class DepthPrior(Protocol):
     """Multi-view depth conditioned on the shared poses."""
 
-    def predict(self, frames: list[Frame],
-                world_from_camera: list[np.ndarray]) -> list[DepthMap]:
-        """Depth of every frame given its (4, 4) world <- camera pose."""
+    def predict(self, frames: list[Frame], world_from_camera: list[np.ndarray],
+                cameras: dict | None = None) -> list[DepthMap]:
+        """Depth of every frame given its (4, 4) world <- camera pose.
+
+        `cameras` maps camera names to their C++ CameraModel (models that
+        resample the image, e.g. fisheye -> pinhole views, need it).
+        """
 
 
 class OcrReader(Protocol):

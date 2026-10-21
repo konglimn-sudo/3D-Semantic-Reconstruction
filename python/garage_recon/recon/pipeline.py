@@ -16,6 +16,10 @@ Stages:
                  levels, dynamic points
     bev          per-level rasters
     texture      floor orthophoto from the fisheyes
+    depth_prior  depth model (DA3) fused with the LiDAR map in its holes
+    gs           3D Gaussians on the LiDAR skeleton (gsplat 3DGUT)
+    gs_verify    Gaussians against held-out LiDAR rays, the map, a reference
+    ortho        orthophoto per level from the Gaussians
 
 Work directory layout:
     trips/<trip>/odometry.{npz,tum}, kf/, kf_final/, poses.{npz,tum}
@@ -23,6 +27,9 @@ Work directory layout:
     pose_set/pose_set.json, <trip>.npz;  calibration.json
     map/point_map.npz, levels.json, floor_grids.npz
     bev/level_<i>.npz (+ PNG previews)
+    depth_prior/<trip>/<camera>/<stamp>.npz, frames.csv, points.npz
+    gs/model.npz, model.ply, summary.json, previews/, verify.json
+    ortho/level_<i>.png, .json
     provenance.json
 """
 
@@ -42,6 +49,7 @@ from garage_recon.models import registry
 from garage_recon.recon import backend
 from garage_recon.recon import bev
 from garage_recon.recon import calibration
+from garage_recon.recon import depth_prior
 from garage_recon.recon import floor_texture
 from garage_recon.recon import keyframes as keyframes_lib
 from garage_recon.recon import levels as levels_lib
@@ -51,7 +59,7 @@ from garage_recon.recon import static_map
 from garage_recon.recon import trajectory
 
 STAGES = ("odometry", "graph", "trajectory", "calibration", "map", "bev",
-          "texture")
+          "texture", "depth_prior", "gs", "gs_verify", "ortho")
 
 
 class ReconPipeline:
@@ -134,8 +142,15 @@ class ReconPipeline:
         """Loops and the pose graph; IMU bias / velocity per keyframe."""
         odoms = self.odometries()
         keyframes = keyframes_lib.KeyframeSet.from_odometry(odoms)
+        pairs = None
+        appearance_cfg = self.cfg.loops.get("appearance") or {}
+        if appearance_cfg.get("enabled") and self.models.features is not None:
+            from garage_recon.recon import appearance  # Needs torch.
+            pairs = appearance.appearance_pairs(
+                keyframes, self.datasets, self.models.features, self.cfg,
+                self.log)
         result = backend.run_graph(keyframes, self.datasets, odoms, self.cfg,
-                                   self.log)
+                                   self.log, pairs)
         poses = result["poses"]
         out = self.work / "graph"
         out.mkdir(parents=True, exist_ok=True)
@@ -153,7 +168,11 @@ class ReconPipeline:
                         "gravity_factors": len(result["gravity"]),
                         "loops_tested": result["loops_tested"],
                         "loops_verified": result["loops_verified"],
-                        "ba_rounds": result["ba_rounds"]})
+                        "ba_rounds": result["ba_rounds"],
+                        "trip_alignments": [
+                            {**a, "trip": self.datasets[a["trip"]].trip_id,
+                             "T": np.asarray(a["T"]).tolist()}
+                            for a in result["trip_alignments"]]})
         valid = np.asarray(result["inertial_valid"], bool)
         for t, data in enumerate(self.datasets):
             mine = valid & (keyframes.trip == t) if valid.any() else valid
@@ -247,6 +266,61 @@ class ReconPipeline:
                        rasters["height_max"], 0.0, 2.5)
             self.log(f"[bev] level {lv}: {grid.width}x{grid.height} cells")
         self.record("bev", uses_cameras=False)
+
+    def stage_depth_prior(self) -> None:
+        """DA3 depth fused with the LiDAR map, in the LiDAR holes (8.2)."""
+        if (not self.cfg.depth_prior.enabled or self.models.depth is None
+                or not any(d.rig.cameras for d in self.datasets)):
+            self.log("[depth_prior] skipped (disabled, no depth model or no "
+                     "cameras)")
+            return
+        depth_prior.run_depth_prior(self.pose_set(), self.point_map(),
+                                    self.models.depth, self.cfg,
+                                    self.work / "depth_prior", self.log)
+        self.record("depth_prior", uses_cameras=True)
+
+    def stage_gs(self) -> None:
+        """3D Gaussians on the LiDAR skeleton (8.3)."""
+        if not self.cfg.gs.enabled or not any(d.rig.cameras
+                                              for d in self.datasets):
+            self.log("[gs] skipped (disabled or no cameras)")
+            return
+        from garage_recon.recon import gs  # Needs torch and gsplat.
+        keyframes = self.keyframes()
+        gs.run_gs(self.pose_set(), self.point_map(), self.levels(), keyframes,
+                  self.kf_poses(keyframes), self.cfg, self.work, self.log)
+        self.record("gs", uses_cameras=True)
+
+    def stage_gs_verify(self) -> None:
+        """The Gaussians against held-out LiDAR rays, the map and a reference."""
+        if not self.cfg.gs.enabled or not (self.work / "gs" / "model.npz").exists():
+            self.log("[gs_verify] skipped (no Gaussians)")
+            return
+        from garage_recon.recon import gs_verify
+        frames = {o.trip_id: o.kf_frames for o in self.odometries()}
+        reference = None
+        handheld = self.cfg.gs_verify.get("reference")
+        report = self.work / "acceptance" / "report.json"
+        if handheld and report.exists():
+            # The registered handheld cloud, in the map frame.
+            gt_from_map = np.array(json.loads(report.read_text())[
+                "registration"]["gt_from_map"])
+            with np.load(pathlib.Path(handheld) / "cloud.npz") as z:
+                xyz = z["xyz"].astype(np.float64)
+            map_from_gt = np.linalg.inv(gt_from_map)
+            reference = xyz @ map_from_gt[:3, :3].T + map_from_gt[:3, 3]
+        gs_verify.run_gs_verify(self.pose_set(), self.point_map(), frames,
+                                self.cfg, self.work, reference, self.log)
+        self.record("gs_verify", uses_cameras=True)
+
+    def stage_ortho(self) -> None:
+        """Orthophoto of every level from the Gaussians."""
+        if not self.cfg.gs.enabled or not (self.work / "gs" / "model.npz").exists():
+            self.log("[ortho] skipped (no Gaussians)")
+            return
+        from garage_recon.recon import gs_verify
+        gs_verify.run_ortho(self.levels(), self.cfg, self.work, self.log)
+        self.record("ortho", uses_cameras=True)
 
     def stage_texture(self) -> None:
         """Floor orthophoto from the fisheye images."""

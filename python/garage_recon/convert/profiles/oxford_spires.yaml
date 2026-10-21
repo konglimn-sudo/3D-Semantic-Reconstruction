@@ -1,0 +1,97 @@
+# Oxford Spires dataset (Tao et al., IJRR 2025; huggingface.co/datasets/
+# ori-drs/oxford_spires_dataset, CC BY-NC-SA 4.0): Frontier handheld unit with
+# a Hesai QT64, an Alphasense Core (IMU, 400 Hz, and three global shutter
+# colour fisheye cameras, 1440 x 1080, 20 Hz). Ground truth: Leica RTC360
+# TLS map per site (ground_truth_map/<site>/merged-cloud-1cm.pcd) and per
+# sequence the base pose registered to it (processed/trajectory/gt-tum.txt,
+# 1-2 cm), with T_base_lidar = translation (0, 0, 0.124), yaw 180 deg.
+#
+# Calibration: calibration/cam-lidar-imu.yaml and cam*.yaml, identical to
+# configs/sensor.yaml of github.com/ori-drs/oxford_spires_dataset (the
+# primary calibration of 2024-03-19; sequences from June / October 2024 have
+# their own under calibration/calibration-sequences-*). Quaternions there
+# are xyzw; T_cam_lidar maps LiDAR points into the camera (hence
+# `invert: true`). The IMU extrinsics follow from cam0:
+# T_lidar_imu = inv(T_cam0_lidar) . T_cam0_imu.
+# Time: the cameras and the IMU are synchronised by the Alphasense FPGA, the
+# Alphasense clock to the host and the Hesai by PTP: no offsets.
+#
+# garage_id names the site (keble_college here); the rig is carried, so the
+# vehicle frame is levelled with the gravity at the start and put on the
+# floor below the LiDAR.
+garage_id: keble_college
+reference: hesai
+vehicle:
+  level: true
+  floor: auto
+  forward: [-1.0, 0.0, 0.0]  # The base x axis (forward) in the LiDAR frame.
+  level_window: 1.0
+lidars:
+  hesai:
+    topic: /hesai/pandar
+    T_reference_sensor: null
+    stamp: points            # Absolute per-point times (header = first point).
+    time_field: timestamp
+    time_scale: 1.0
+    intensity_field: intensity
+    intensity_scale: 0.00392156862745098   # 0-255.
+    min_range: 0.8           # The operator.
+    max_range: 60.0
+    storage_step: 0.002
+    sweep_duration: 0.1
+imu:
+  topic: /alphasense_driver_ros/imu
+  T_reference_sensor:
+    - [-0.016638046, 0.999855257, -0.003555273, 0.015798147]
+    - [-0.999860106, -0.016631814, 0.001775369, -0.001059837]
+    - [0.001715981, 0.003584314, 0.999992104, -0.084575277]
+    - [0.0, 0.0, 0.0, 1.0]
+cameras:
+  cam_front:
+    topic: /alphasense_driver_ros/cam0/debayered/image/compressed
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [698.1692094914263, 698.5147584873237, 712.7646767255006,
+             560.5751284820508, -0.04114225009462773, -0.002421765984053725,
+             0.003400355152679783, -0.0018518822347983275]
+    T_reference_sensor:
+      quaternion_wxyz: [0.5013981452864594, 0.5034725628949727,
+                        0.5003337192107279, -0.4947539264483171]
+      translation: [0.00035060884033447846, -0.079574053851818,
+                    -0.053826061545697405]
+      invert: true
+    scale: 0.5
+    max_rate: 2.0
+  cam_left:
+    topic: /alphasense_driver_ros/cam1/debayered/image/compressed
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [697.4908124760002, 696.9171455329763, 719.1718975625936,
+             543.7401536075661, -0.04417827343575797, 0.006234275291082348,
+             -0.0028153029005502637, -0.0005652124301059104]
+    T_reference_sensor:
+      quaternion_wxyz: [0.0032502610734581453, 0.005222551021921984,
+                        0.7078744176660065, -0.7063115244548896]
+      translation: [3.388762063794015e-05, -0.07994358595369325,
+                    -0.05600121569499821]
+      invert: true
+    scale: 0.5
+    max_rate: 2.0
+  cam_right:
+    topic: /alphasense_driver_ros/cam2/debayered/image/compressed
+    model: kannala_brandt
+    width: 1440
+    height: 1080
+    params: [698.4588137038655, 699.3937128891818, 708.6474762128631,
+             533.7390355049014, -0.042476719963857094, -0.00421520261588724,
+             0.006942403828737165, -0.0034076218162515594]
+    T_reference_sensor:
+      quaternion_wxyz: [0.7075930057111628, 0.7066174394729171,
+                        -0.001174547005383393, 0.0015977924498378243]
+      translation: [-0.0006070783260079121, -0.07992015242752262,
+                    -0.054798558347406996]
+      invert: true
+    scale: 0.5
+    max_rate: 2.0

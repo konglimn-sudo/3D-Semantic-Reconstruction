@@ -68,6 +68,7 @@ set(GR_CORE_SOURCES
   cpp/gr/imu.cc
   cpp/gr/imu_preintegration.cc
   cpp/gr/odometry.cc
+  cpp/gr/lio.cc
   cpp/gr/keyframes.cc
   cpp/gr/lidar_ba.cc
   cpp/gr/scan_context.cc
@@ -86,8 +87,10 @@ set(GR_CORE_SOURCES
   cpp/gr/projector.cc
   cpp/gr/labeling.cc
   cpp/gr/identity.cc
-  # 3DGS: LiDAR-anchored Gaussians, camera coverage, training masks.
+  # 3DGS: LiDAR-anchored Gaussians, camera coverage, training masks,
+  # the depth prior aligned to the LiDAR.
   cpp/gr/gaussians.cc
+  cpp/gr/depth_prior.cc
   cpp/gr/coverage.cc
   # Navigation map: drivable layers, aisle route graph, planning.
   cpp/gr/nav_map.cc
@@ -151,6 +154,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/exposure_test.cc
     cpp/gr/registration_test.cc
     cpp/gr/odometry_test.cc
+    cpp/gr/lio_test.cc
     cpp/gr/imu_test.cc
     cpp/gr/imu_preintegration_test.cc
     cpp/gr/scan_context_test.cc
@@ -171,6 +175,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/labeling_test.cc
     cpp/gr/identity_test.cc
     cpp/gr/gaussians_test.cc
+    cpp/gr/depth_prior_test.cc
     cpp/gr/coverage_test.cc
     cpp/gr/nav_map_test.cc
     cpp/gr/e2e_test.cc

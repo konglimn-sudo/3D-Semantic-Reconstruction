@@ -3,7 +3,8 @@
 // correspondence threshold and a local voxel-hash map. `OdometryPipeline`
 // wraps it into the per-trip front-end: wheel-speed + gyro motion prior, IMU
 // in-sweep deskew, keyframe selection and keyframe sweeps for the back-end.
-// Production systems can feed externally computed LIO trajectories instead.
+// Rigs with an IMU can run the LiDAR-inertial odometry of lio.h instead, or
+// feed externally computed LIO trajectories.
 
 #ifndef GARAGE_RECON_GR_ODOMETRY_H_
 #define GARAGE_RECON_GR_ODOMETRY_H_
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "gr/imu.h"
+#include "gr/lio.h"
 #include "gr/pose.h"
 #include "gr/registration.h"
 
@@ -39,6 +41,11 @@ struct OdometryConfig {
   // Without wheel speed: gyro rotation and the velocity of the last two
   // registered sweeps (handheld and backpack rigs).
   bool use_gyro_prior = true;
+  // LiDAR-inertial odometry (lio.h) instead of the ICP front-end, for rigs
+  // with an IMU: needed where the geometry degenerates (open decks seen by a
+  // short-range LiDAR, long corridors). Ranges come from min / max_range.
+  bool use_lio = false;
+  LioConfig lio;
 };
 
 class Odometry {
@@ -120,6 +127,9 @@ class OdometryPipeline {
   const std::vector<int>& keyframes() const { return keyframes_; }
   bool uses_prior() const { return use_prior_; }
   bool uses_gyro_prior() const { return use_gyro_; }
+  bool uses_lio() const { return lio_.has_value(); }
+  // Statistics of the last LIO update (uses_lio only).
+  const LioStats& lio_stats() const { return lio_->last_stats(); }
 
  private:
   bool IsKeyframe(const Pose& pose) const;
@@ -137,6 +147,7 @@ class OdometryPipeline {
   bool use_prior_ = false;
   bool use_gyro_ = false;
   Odometry odometry_;
+  std::optional<LioOdometry> lio_;
   std::vector<Pose> poses_;
   std::vector<double> stamps_;
   std::vector<int> keyframes_;

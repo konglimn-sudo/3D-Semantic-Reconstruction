@@ -1,0 +1,20 @@
+# Reconstruction settings for the Hilti 2021 handheld rig (Ouster OS0-64,
+# ADIS16445 IMU), from the trial on Parking_1 (2026-10-16).
+# Use with: recon --config this.yaml (after convert with hilti_2021.yaml).
+#
+# Open two-level parking deck in sunlight: the OS0-64 returns end at 8-9 m
+# (median 4 m) and the scene is mostly ground, so the ICP front-end with a
+# gyro prior diverges after 100 s. The LiDAR-inertial odometry keeps the
+# IMU motion in the directions the geometry does not constrain.
+odometry:
+  use_lio: true
+  min_range: 1.0             # The pole and the operator are within 1 m.
+  max_range: 40.0
+  lio:
+    map_voxel: 0.3           # Short returns: a finer local map.
+    scan_voxel: 0.15         # More sweep points on the sparse structure.
+    insert_voxel: 0.15
+# A person, not a car: the walked path is not cleared at car width.
+map:
+  dynamic:
+    ego_radius: 0.0

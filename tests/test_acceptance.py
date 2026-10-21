@@ -62,7 +62,19 @@ def test_cloud_formats_round_trip(tmp_path):
     np.savetxt(tmp_path / "d.csv", np.column_stack([xyz, intensity]),
                delimiter=",", header="x,y,z,intensity", comments="")
     np.savez(tmp_path / "e.npz", xyz=xyz, intensity=intensity)
-    for name in ("a.ply", "b.ply", "c.pcd", "d.csv", "e.npz"):
+    # Binary PCD as written by Leica Cyclone / CloudCompare exports: a
+    # capitalised intensity and a 4-byte padding field (COUNT 4).
+    record = np.zeros(3, np.dtype([("Intensity", "<f4"), ("rgb", "<f4"),
+                                   ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                   ("_", "u1", (4,))]))
+    record["Intensity"] = intensity
+    record["x"], record["y"], record["z"] = xyz.T
+    (tmp_path / "f.pcd").write_bytes(
+        b"# .PCD v0.7\nVERSION 0.7\nFIELDS Intensity rgb x y z _\n"
+        b"SIZE 4 4 4 4 4 1\nTYPE F F F F F U\nCOUNT 1 1 1 1 1 4\nWIDTH 3\n"
+        b"HEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS 3\nDATA binary\n"
+        + record.tobytes())
+    for name in ("a.ply", "b.ply", "c.pcd", "d.csv", "e.npz", "f.pcd"):
         points, values = handheld_lib.read_cloud(tmp_path / name)
         assert np.allclose(points, xyz, atol=1e-5), name
         if values is not None:

@@ -9,6 +9,7 @@
 #ifndef GARAGE_RECON_GR_LOOP_CLOSURE_H_
 #define GARAGE_RECON_GR_LOOP_CLOSURE_H_
 
+#include <utility>
 #include <vector>
 
 #include "gr/keyframes.h"
@@ -59,6 +60,30 @@ std::vector<LoopConstraint> DetectLoops(const KeyframeSet& keyframes,
                                         const std::vector<Pose>& poses,
                                         const LoopConfig& config,
                                         LoopStats* stats = nullptr);
+
+// Appearance candidates (e.g. AnyLoc image descriptors): pairs of keyframes
+// whose images look alike, with no usable pose prior (another trip in its
+// own frame, a revisit after drift). Each pair is registered without the
+// graph's guess: the gravity-aligned coarse search (cloud_compare) proposes
+// yaw / height hypotheses between the two submaps, each is refined by ICP,
+// and the pair is accepted if the best one passes the loop gates and beats
+// every distinct hypothesis by `min_fitness_gap` (repeated layouts).
+struct AppearanceLoopConfig {
+  double coarse_voxel = 0.2;   // Submaps for the coarse search (m).
+  double z_peak_ratio = 0.5;   // Height hypotheses (AlignGravityAligned...).
+  int max_hypotheses = 8;  // Every yaw first, then more heights.
+  double min_fitness_gap = 0.03;
+  double distinct_t = 1.0;     // m / deg: another solution.
+  double distinct_r = 5.0;
+};
+
+// Loops of the candidate pairs (i later than j, as in DetectLoops); pairs
+// that fail are dropped. `tested` (optional) counts the ICP runs.
+std::vector<LoopConstraint> VerifyAppearanceLoops(
+    const KeyframeSet& keyframes, const std::vector<Pose>& poses,
+    const std::vector<std::pair<int, int>>& candidates,
+    const LoopConfig& config, const AppearanceLoopConfig& appearance,
+    int* tested = nullptr);
 
 // Pairwise consistency maximisation (Mangelson et al., ICRA 2018) with a
 // greedy clique: two loops between the same pair of trips must agree with

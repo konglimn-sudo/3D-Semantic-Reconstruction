@@ -11,6 +11,31 @@ odometry:
   deskew: true
   use_wheel_prior: true      # wheel speed + gyro motion prior when available
   use_gyro_prior: true       # without wheels: gyro rotation + last velocity
+  use_lio: false             # LiDAR-inertial odometry (C++ lio.h) instead of ICP: rigs with
+                             # an IMU in degenerate geometry (open decks, short range, corridors)
+  lio:                       # iterated error-state Kalman filter (FAST-LIO2 style)
+    map_voxel: 0.5           # local map; points per voxel below
+    max_points_per_voxel: 20
+    map_radius: 100.0
+    scan_voxel: 0.5          # sweep points in the update
+    insert_voxel: 0.25       # sweep points added to the map
+    max_iterations: 6
+    max_plane_radius: 1.2    # point-to-plane: PCA radius doubles from map_voxel up to this
+    max_residual: 0.5        # m, point-to-plane gate
+    point_sigma: 0.05        # m
+    robust_scale: 0.1        # m, Cauchy
+    point_weight: 0.05       # point-to-point where no plane is found (cars, parapets)
+    zupt_window: 0.3         # s: zero-velocity update when the gyro stays below
+    zupt_max_gyro: 0.03      # rad/s and the specific force within
+    zupt_max_accel: 0.1      # m/s^2 of its mean (stops at control points)
+    zupt_sigma: 0.02         # m/s; 0 disables
+    max_speed: 0.0           # m/s carrier speed limit (handheld: ~2); 0 disables
+    speed_sigma: 0.1
+    gyro_noise: 0.05         # rad/s/sqrt(Hz), effective (vibration, timing); a tighter
+    accel_noise: 0.3         # m/s^2/sqrt(Hz)  prediction ignores weak LiDAR constraints
+    gyro_bias_walk: 1.0e-4
+    accel_bias_walk: 1.0e-3
+    init_velocity_sigma: 1.0 # m/s: the first sweep may already be moving
   external_trajectory: null  # TUM file per trip from an external LIO, e.g. "{trip}/lio.tum"
 
 keyframes:
@@ -37,6 +62,18 @@ loops:
   max_correction: 4.0        # metres between odometry prior and ICP result
   pcm_threshold: 0.5         # metres-equivalent cycle error
   pcm_drift_per_m: 0.01
+  appearance:                # AnyLoc image retrieval proposes loop pairs (README 8.4); needs
+    enabled: false           # models.dino (real backend). Verified without a pose guess.
+    camera: null             # null: the first camera of each trip
+    stride: 2                # keyframes with an image descriptor
+    max_dt: 0.25             # s between a keyframe and its image
+    num_words: 32            # VLAD vocabulary (k-means on the trip's own tokens)
+    top_k: 2                 # most similar keyframes proposed per keyframe
+    min_index_gap: 30        # same-trip separation (keyframes)
+    coarse_voxel: 0.2        # C++ AppearanceLoopConfig: gravity-aligned coarse search ...
+    z_peak_ratio: 0.5
+    max_hypotheses: 8        # ... hypotheses (every yaw first) refined by ICP; the best must beat any distinct
+    min_fitness_gap: 0.03    # one by this (repeated layouts)
 
 backend:
   odom_sigma_t: 0.02         # per keyframe step + drift per metre below
@@ -76,10 +113,27 @@ backend:
   gravity_max_yaw_rate: 3.0  # deg/s, no gravity factors while turning (side-slip)
   iterations: 50
 
+trip_align:                  # trips without an INS / GNSS anchor (handheld sessions start
+  enabled: true              # in their own frame): placed onto the other trips before loop
+  voxel: 0.2                 # detection (gravity-aligned coarse hypotheses, each refined by ICP)
+  icp_schedule: [2.0, 1.0, 0.5, 0.3]
+  icp_iters: 40
+  min_score: 0.3             # coarse: fraction of structure cells matched
+  z_peak_ratio: 0.5          # height hypotheses: one per level spacing in repeated levels
+  max_candidates: 8          # hypotheses refined by ICP
+  min_fitness: 0.5           # ICP inliers / points of the trip's map
+  max_rmse: 0.2              # whole-trip maps carry each trip's drift (Keble: 14 cm)
+  min_fitness_gap: 0.03      # a distinct solution must fit this much worse (identical levels)
+  distinct_t: 1.0            # m / deg between distinct solutions
+  distinct_r: 5.0
+  sigma_t: 2.0               # prior of an aligned trip's first keyframe; loops refine it
+  sigma_r: 5.0
+
 ba:                          # LiDAR bundle adjustment (plane factors, joint with the IMU)
   enabled: true
   sweep_voxel: 0.1           # keyframe sweeps used
-  min_range: 1.0
+  min_range: 5.0             # near returns (low ceilings at grazing incidence) carry mm
+                             # range biases that bend long corridors (README 4.3)
   max_range: 30.0            # distant structure constrains the ramp direction
   voxel: 1.0                 # octree root voxel; split down to voxel / 2^max_depth
   max_depth: 2
@@ -97,6 +151,137 @@ ba:                          # LiDAR bundle adjustment (plane factors, joint wit
   robust_scale: 3.0
   rounds: 2
   iterations: 10
+
+depth_prior:                 # DA3 depth in the LiDAR holes (README 8.2); needs models.depth
+  enabled: true
+  frame_stride: 1            # every n-th image of each camera
+  chunk_frames: 16           # image stamps per model call (all cameras together)
+  context_frames: 0          # + images from elsewhere in the trip per call (predictions dropped):
+                             # a wide baseline for far structure; needs models.da3.batch_views >=
+                             # 2 x (chunk_frames x cameras + context_frames)
+  context_mode: distance     # distance: cameras context_near..context_far m from the batch;
+  context_near: 15.0         # spread: evenly over the trip
+  context_far: 40.0
+  workers: 8                 # threads fusing images with the LiDAR while the model runs
+  max_range: 60.0            # LiDAR map rendered into the images
+  point_spacing: 0.05        # map voxel, for the splat radius (holes, occlusion)
+  fit_voxel: 0.1             # map points sampled for the fit, at their sub-pixel position
+  visibility_abs_tol: 0.1    # m / relative: a point is visible if within this of the z-buffer
+  visibility_rel_tol: 0.03
+  surface_abs_tol: 0.05       # stored LiDAR range: mean of the points within this (m) +
+  surface_rel_tol: 0.01       # this x range behind the nearest (z-buffer reads short)
+  points_stride: 4           # pixels between the exported prior points
+  points_voxel: 0.05
+  min_point_confidence: 0.3
+  align:                     # C++ DepthAlignConfig: l = s p + b per image (relative Cauchy)
+    min_range: 0.3
+    max_range: 80.0
+    min_pixels: 200
+    fit_shift: true
+    robust_scale: 0.05
+    max_residual: 0.10       # median relative residual; worse images are dropped
+    min_scale: 0.5
+    max_scale: 2.0
+    cell: 24                 # px; cells whose median residual exceeds max_cell_residual
+    min_cell_pixels: 20      # drop the prior there and around
+    max_cell_residual: 0.15
+    tolerance: 0.05          # confidence = own * exp(-0.5 (cell residual / tolerance)^2)
+    min_confidence: 0.05
+    hole_radius: 4           # px from a rendered LiDAR pixel: not a hole
+
+gs:                          # 3DGS on the LiDAR skeleton (README 8.3): gsplat 3DGUT, raw fisheye
+  enabled: false             # needs CUDA + gsplat
+  frame_stride: 1            # images per camera
+  holdout_every: 10          # every n-th image of a camera is held out for evaluation
+  workers: 8                 # threads loading images, masks and depth targets
+  saturated: 250             # pixels at or above (lamps) / at or below `dark` do not supervise
+  saturated_weight: 0.0      # > 0: saturated pixels supervise one-sidedly (render at least this
+                             # bright; sunlit decks saturate 20-43% of a frame)
+  saturated_fixed_appearance: true  # that loss moves the Gaussians, not the image gain / bias
+  dark: 3
+  images_on_gpu: true        # compact image targets live on the GPU (host memory is the limit)
+  sky_weight: 0.0            # opacity penalty on "sky": rays above the horizon that meet no LiDAR /
+  sky_min_elevation: 5.0     # prior surface (deg). Off: far facades and trees count as sky too
+                             # (Keble 0.1: holdout 24.0 -> 21.6 dB, 8% of LiDAR rays missed)
+  depth_max_range: 60.0      # LiDAR depth targets without a depth_prior stage
+  mask: {dilate: 4}          # C++ TrainingMaskConfig: moving points
+  coverage: {max_range: 40.0, point_spacing: 0.05}  # C++ CoverageConfig
+  coverage_stride: 2         # images per coverage pass (views are scaled back)
+  min_views: 3               # usable views below this: frozen Gaussian
+  init: {tangent_factor: 0.8, opacity: 0.9}  # C++ GaussianInitConfig
+  init_projection:           # anchors moved onto their local planes (one MLS step): flat discs
+    radius: 0.15             # on a noisy point layer stop rays at its front (Keble: held-out
+    min_neighbors: 8         # LiDAR depth -8.6 -> -2.7 cm); null keeps the raw points
+    min_planarity: 0.3
+    max_shift: 0.1
+  use_prior_points: true     # DA3 points of the LiDAR holes (depth_prior/points.npz)
+  prior_scale: 0.03          # m
+  prior_opacity: 0.5
+  block_max_gaussians: 12000000 # one block while the Gaussians fit (6.3M: ~17 GB on the GPU); else xy tiles of
+  block_size: 40.0           # m, trained one after the other
+  block_margin: 5.0          # m of Gaussians around the core (at least image_reach)
+  image_reach: 15.0          # m: images taken this far outside the core train the block
+  iterations: 30000          # per block
+  sh_degree: 3
+  sh_interval: 1000          # steps per added SH band
+  near_plane: 0.3
+  far_plane: 200.0
+  ssim_weight: 0.2
+  depth_weight: 1.0          # relative z-depth error (Keble 10k steps: 0.1 -> held-out LiDAR depth
+                             # 6.8 cm median, 1.0 -> 5.4 cm, PSNR -0.4 dB)
+  prior_weight: 0.5          # DA3 targets relative to LiDAR ones ...
+  prior_decay_until: 15000   # ... decaying to zero by this step
+  flatten_weight: 0.01       # mean smallest scale (m)
+  anchor_weight: 0.01        # anchored Gaussians leaving their point beyond the tolerance
+  anchor_tolerance: 0.02     # m (at least 2 sigma)
+  anchor_prune: 0.15         # m: pruned beyond
+  max_scale_growth: null     # scales capped at this x their initial value (null: free; 1.5:
+                             # depth 5.3 cm but PSNR -1.8 dB, the discs must cover the gaps)
+  appearance_weight: 0.001   # per-image gain / bias towards identity
+  below_floor: 0.05          # m: Gaussians below the floor are pruned (reflections)
+  prune_opacity: 0.005
+  refine_every: 100
+  densify_from: 500
+  densify_until: 15000
+  densify_fraction: 0.002    # of the Gaussians per refinement, by 3D gradient
+  densify_grad: 1.0e-6
+  split_scale: 0.05          # m: larger Gaussians are split, smaller cloned
+  max_gaussians: 8000000
+  free_space:
+    enabled: true
+    voxel: 0.2
+    endpoint_margin: 0.2
+    min_misses: 3
+  lidar_views:               # depth seen from the LiDAR origins of the keyframes (README 8.3)
+    enabled: false
+    stride: 1                # every n-th keyframe
+    faces: 4                 # gravity-aligned pinhole views around the horizon
+    width: 256               # px per view; height from vfov
+    vfov: 110.0              # deg
+    max_range: 60.0          # map rendered into the views
+    every: 2                 # one keyframe's views every n steps
+    weight: 1.0              # relative z-depth error
+    alpha_weight: 0.1        # opacity where the LiDAR saw a surface
+  lr: {means: 1.6e-5, scales: 5.0e-3, quats: 1.0e-3, opacity: 5.0e-2, sh0: 2.5e-3, shn: 1.25e-4, appearance: 1.0e-3}
+
+gs_verify:                   # the Gaussians against the LiDAR (README 8.3)
+  sweep_stride: 20           # non-keyframe sweeps (held out of the map) used
+  rays_per_sweep: 3000
+  min_range: 1.0
+  max_range: 40.0
+  render: {cutoff: 3.0, cell: 0.5, max_range: 60.0}  # C++ RayRenderConfig
+  min_opacity: 0.5           # Gaussians compared with the map / reference
+  surface_radius: 0.15       # m, local plane of the map / reference
+  max_distance: 0.5
+  top_resolution: 0.5        # m, cells of verify_top.png
+  reference: null            # handheld reference directory (cloud.npz), registered by `accept`
+
+ortho:                       # orthophoto per level from the Gaussians
+  resolution: 0.02           # m per pixel
+  tile: 2048                 # px
+  below_floor: 0.3           # m: slab from the floor ...
+  below_ceiling: 0.3         # ... to this far under the ceiling
+  min_opacity: 0.05
 
 refine:                      # scan-to-map refinement, used when ba is disabled
   enabled: false
@@ -134,7 +319,28 @@ calibration:                 # camera time offset + extrinsic on the pose set
     iterations: 15
 
 models:
-  backend: auto              # auto | oracle | none (oracle = synthetic ground truth)
+  backend: auto              # auto | oracle | real | none (oracle = synthetic ground truth;
+                             # real = the GPU models below; auto = oracle with --gt, else none)
+  da3:                       # depth prior (README 8.2); SMALL / BASE are Apache 2.0,
+    model: depth-anything/DA3-BASE  # LARGE / GIANT CC BY-NC (research only). HF id or directory
+    device: cuda
+    views: [[-28, 0], [28, 0]]  # virtual pinholes (yaw, pitch deg) per fisheye; pitched views
+                             # (sky / ground) fit worse (Keble: 3.9 vs 4.6 % residual)
+    view_hfov: 80.0
+    view_size: [504, 378]    # multiples of the 14 px patch
+    batch_views: 96          # views per DA3 call (multi-view attention within a call)
+    process_res: 504
+    conf_scale: 3.0          # confidence = 1 - exp(-(conf - 1) / conf_scale)
+  roma:                      # dense matcher (README 8.4): camera calibration; MIT + DINOv2 Apache 2.0
+    weights: null            # directory with roma_outdoor.pth, dinov2_vitl14_pretrain.pth (null: download)
+    device: cuda
+    max_matches: 2000
+    min_certainty: 0.3
+    grid_step: 16            # px between query points of an anchor image
+  dino:                      # DINOv2 ViT-L/14 patch features (DenseFeatures, AnyLoc descriptors)
+    weights: null
+    device: cuda
+    resolution: 518
   oracle:
     segmenter: {min_pixels: 20, split_probability: 0.05}
     encoder: {dimension: 64, mask_noise: 0.35, text_noise: 0.1, confusion: 0.1}
@@ -165,7 +371,8 @@ map:
     min_through: 2
     min_ratio: 0.6           # within one session
     min_height: 0.15         # never remove points below this height above floor
-    ego_radius: 0.9          # the ego vehicle's swept path is free space (half width)
+    ego_radius: 0.9          # the ego vehicle's swept path is free space (half width); 0 for
+                             # handheld rigs (the carrier walks next to parked cars, README 4.3)
     ego_height: 2.0          # up to this height above the floor
 
 levels:
@@ -251,6 +458,8 @@ objects:
   static_displacement: 1.0
   typical_vehicle_size: [4.6, 1.85, 1.5]
   moving_fraction: 0.15        # cluster share of moved points that marks a moving object
+  streak_min_moved: 0.05       # a cluster longer than 7 m is a moving smear only with this share
+                               # of moved points (a row of touching parked cars has ~2 %)
   parked_min_points: 150       # aggregated points needed for a parked object
   parked_min_extent: 1.0       # m, observed footprint
   vehicle_max_height: 2.3

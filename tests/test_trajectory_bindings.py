@@ -111,6 +111,7 @@ def test_bundle_adjustment_planes_binding():
         local = (world - pose[:3, 3]) @ pose[:3, :3]
         keyframes.add(0, k, float(k), pose, local)
     config = _core.LidarBaConfig()
+    config.min_range = 1.0  # A small room: the default (5 m) keeps few returns.
     planes = _core.extract_planes(keyframes, np.asarray(poses), config)
     offsets = planes["offsets"].astype(int)
     assert len(planes["rms"]) > 50
