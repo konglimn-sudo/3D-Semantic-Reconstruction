@@ -30,10 +30,14 @@ def trip_inputs(ds: TripDataset, odom: TripOdometry) -> _core.TripInputs:
     return ti
 
 
-def run_graph(kfs: KeyframeSet, datasets: list[TripDataset], odoms: list[TripOdometry], cfg, log=print) -> dict:
-    """Returns {poses (K, 4, 4), loops, anchors, gravity, summary, loops_tested, loops_verified}."""
+def run_graph(kfs: KeyframeSet, datasets: list[TripDataset], odoms: list[TripOdometry], cfg, log=print,
+              appearance: np.ndarray | None = None) -> dict:
+    """Returns {poses (K, 4, 4), loops, anchors, gravity, summary, loops_tested, loops_verified}.
+
+    `appearance`: (N, 2) keyframe pairs proposed by image retrieval (appearance.py)."""
     core = kfs.to_core(graph_voxels(cfg))
-    return _core.run_graph_stage(core, [trip_inputs(ds, o) for ds, o in zip(datasets, odoms)], graph_config(cfg), log)
+    return _core.run_graph_stage(core, [trip_inputs(ds, o) for ds, o in zip(datasets, odoms)], graph_config(cfg), log,
+                                 appearance)
 
 
 def loop_json(lc) -> dict:

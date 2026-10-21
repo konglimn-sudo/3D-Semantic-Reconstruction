@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "gr/check.h"
+#include "gr/cloud_compare.h"
 #include "gr/registration.h"
 #include "gr/scan_context.h"
 
@@ -133,6 +134,109 @@ std::vector<LoopConstraint> DetectLoops(const KeyframeSet& keyframes,
       stats->tested += tested[q];
       stats->queries += had[q];
     }
+  }
+  return loops;
+}
+
+std::vector<LoopConstraint> VerifyAppearanceLoops(
+    const KeyframeSet& keyframes, const std::vector<Pose>& poses,
+    const std::vector<std::pair<int, int>>& candidates,
+    const LoopConfig& config, const AppearanceLoopConfig& appearance,
+    int* tested) {
+  const int n = static_cast<int>(candidates.size());
+  std::vector<std::optional<LoopConstraint>> found(static_cast<size_t>(n));
+  std::vector<int> runs(static_cast<size_t>(n), 0);
+  CoarseAlignConfig coarse;
+  coarse.voxel = appearance.coarse_voxel;
+  coarse.normal_radius = 2.5 * appearance.coarse_voxel;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+  for (int c = 0; c < n; ++c) {
+    const auto [i, j] = candidates[static_cast<size_t>(c)];
+    if (i < 0 || j < 0 || i >= static_cast<int>(keyframes.size()) ||
+        j >= static_cast<int>(keyframes.size()) || i == j) {
+      continue;
+    }
+    const size_t ii = static_cast<size_t>(i), jj = static_cast<size_t>(j);
+    const Points source_world = TransformPoints(
+        keyframes.Submap(ii, config.submap_half_window,
+                         appearance.coarse_voxel, poses),
+        poses[ii]);
+    const Points target_world = TransformPoints(
+        keyframes.Submap(jj, config.submap_half_window,
+                         appearance.coarse_voxel, poses),
+        poses[jj]);
+    const std::vector<CoarseAlignment> all = AlignGravityAlignedCandidates(
+        source_world, target_world, coarse, appearance.z_peak_ratio);
+    // Every yaw first (its best height), then the other heights by score: in
+    // a symmetric layout the right yaw can rank below the mirrored one, and
+    // both must be tested for the ambiguity gap to see them.
+    std::vector<CoarseAlignment> hypotheses;
+    std::vector<char> taken(all.size(), 0);
+    std::vector<double> yaws;
+    for (size_t h = 0; h < all.size(); ++h) {
+      const Mat3& r = all[h].reference_from_source.rotation;
+      const double yaw = RadToDeg(std::atan2(r(1, 0), r(0, 0)));
+      bool seen = false;
+      for (double y : yaws) {
+        seen = seen || std::abs(std::remainder(yaw - y, 360.0)) < 1.0;
+      }
+      if (seen) continue;
+      yaws.push_back(yaw);
+      hypotheses.push_back(all[h]);
+      taken[h] = 1;
+    }
+    for (size_t h = 0; h < all.size(); ++h) {
+      if (!taken[h]) hypotheses.push_back(all[h]);
+    }
+    if (static_cast<int>(hypotheses.size()) > appearance.max_hypotheses) {
+      hypotheses.resize(static_cast<size_t>(appearance.max_hypotheses));
+    }
+    const Points& source = keyframes.Cloud(ii, config.icp_voxel);
+    const Points target =
+        keyframes.Submap(jj, config.submap_half_window, config.icp_voxel,
+                         poses);
+    std::vector<IcpResult> results;
+    for (const CoarseAlignment& h : hypotheses) {
+      const Pose initial =
+          poses[jj].Inverse() * h.reference_from_source * poses[ii];
+      results.push_back(AlignMultiScale(source, target, initial,
+                                        config.icp_schedule, config.icp_voxel,
+                                        config.icp_iters, false));
+      ++runs[static_cast<size_t>(c)];
+    }
+    if (results.empty()) continue;
+    size_t best = 0;
+    for (size_t r = 1; r < results.size(); ++r) {
+      if (results[r].fitness > results[best].fitness) best = r;
+    }
+    // The best distinct solution (repeated layouts give a second peak).
+    double runner_up = 0.0;
+    for (size_t r = 0; r < results.size(); ++r) {
+      const Pose d = results[best].pose.Inverse() * results[r].pose;
+      if (d.translation.norm() > appearance.distinct_t ||
+          RadToDeg(RotationAngle(d.rotation)) > appearance.distinct_r) {
+        runner_up = std::max(runner_up, results[r].fitness);
+      }
+    }
+    const IcpResult& icp = results[best];
+    if (icp.fitness < config.min_fitness || icp.rmse > config.max_rmse ||
+        icp.fitness - runner_up < appearance.min_fitness_gap) {
+      continue;
+    }
+    LoopConstraint loop;
+    loop.i = i;
+    loop.j = j;
+    loop.j_from_i = icp.pose;
+    loop.fitness = icp.fitness;
+    loop.rmse = icp.rmse;
+    found[static_cast<size_t>(c)] = loop;
+  }
+  std::vector<LoopConstraint> loops;
+  for (int c = 0; c < n; ++c) {
+    if (found[static_cast<size_t>(c)]) loops.push_back(*found[static_cast<size_t>(c)]);
+    if (tested != nullptr) *tested += runs[static_cast<size_t>(c)];
   }
   return loops;
 }

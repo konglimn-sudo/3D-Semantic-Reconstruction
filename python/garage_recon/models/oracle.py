@@ -298,10 +298,10 @@ class OracleDepthPrior:
         self.seed = seed
 
     def predict(self, frames: list[interfaces.Frame],
-                world_from_camera: list[np.ndarray]) -> list[
-                    interfaces.DepthMap]:
+                world_from_camera: list[np.ndarray],
+                cameras: dict | None = None) -> list[interfaces.DepthMap]:
         """Ground-truth range per frame (poses unused: they are known)."""
-        del world_from_camera
+        del world_from_camera, cameras
         out = []
         for frame in frames:
             depth = self.world.render(frame.trip_id, frame.camera,

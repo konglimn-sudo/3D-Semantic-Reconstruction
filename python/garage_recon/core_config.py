@@ -24,7 +24,11 @@ def fill(struct, section, **renames):
 
 
 def odometry_config(cfg) -> _core.OdometryConfig:
-    return fill(_core.OdometryConfig(), cfg.odometry)
+    section = dict(cfg.odometry)
+    lio = section.pop("lio", None)
+    config = fill(_core.OdometryConfig(), section)
+    config.lio = fill(_core.LioConfig(), lio)
+    return config
 
 
 def keyframe_config(cfg) -> _core.KeyframeConfig:
@@ -34,7 +38,10 @@ def keyframe_config(cfg) -> _core.KeyframeConfig:
 def graph_config(cfg) -> _core.GraphStageConfig:
     config = _core.GraphStageConfig()
     config.loops = fill(_core.LoopConfig(), cfg.loops)
+    config.appearance = fill(_core.AppearanceLoopConfig(),
+                             cfg.loops.get("appearance"))
     config.backend = fill(_core.BackendConfig(), cfg.backend)
+    config.trip_align = fill(_core.TripAlignConfig(), cfg.get("trip_align"))
     config.ba = fill(_core.LidarBaConfig(), cfg.get("ba"))
     config.refine = fill(_core.RefineConfig(), cfg.refine)
     return config

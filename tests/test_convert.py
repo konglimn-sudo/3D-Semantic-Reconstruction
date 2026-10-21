@@ -3,6 +3,8 @@ compared with what was written (LiDAR, IMU, wheel, GNSS, cameras, INS pose,
 rig), and a tilted handheld rig gets a levelled vehicle frame on the
 floor."""
 
+import pickle
+
 import cv2
 import numpy as np
 import pytest
@@ -86,6 +88,32 @@ def _pointcloud(t_end: float, xyz: np.ndarray, rows: int = 4):
                 height=rows, width=width, fields=fields, is_bigendian=False,
                 point_step=20, row_step=width * 20 + 8,
                 data=padded.reshape(-1), is_dense=False), points
+
+
+def test_sweep_time_ignores_returns_without_echo():
+    # Hilti 2021 Ouster clouds: a pixel without an echo (x = y = z = 0) can
+    # carry an undefined `t` (+4.1 s); the sweep timing must come from the
+    # valid returns, or the whole sweep is stamped 4 s late.
+    rng = np.random.default_rng(3)
+    xyz = rng.uniform(2.0, 10.0, (300, 3))
+    msg, points = _pointcloud(100.0, xyz)  # Header stamp = sweep start here.
+    t = points["t"].copy()
+    t[len(xyz):] = 4_100_000_000  # The zero padding points.
+    msg.data[:] = 0
+    raw = np.zeros(len(points) * 20, np.uint8)
+    points["t"] = t
+    raw[:] = points.view(np.uint8).reshape(-1)
+    width = msg.width
+    padded = np.zeros((msg.height, width * 20 + 8), np.uint8)
+    padded[:, :width * 20] = raw.reshape(msg.height, width * 20)
+    msg.data = padded.reshape(-1)
+    lidar = profile_lib.LidarProfile("os", "/points", np.eye(4), stamp="start")
+    sweep = rosbag.decode_sweep(msg, lidar)
+    valid = t[:len(xyz)] * 1e-9
+    assert sweep.stamp_ns == pytest.approx(
+        (100.0 + valid.max() - valid.min()) * 1e9, abs=1e3)
+    assert sweep.time.min() >= -0.1 and sweep.time.max() == 0.0
+    assert len(sweep.xyz) == len(xyz)
 
 
 def _enu_to_geodetic(enu: np.ndarray) -> tuple[float, float, float]:
@@ -288,6 +316,39 @@ def test_round_trip(recording, tmp_path):
     assert np.allclose(ds.initial_pose(), truth["world_sensor"]
                        @ np.linalg.inv(T_vehicle_reference), atol=1e-9)
     assert ds.initial_pose_time() == pytest.approx(START + 0.12)
+
+
+def test_parallel_windows_match_one_process(recording, tmp_path):
+    root, _ = recording
+    profile = profile_lib.Profile.from_dict(_profile(level=False))
+    trips = [rosbag.convert([root / "rec.bag"], profile, tmp_path / name,
+                            log=lambda *_: None, jobs=jobs)
+             for name, jobs in (("one", 1), ("three", 3))]
+    one, three = (dataset.TripDataset(trip) for trip in trips)
+    assert np.array_equal(one.lidar_stamps_ns, three.lidar_stamps_ns)
+    for k in range(len(one)):
+        assert np.array_equal(one.load_lidar(k).points,
+                              three.load_lidar(k).points)
+    for stream in ("imu", "wheel", "gnss"):
+        assert np.array_equal(getattr(one, stream)(),
+                              getattr(three, stream)()), stream
+    assert np.allclose(one.initial_pose(), three.initial_pose())
+    assert one.rig.to_dict() == three.rig.to_dict()
+    # Rate-limited cameras restart their spacing in every window.
+    images = len(one.camera_stamps_ns("cam"))
+    assert images <= len(three.camera_stamps_ns("cam")) <= images + 2
+
+
+def test_clock_correction_models_and_pickling():
+    piecewise = rosbag.ClockCorrection(np.array([10.0, 20.0]),
+                                       np.array([0.04, 0.05]), -0.022)
+    assert piecewise(15.0) == pytest.approx(0.045 - 0.022)
+    assert piecewise(0.0) == pytest.approx(0.04 - 0.022)  # Held.
+    linear = rosbag.ClockCorrection(np.array([10.0, 20.0]),
+                                    np.array([0.04, 0.05]), 0.0,
+                                    extrapolate=True)
+    assert linear(30.0) == pytest.approx(0.06)
+    assert pickle.loads(pickle.dumps(piecewise))(15.0) == piecewise(15.0)
 
 
 def test_handheld_rig_is_levelled_onto_the_floor(recording, tmp_path):

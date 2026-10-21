@@ -1,0 +1,36 @@
+# Mandeye handheld scanner with a Livox Mid-360 (serial 47MDL9T0020017) and
+# its built-in IMU: "Underground Parking Dataset", an underground garage in
+# Skierniewice, Poland (huggingface.co/datasets/MichalPelka/
+# UndegroundParkingDataset, Apache 2.0). Ground truth: Z+F IMAGER 5010
+# terrestrial scan (ground-truth/*.laz) in its own frame.
+# Use with: convert --mandeye <dataset>/mandeye --profile this.yaml
+#
+# The recording has no calibration file; the extrinsics are the Mid-360
+# factory values (user manual: IMU origin at (11.0, 23.29, -44.12) mm in
+# the point cloud frame, axes parallel). LiDAR and IMU share the device
+# clock.
+#
+# The rig is carried: the vehicle frame is levelled with the gravity the
+# IMU measures at the start and put on the floor below the LiDAR.
+garage_id: skierniewice_underground
+reference: livox
+vehicle:
+  level: true
+  floor: auto
+  forward: [1.0, 0.0, 0.0]   # Livox x points forward.
+  level_window: 1.0
+lidars:
+  livox:
+    topic: lidar             # lidarNNNN.laz
+    T_reference_sensor: null
+    intensity_scale: 0.00392156862745098   # Livox reflectivity 0-255.
+    min_range: 0.8           # The operator.
+    max_range: 60.0
+    storage_step: 0.002
+    sweep_duration: 0.1
+imu:
+  topic: imu                 # imuNNNN.csv
+  T_reference_sensor:
+    quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+    translation: [0.011, 0.02329, -0.04412]
+  accel_scale: 9.80665       # Logged in g.

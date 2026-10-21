@@ -119,6 +119,13 @@ OdometryPipeline::OdometryPipeline(const OdometryConfig& config,
       odometry_(config, world_from_vehicle0 * vehicle_from_lidar) {
   use_prior_ = config_.use_wheel_prior && prior_.valid();
   use_gyro_ = !use_prior_ && config_.use_gyro_prior && prior_.has_gyro();
+  if (config_.use_lio && prior_.has_gyro()) {
+    LioConfig lio = config_.lio;
+    lio.min_range = config_.min_range;
+    lio.max_range = config_.max_range;
+    lio_.emplace(lio, prior_.imu(), vehicle_from_lidar, world_from_vehicle0);
+    use_prior_ = use_gyro_ = false;
+  }
 }
 
 bool OdometryPipeline::IsKeyframe(const Pose& pose) const {
@@ -219,7 +226,11 @@ OdometryFrame OdometryPipeline::Process(
   }
 
   OdometryFrame frame;
-  if (external_pose) {
+  if (lio_) {
+    const Pose pose = lio_->Process(points, times, stamp);
+    frame.pose = external_pose ? *external_pose : pose;
+    imu_deskewed = lio_->last_deskewed();
+  } else if (external_pose) {
     frame.pose = *external_pose;
   } else if (imu_deskewed) {  // Compensated: no constant-velocity deskew.
     frame.pose = odometry_.RegisterFrame(*imu_deskewed, {}, stamp, predicted);

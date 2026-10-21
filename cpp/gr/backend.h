@@ -4,8 +4,8 @@
 // accelerometer gravity factors for roll / pitch), wheel-speed velocity
 // factors, and the LiDAR bundle adjustment (plane factors, lidar_ba.h) or the
 // older scan-to-map refinement. RunGraphStage is the whole stage: graph
-// without loops -> loop detection + PCM -> graph with loops -> bundle
-// adjustment.
+// without loops -> placing the trips without an anchor (AlignTrips) -> loop
+// detection + PCM -> graph with loops -> bundle adjustment.
 
 #ifndef GARAGE_RECON_GR_BACKEND_H_
 #define GARAGE_RECON_GR_BACKEND_H_
@@ -93,6 +93,9 @@ struct Anchor {
   double sigma_t = 1.0;          // kPose (m)
   double sigma_r = 1.0;          // kPose (deg)
   double sigma = 1.0;            // kPosition (m)
+  // The weak prior of a trip without an INS pose or GNSS fix (MakeAnchors);
+  // AlignTrips moves it.
+  bool weak = false;
 };
 
 // Everything the back-end needs from one trip besides its keyframes.
@@ -189,15 +192,76 @@ std::vector<Pose> RunLidarBa(
     const Logger& log = nullptr, const std::vector<TripInputs>* trips = nullptr,
     InertialEstimate* inertial = nullptr);
 
+// A trip without an entrance anchor (a handheld or backpack session) starts
+// in the frame of its own first pose, so the position-gated loop candidates
+// cannot connect it to the other trips. AlignTrips places such trips before
+// loop detection: the trip's map at the current poses is registered onto the
+// map of the trips placed so far. The gravity-aligned coarse search of
+// cloud_compare.h proposes hypotheses (four yaws; one height per correlation
+// peak, as levels of the same layout give one peak per level spacing), each
+// is refined by multi-scale ICP, and the best fit is accepted only if no
+// distinct hypothesis fits nearly as well (a garage of identical levels seen
+// on one level only cannot be placed). Without any anchored trip the first
+// trip defines the world frame.
+struct TripAlignConfig {
+  bool enabled = true;
+  double voxel = 0.2;  // Keyframe sweeps used; the maps are downsampled to it.
+  std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};
+  int icp_iters = 40;
+  double min_score = 0.3;  // Coarse: fraction of structure cells matched.
+  double z_peak_ratio = 0.5;  // Height hypotheses (AlignGravityAlignedCandidates).
+  int max_candidates = 8;     // Hypotheses refined by ICP, best score first.
+  double min_fitness = 0.5;   // ICP: inliers / points of the trip's map.
+  // ICP (m). Whole-trip maps carry each trip's own drift: 14 cm between the
+  // two Oxford Spires Keble sessions (Hesai QT64).
+  double max_rmse = 0.2;
+  // A distinct solution (beyond distinct_t or distinct_r from the best) must
+  // fit this much worse (fitness difference). The fitness saturates in
+  // regular garages, where a wrong placement still matches floors, ceilings
+  // and most columns: 0.999 vs 0.952 on the test garage, 0.984 vs 0.787 for
+  // the wrong level of the synthetic two-level garage.
+  double min_fitness_gap = 0.03;
+  double distinct_t = 1.0;  // m
+  double distinct_r = 5.0;  // deg
+  // Prior of an aligned trip's first keyframe; inter-trip loops refine it.
+  double sigma_t = 2.0;  // m
+  double sigma_r = 5.0;  // deg
+};
+
+struct TripAlignment {
+  int trip = 0;
+  bool aligned = false;
+  Pose correction;  // Applied to the trip's poses (world <- trip map).
+  double score = 0.0;      // Coarse score of the accepted hypothesis.
+  double fitness = 0.0;    // Its ICP fitness and RMSE.
+  double rmse = 0.0;
+  double runner_up = 0.0;  // Best ICP fitness of a distinct hypothesis.
+  int hypotheses = 0;      // Refined by ICP.
+};
+
+// Places the trips that only have a weak anchor (Anchor::weak) onto the
+// others, in trip order: on success their `poses` and weak anchors are moved
+// by the correction (and the anchor tightened to config.sigma_t / sigma_r).
+// Returns one entry per such trip except the reference.
+std::vector<TripAlignment> AlignTrips(const KeyframeSet& keyframes,
+                                      const TripAlignConfig& config,
+                                      std::vector<Pose>& poses,
+                                      std::vector<Anchor>& anchors,
+                                      const Logger& log = nullptr);
+
 struct GraphStageConfig {
   LoopConfig loops;
+  AppearanceLoopConfig appearance;  // Externally proposed loop pairs.
   BackendConfig backend;
+  TripAlignConfig trip_align;
   LidarBaConfig ba;
   RefineConfig refine;  // Used when the bundle adjustment is disabled.
 
   // Voxel sizes at which a KeyframeSet must keep sweeps for this stage.
   std::vector<double> RequiredVoxels() const {
-    std::vector<double> voxels = {loops.sc_voxel, loops.icp_voxel};
+    std::vector<double> voxels = {loops.sc_voxel, loops.icp_voxel,
+                                  appearance.coarse_voxel};
+    if (trip_align.enabled) voxels.push_back(trip_align.voxel);
     if (ba.enabled) voxels.push_back(ba.sweep_voxel);
     if (refine.enabled) voxels.push_back(refine.voxel);
     return voxels;
@@ -210,6 +274,7 @@ struct GraphStageResult {
   std::vector<LoopConstraint> loops;
   std::vector<Anchor> anchors;
   std::vector<GravityMeasurement> gravity;
+  std::vector<TripAlignment> trip_alignments;
   GraphSummary summary;  // Of the last optimisation.
   LidarBaSummary ba;
   LoopStats loop_stats;
@@ -217,10 +282,13 @@ struct GraphStageResult {
 };
 
 // `keyframes` must keep sweeps at every voxel of config.RequiredVoxels().
-GraphStageResult RunGraphStage(const KeyframeSet& keyframes,
-                               const std::vector<TripInputs>& trips,
-                               const GraphStageConfig& config,
-                               const Logger& log = nullptr);
+// `appearance` holds keyframe pairs proposed by image retrieval (later
+// keyframe first); they are verified without the graph's pose guess
+// (VerifyAppearanceLoops) and join the geometric loops before PCM.
+GraphStageResult RunGraphStage(
+    const KeyframeSet& keyframes, const std::vector<TripInputs>& trips,
+    const GraphStageConfig& config, const Logger& log = nullptr,
+    const std::vector<std::pair<int, int>>& appearance = {});
 
 // Poses of all frames of a trip: the odometry corrected by the keyframe
 // corrections (kf_pose * kf_odom^-1), interpolated in time.

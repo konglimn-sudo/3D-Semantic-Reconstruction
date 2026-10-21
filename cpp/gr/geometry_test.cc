@@ -53,5 +53,33 @@ GR_TEST(GeometryTest, RansacPlaneIgnoresOutliers) {
   GR_EXPECT_GE(fit.inliers.size(), 2000u);
 }
 
+GR_TEST(GeometryTest, ProjectionOntoLocalPlanesRemovesTheNoiseOfAWall) {
+  // A 4 x 3 m wall (x = 0) sampled every 5 cm with 1.5 cm noise along its
+  // normal, and a corner edge where a second wall (y = 0) meets it.
+  std::mt19937 rng(11);
+  std::normal_distribution<double> noise(0.0, 0.015);
+  Points points;
+  for (double y = 0.05; y < 4.0; y += 0.05) {
+    for (double z = 0.0; z < 3.0; z += 0.05) {
+      points.emplace_back(noise(rng), y, z);
+    }
+  }
+  std::vector<double> shift;
+  const Points projected =
+      ProjectToLocalPlanes(points, 0.15, 8, 64, 0.3, 0.1, &shift);
+  double before = 0.0, after = 0.0;
+  for (size_t i = 0; i < points.size(); ++i) {
+    before += points[i].x() * points[i].x();
+    after += projected[i].x() * projected[i].x();
+    // Only along the normal: the wall coordinates stay.
+    GR_EXPECT_NEAR(projected[i].y(), points[i].y(), 0.02);
+    GR_EXPECT_LE(std::abs(shift[i]), 0.1);
+  }
+  before = std::sqrt(before / points.size());
+  after = std::sqrt(after / points.size());
+  GR_EXPECT_NEAR(before, 0.015, 0.002);
+  GR_EXPECT_LT(after, 0.006);
+}
+
 }  // namespace
 }  // namespace gr

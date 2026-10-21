@@ -43,6 +43,16 @@ std::optional<CoarseAlignment> AlignGravityAligned(
     const Points& source, const Points& reference,
     const CoarseAlignConfig& config = {});
 
+// Every hypothesis of the search above for a verification by ICP: the four
+// yaw candidates (best occupancy score first), each with the height shifts
+// whose correlation is a local maximum reaching `z_peak_ratio` of the best
+// (levels of the same layout give one peak per level spacing; 1 keeps the
+// best only). `ambiguity` is that of the best yaw. Empty if either cloud has
+// too little vertical structure.
+std::vector<CoarseAlignment> AlignGravityAlignedCandidates(
+    const Points& source, const Points& reference,
+    const CoarseAlignConfig& config = {}, double z_peak_ratio = 0.5);
+
 struct SurfaceDistances {
   // Along the normal of the reference surface fitted around the nearest
   // reference points (positive on the side the normal points to); NaN where

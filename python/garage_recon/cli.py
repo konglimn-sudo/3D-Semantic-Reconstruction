@@ -3,9 +3,9 @@
     garage-recon synth     --out DATA [--preset small] [--trips 2] [--seed 0]
                            [--ideal] [--no-handheld]
     garage-recon handheld  --data DATA [--seed 0]
-    garage-recon convert   --bag BAG [BAG ...] --profile PROFILE.yaml
-                           --out TRIP [--trip-id ID] [--start S]
-                           [--duration S]
+    garage-recon convert   (--bag BAG [BAG ...] | --mandeye DIR)
+                           --profile PROFILE.yaml --out TRIP [--trip-id ID]
+                           [--start S] [--duration S] [--jobs N]
     garage-recon import-scan --cloud EXPORT --out HANDHELD
                            [--trajectory TUM] [--margin 15] [--voxel 0.02]
                            [--no-draft]
@@ -23,8 +23,8 @@
 
 `handheld` adds the synthetic handheld-scanner ground truth (cloud and
 digitised features in the scanner's own frame) to a synthetic dataset;
-`convert` turns a ROS bag into a trip with a conversion profile (see
-convert/profiles/); `import-scan` turns a scanner export into a handheld
+`convert` turns a ROS bag or a Mandeye recording into a trip with a
+conversion profile (see convert/profiles/); `import-scan` turns a scanner export into a handheld
 ground-truth directory with drafted levels and columns; `accept` registers
 a reconstruction to a handheld result and writes the survey acceptance
 report (work/acceptance/report.md); `viewer` exports reconstructions (map,
@@ -146,7 +146,11 @@ def main(argv=None) -> int:
 
     convert = commands.add_parser(
         "convert", help="ROS bag -> trip directory (conversion profile)")
-    convert.add_argument("--bag", nargs="+", required=True)
+    source = convert.add_mutually_exclusive_group(required=True)
+    source.add_argument("--bag", nargs="+", help="ROS 1 / ROS 2 bag(s)")
+    source.add_argument("--mandeye", default=None,
+                        help="Mandeye recording directory (lidarNNNN.laz, "
+                             "imuNNNN.csv)")
     convert.add_argument("--profile", required=True,
                          help="profile YAML (e.g. convert/profiles/*.yaml)")
     convert.add_argument("--out", required=True)
@@ -154,6 +158,9 @@ def main(argv=None) -> int:
     convert.add_argument("--start", type=float, default=0.0,
                          help="seconds to skip at the start")
     convert.add_argument("--duration", type=float, default=None)
+    convert.add_argument("--jobs", type=int, default=1,
+                         help="ROS bags: processes reading time windows in "
+                              "parallel (compressed bags)")
 
     scan_in = commands.add_parser(
         "import-scan", help="scanner export -> handheld ground truth")
@@ -218,13 +225,21 @@ def main(argv=None) -> int:
     elif args.cmd == "handheld":
         handheld.simulate_handheld(args.data, args.seed, log=_log)
     elif args.cmd == "convert":
-        # Imported here: rosbags is an optional dependency.
+        # Imported here: rosbags and laspy are optional dependencies.
         # pylint: disable-next=import-outside-toplevel
         from garage_recon.convert import profile as profile_lib
-        # pylint: disable-next=import-outside-toplevel
-        from garage_recon.convert import rosbag
-        rosbag.convert(args.bag, profile_lib.load(args.profile), args.out,
-                       args.trip_id, args.start, args.duration, log=_log)
+        profile = profile_lib.load(args.profile)
+        if args.mandeye:
+            # pylint: disable-next=import-outside-toplevel
+            from garage_recon.convert import mandeye
+            mandeye.convert(args.mandeye, profile, args.out, args.trip_id,
+                            args.start, args.duration, log=_log)
+        else:
+            # pylint: disable-next=import-outside-toplevel
+            from garage_recon.convert import rosbag
+            rosbag.convert(args.bag, profile, args.out, args.trip_id,
+                           args.start, args.duration, log=_log,
+                           jobs=args.jobs)
     elif args.cmd == "import-scan":
         scan_import.import_scan(args.cloud, args.out, args.voxel,
                                 args.trajectory, args.margin,

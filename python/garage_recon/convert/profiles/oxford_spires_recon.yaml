@@ -1,0 +1,10 @@
+# Reconstruction settings for the Oxford Spires handheld rig (Hesai QT64,
+# Alphasense Core), from the trial on keble-college-02 / -03 (2026-10-16).
+# Use with: recon --config this.yaml (after convert with oxford_spires.yaml).
+#
+# Defaults otherwise (BA from 5 m: ATE 7.0 cm against the 1-2 cm reference
+# trajectory, README 9.6).
+# A person, not a car: the walked path is not cleared at car width.
+map:
+  dynamic:
+    ego_radius: 0.0

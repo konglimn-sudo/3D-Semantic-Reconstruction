@@ -77,6 +77,61 @@ RenderResult RenderPoints(const CameraModel& camera,
   return buffer.TakeResult();
 }
 
+std::vector<float> RenderSurfaceDepth(const CameraModel& camera,
+                                      const CameraExposure& exposure,
+                                      const Points& points_world,
+                                      double point_spacing, int min_radius,
+                                      int max_radius, double min_range,
+                                      double max_range, double abs_tol,
+                                      double rel_tol, int mean_radius) {
+  const RenderResult nearest =
+      RenderPoints(camera, exposure, points_world, {}, point_spacing,
+                   min_radius, max_radius, min_range, max_range);
+  const int width = camera.width();
+  const int height = camera.height();
+  const size_t num_pixels =
+      static_cast<size_t>(width) * static_cast<size_t>(height);
+  std::vector<double> sum(num_pixels, 0.0);
+  std::vector<int> count(num_pixels, 0);
+  const double focal = camera.focal();
+  for (const Vec3& point : points_world) {
+    const std::optional<CameraExposure::Projection> projection =
+        exposure.Project(camera, point);
+    if (!projection) continue;
+    const double range = projection->point_camera.norm();
+    if (range < min_range || range > max_range) continue;
+    const int u = static_cast<int>(std::floor(projection->uv.x()));
+    const int v = static_cast<int>(std::floor(projection->uv.y()));
+    const int radius = std::min(
+        mean_radius,
+        std::clamp(static_cast<int>(std::lround(focal * point_spacing / range)),
+                   min_radius, max_radius));
+    for (int dv = -radius; dv <= radius; ++dv) {
+      const int vv = v + dv;
+      if (vv < 0 || vv >= height) continue;
+      for (int du = -radius; du <= radius; ++du) {
+        const int uu = u + du;
+        if (uu < 0 || uu >= width) continue;
+        const size_t pixel =
+            static_cast<size_t>(vv) * static_cast<size_t>(width) +
+            static_cast<size_t>(uu);
+        const double first = nearest.depth[pixel];
+        if (!std::isfinite(first) ||
+            range > first + abs_tol + rel_tol * first) {
+          continue;
+        }
+        sum[pixel] += range;
+        ++count[pixel];
+      }
+    }
+  }
+  std::vector<float> out(num_pixels, std::numeric_limits<float>::quiet_NaN());
+  for (size_t i = 0; i < num_pixels; ++i) {
+    if (count[i] > 0) out[i] = static_cast<float>(sum[i] / count[i]);
+  }
+  return out;
+}
+
 VisibilityResult ProjectVisibility(const CameraModel& camera,
                                    const CameraExposure& exposure,
                                    const Points& query_world,

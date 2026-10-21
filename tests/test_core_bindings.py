@@ -77,6 +77,10 @@ def test_motion_prior_and_imu_deskew_bindings():
     assert np.allclose(out[1], pts[1]) and not np.allclose(out[0], pts[0])
     g = _core.gravity_measurements(_core.ImuSamples(imu), _core.WheelSamples(wheel), np.eye(3), [1.0])
     assert g == []  # 0.5 rad/s exceeds the default yaw-rate gate
+    # The IMU origin in the vehicle frame (the body of the inertial factors).
+    mounted = _core.ImuSamples(imu, np.eye(3), np.array([0.0, 0.0, 1.8]))
+    assert np.allclose(mounted.position, [0.0, 0.0, 1.8])
+    assert np.allclose(_core.ImuSamples(imu).position, 0.0)
 
 
 def test_odometry_pipeline_keyframes_with_external_poses():

@@ -15,18 +15,15 @@ Per stream:
              thinned to a maximum rate
     INS      nav_msgs/Odometry at the first sweep -> meta.yaml initial_pose
 
-Rigs that are not cars (handheld, backpack) have no natural vehicle frame
-on the floor. With `vehicle.level` the converter makes one: z up from the
-gravity the IMU measures while the rig stands still at the start, and with
-`vehicle.floor: auto` the origin on the floor plane under the reference
-sensor (RANSAC plane in the first sweeps). The pipeline assumes both: the
-vehicle origin is on the floor (levels, ego volume) and the world frame of a
-trip without an INS pose is the vehicle frame at the start (gravity factors).
+The vehicle frame of rigs that are not cars (levelled, on the floor) comes
+from convert/frames.py.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
+import multiprocessing
 import pathlib
 
 import cv2
@@ -37,6 +34,7 @@ import yaml
 
 from garage_recon import _core
 from garage_recon import geometry
+from garage_recon.convert import frames
 from garage_recon.convert import profile as profile_lib
 from garage_recon.data import dataset
 from garage_recon.data import schema
@@ -105,20 +103,26 @@ def decode_sweep(msg, lidar: profile_lib.LidarProfile) -> Sweep | None:
         t = points[lidar.time_field].astype(np.float64) * lidar.time_scale
     else:
         t = np.zeros(len(points))
-    t_max = float(t.max()) if len(t) else 0.0
-    if lidar.stamp == "points":  # Absolute per-point times.
-        end = t_max
-    elif lidar.stamp == "start":
-        end = header * 1e-9 + t_max - float(t.min() if len(t) else 0.0)
-    else:
-        end = header * 1e-9
-    relative = t - t_max
     with np.errstate(invalid="ignore"):
         rng = np.linalg.norm(xyz, axis=1)
     keep = (np.isfinite(rng) & (rng >= lidar.min_range)
             & (rng <= lidar.max_range))
     if not keep.any():
         return None
+    # The sweep's time span comes from its valid returns only: Ouster pixels
+    # without an echo (x = y = z = 0) can carry an undefined `t` (Hilti 2021:
+    # +4.1 s), which moved the whole sweep 4 s late. Returns timed more than
+    # a sweep away from the median are dropped as well.
+    median = float(np.median(t[keep]))
+    keep &= np.abs(t - median) <= lidar.sweep_duration
+    t_max = float(t[keep].max())
+    if lidar.stamp == "points":  # Absolute per-point times.
+        end = t_max
+    elif lidar.stamp == "start":
+        end = header * 1e-9 + t_max - float(t[keep].min())
+    else:
+        end = header * 1e-9
+    relative = t - t_max
     if lidar.intensity_field and lidar.intensity_field in points.dtype.names:
         intensity = np.clip(points[lidar.intensity_field][keep].astype(
             np.float64) * lidar.intensity_scale, 0.0, 1.0)
@@ -227,71 +231,24 @@ def _pose_matrix(pose) -> np.ndarray:
         [pose.position.x, pose.position.y, pose.position.z])
 
 
-def level_rotation(accel_reference: np.ndarray,
-                   forward: np.ndarray) -> np.ndarray:
-    """vehicle <- reference rotation with z along the measured "up".
+@dataclasses.dataclass
+class ClockCorrection:
+    """Correction (s) of a LiDAR stamp onto the IMU clock: linear through
+    (times, lags), held at the ends unless `extrapolate`, plus the LiDAR
+    IMU's own delay. A class (not a closure) so that it can be pickled."""
 
-    Args:
-        accel_reference: Mean specific force at rest in the reference frame
-            (points up).
-        forward: Reference-frame direction that becomes the vehicle x axis
-            once made horizontal.
+    times: np.ndarray
+    lags: np.ndarray
+    delay: float
+    extrapolate: bool = False
 
-    Raises:
-        ValueError: `forward` is (nearly) vertical.
-    """
-    z = accel_reference / np.linalg.norm(accel_reference)
-    x = forward - np.dot(forward, z) * z
-    if np.linalg.norm(x) < 0.3:
-        raise ValueError("vehicle.forward is nearly vertical")
-    x /= np.linalg.norm(x)
-    return np.stack([x, np.cross(z, x), z])
-
-
-def floor_height(sweeps: list[np.ndarray], R_level_reference: np.ndarray,
-                 min_radius: float = 1.5, max_radius: float = 8.0,
-                 threshold: float = 0.03, max_tilt_deg: float = 25.0
-                 ) -> tuple[float, int]:
-    """Height of the reference origin above the floor plane.
-
-    Args:
-        sweeps: Points in the reference frame, one array per sweep, taken
-            over the whole recording: a carried rig may start on the ground
-            and tilts while it is carried.
-        R_level_reference: Rotation to the gravity-aligned frame at the start
-            (selects the points below the rig).
-        min_radius: Horizontal distance band of the floor points (the area
-            right under a carried rig is hidden by the person).
-        max_radius: Outer edge of the band (drainage slopes further away).
-        threshold: RANSAC inlier distance (m).
-        max_tilt_deg: Rig tilt accepted relative to the start (the distance
-            to the plane does not depend on it).
-
-    Returns:
-        (median height over the sweeps, sweeps with a floor plane).
-
-    Raises:
-        ValueError: No sweep showed a floor plane below the rig.
-    """
-    heights = []
-    min_normal_z = np.cos(np.radians(max_tilt_deg))
-    for points in sweeps:
-        level = points @ R_level_reference.T
-        radius = np.hypot(level[:, 0], level[:, 1])
-        below = level[(radius > min_radius) & (radius < max_radius)
-                      & (level[:, 2] < -0.3) & (level[:, 2] > -4.0)]
-        if len(below) < 200:
-            continue
-        normal, d, inliers = _core.ransac_plane(np.ascontiguousarray(below),
-                                                threshold, 300)
-        normal = np.asarray(normal).ravel()
-        if abs(normal[2]) < min_normal_z or len(inliers) < 0.3 * len(below):
-            continue
-        heights.append(abs(d) / np.linalg.norm(normal))
-    if not heights:
-        raise ValueError("no floor plane found below the rig in the sampled "
-                         "sweeps")
-    return float(np.median(heights)), len(heights)
+    def __call__(self, t: float) -> float:
+        if self.extrapolate:
+            slope = (self.lags[1] - self.lags[0]) / (self.times[1]
+                                                     - self.times[0])
+            return float(self.lags[0] + slope * (t - self.times[0])
+                         + self.delay)
+        return float(np.interp(t, self.times, self.lags)) + self.delay
 
 
 class Converter:
@@ -327,12 +284,9 @@ class Converter:
                       ) -> tuple[np.ndarray, dict]:
         """vehicle <- reference transform and how it was obtained."""
         vehicle = self.profile.vehicle
-        out = vehicle.T_vehicle_reference.copy()
-        info = {}
-        if vehicle.level:
-            imu = self.profile.imu
-            if imu is None:
-                raise ValueError("vehicle.level needs the IMU")
+        imu = self.profile.imu
+        rows = None
+        if vehicle.level and imu is not None:
             stop = start_ns + int(vehicle.level_window * 1e9)
             rows = np.array([[m.angular_velocity.x, m.angular_velocity.y,
                               m.angular_velocity.z, m.linear_acceleration.x,
@@ -340,47 +294,25 @@ class Converter:
                               m.linear_acceleration.z]
                              for _, _, m in self._messages(
                                  [imu.topic], start_ns, stop)])
-            if len(rows) < 10:
-                raise ValueError("too few IMU samples to level the rig")
-            R_ref_imu = imu.T_reference_sensor[:3, :3]
-            accel = R_ref_imu @ (rows[:, 3:].mean(axis=0) * imu.accel_scale)
-            gyro = float(np.linalg.norm(rows[:, :3].mean(axis=0)))
-            spread = float(np.linalg.norm(rows[:, 3:].std(axis=0))
-                           * imu.accel_scale)
-            out[:3, :3] = level_rotation(accel, vehicle.forward)
-            out[:3, 3] = 0.0
-            tilt = np.degrees(np.arccos(np.clip(
-                accel[2] / np.linalg.norm(accel), -1.0, 1.0)))
-            info.update(level_tilt_deg=round(float(tilt), 3),
-                        level_gravity=round(float(np.linalg.norm(accel)), 4),
-                        level_gyro_rad_s=round(gyro, 4),
-                        level_accel_spread=round(spread, 4))
-            if gyro > 0.05 or spread > 0.3:
-                self.log(f"[convert] warning: the rig moves during the "
-                         f"levelling window (gyro {gyro:.3f} rad/s, accel "
-                         f"spread {spread:.2f} m/s^2)")
-        if vehicle.floor is not None:
-            if vehicle.floor == "auto":
-                # Sweeps spread over the recording: the rig's carrying
-                # height, not where it was put down at the start.
-                lidar = self.profile.lidars[0]
-                stop = stop_ns if stop_ns is not None else self.reader.end_time
-                sweeps = []
-                for t in np.linspace(start_ns, stop, vehicle.floor_sweeps,
-                                     endpoint=False):
-                    for _, _, msg in self._messages([lidar.topic], int(t)):
-                        sweep = decode_sweep(msg, lidar)
-                        if sweep is not None:
-                            sweeps.append(geometry.transform(
-                                lidar.T_reference_sensor, sweep.xyz))
-                        break
-                height, used = floor_height(sweeps, out[:3, :3])
-                info.update(floor_height=round(height, 4), floor_sweeps=used)
-            else:
-                height = float(vehicle.floor)
-            out[:3, 3] = [vehicle.reference_xy[0], vehicle.reference_xy[1],
-                          height]
-        return out, info
+
+        def floor_sweeps():
+            # Sweeps spread over the recording: the rig's carrying height,
+            # not where it was put down at the start.
+            lidar = self.profile.lidars[0]
+            stop = stop_ns if stop_ns is not None else self.reader.end_time
+            sweeps = []
+            for t in np.linspace(start_ns, stop, vehicle.floor_sweeps,
+                                 endpoint=False):
+                for _, _, msg in self._messages([lidar.topic], int(t)):
+                    sweep = decode_sweep(msg, lidar)
+                    if sweep is not None:
+                        sweeps.append(geometry.transform(
+                            lidar.T_reference_sensor, sweep.xyz))
+                    break
+            return sweeps
+
+        return frames.vehicle_frame(self.profile, rows, floor_sweeps,
+                                    self.log)
 
     def clock_sync(self, lidar: profile_lib.LidarProfile, start_ns: int,
                    stop_ns: int | None):
@@ -424,12 +356,13 @@ class Converter:
                              round(float(np.degrees(r)), 3)]
                             for c, l, r, _ in windows])
         if sync.model == "linear":
-            offset, drift = result["offset"], result["drift"]
-            reference_time = result["reference_time"]
-
-            def correction(t):
-                return (offset + drift * (t - reference_time)
-                        + sync.imu_delay)
+            reference_time = float(result["reference_time"])
+            offset = float(result["offset"])
+            drift = float(result["drift"])
+            correction = ClockCorrection(
+                np.array([reference_time - 1.0, reference_time + 1.0]),
+                np.array([offset - drift, offset + drift]), sync.imu_delay,
+                extrapolate=True)
         else:
             # Piecewise linear through the window lags, median of three
             # neighbours against single bad windows; held at the ends.
@@ -438,10 +371,8 @@ class Converter:
                 padded = np.concatenate([lags[:1], lags, lags[-1:]])
                 lags = np.median(np.stack([padded[:-2], padded[1:-1],
                                            padded[2:]]), axis=0)
-            centers = windows[:, 0]
-
-            def correction(t):
-                return float(np.interp(t, centers, lags)) + sync.imu_delay
+            correction = ClockCorrection(windows[:, 0].copy(), lags,
+                                         sync.imu_delay)
         lags_ms = 1000 * windows[:, 1]
         self.log(f"[convert] {lidar.name} clock: {sync.imu_topic} vs the IMU "
                  f"in {len(windows)} windows, lag {lags_ms.min():+.1f} .. "
@@ -449,62 +380,17 @@ class Converter:
                  f"{1000 * sync.imu_delay:+.1f} ms ({sync.model})")
         return correction, info
 
-    def rig(self, T_vehicle_reference: np.ndarray) -> schema.Rig:
-        """The rig.yaml content (cameras at their output resolution)."""
-        p = self.profile
-        lidars = {
-            lidar.name: schema.LidarCalib(
-                lidar.name, T_vehicle_reference @ lidar.T_reference_sensor,
-                lidar.sweep_duration) for lidar in p.lidars}
-        cameras = {}
-        for cam in p.cameras:
-            width = int(round(cam.width * cam.scale))
-            height = int(round(cam.height * cam.scale))
-            params = list(cam.params)
-            sx, sy = width / cam.width, height / cam.height
-            params[0] *= sx
-            params[1] *= sy
-            params[2] = (params[2] + 0.5) * sx - 0.5
-            params[3] = (params[3] + 0.5) * sy - 0.5
-            cameras[cam.name] = schema.CameraCalib(
-                cam.name, cam.model, width, height, params,
-                T_vehicle_reference @ cam.T_reference_sensor,
-                cam.rolling_shutter_line_time / sy, cam.time_offset)
-        T_vehicle_imu = (T_vehicle_reference @ p.imu.T_reference_sensor
-                         if p.imu is not None else np.eye(4))
-        return schema.Rig(lidars, cameras, list(p.stereo_pairs),
-                          T_vehicle_imu,
-                          p.wheel.scale if p.wheel is not None else 1.0)
-
-    def run(self, out: str | pathlib.Path, trip_id: str | None = None,
-            start: float = 0.0, duration: float | None = None
-            ) -> pathlib.Path:
-        """Writes the trip.
-
-        Args:
-            out: Trip directory to create.
-            trip_id: Defaults to the directory name.
-            start: Seconds to skip at the beginning of the recording.
-            duration: Seconds to convert (None: to the end).
+    def read_window(self, writer: dataset.TripWriter, rig: schema.Rig,
+                    corrections: dict, start_ns: int, stop_ns: int) -> dict:
+        """Writes the sweeps and images of [start_ns, stop_ns) (bag time).
 
         Returns:
-            The trip directory.
+            The rows of the streams written at the end ("imu", "wheel",
+            "gnss": (t, lat, lon, alt, covariance, covariance type), "ins":
+            (t, pose)), the "counts" per sensor and the stamp of the first
+            sweep of the primary LiDAR ("first_sweep", None if none).
         """
         p = self.profile
-        out = pathlib.Path(out)
-        start_ns = self.reader.start_time + int(start * 1e9)
-        stop_ns = (None if duration is None else
-                   start_ns + int(duration * 1e9))
-        T_vehicle_reference, info = self.vehicle_frame(start_ns, stop_ns)
-        if info:
-            self.log(f"[convert] vehicle frame: {info}")
-        rig = self.rig(T_vehicle_reference)
-        corrections, sync_info = {}, {}
-        for lidar in p.lidars:
-            if lidar.clock_sync is not None:
-                corrections[lidar.name], sync_info[lidar.name] = (
-                    self.clock_sync(lidar, start_ns, stop_ns))
-        writer = dataset.TripWriter(out, rig, {})
         lidar_by_topic = {lidar.topic: lidar for lidar in p.lidars}
         camera_by_topic = {cam.topic: cam for cam in p.cameras}
         imu_rows, wheel_rows, gnss_fixes, ins = [], [], [], []
@@ -562,9 +448,76 @@ class Converter:
                 wheel_rows.append([t * 1e-9 + p.wheel.time_offset, value])
             if (p.gnss is not None and topic == p.gnss.topic
                     and int(msg.status.status) >= p.gnss.min_status):
-                gnss_fixes.append((t, msg))
+                gnss_fixes.append((t, msg.latitude, msg.longitude,
+                                   msg.altitude,
+                                   np.asarray(msg.position_covariance, float),
+                                   int(msg.position_covariance_type)))
             if p.initial_pose is not None and topic == p.initial_pose.topic:
                 ins.append((t, _pose_matrix(msg.pose.pose)))
+        return {"imu": imu_rows, "wheel": wheel_rows, "gnss": gnss_fixes,
+                "ins": ins, "counts": counts, "first_sweep": first_sweep}
+
+    def run(self, out: str | pathlib.Path, trip_id: str | None = None,
+            start: float = 0.0, duration: float | None = None,
+            jobs: int = 1) -> pathlib.Path:
+        """Writes the trip.
+
+        Args:
+            out: Trip directory to create.
+            trip_id: Defaults to the directory name.
+            start: Seconds to skip at the beginning of the recording.
+            duration: Seconds to convert (None: to the end).
+            jobs: Processes reading consecutive time windows in parallel
+                (bz2-compressed bags decode at ~20 MB/s per process).
+
+        Returns:
+            The trip directory.
+        """
+        p = self.profile
+        out = pathlib.Path(out)
+        start_ns = self.reader.start_time + int(start * 1e9)
+        stop_ns = (None if duration is None else
+                   start_ns + int(duration * 1e9))
+        T_vehicle_reference, info = self.vehicle_frame(start_ns, stop_ns)
+        if info:
+            self.log(f"[convert] vehicle frame: {info}")
+        rig = frames.rig(p, T_vehicle_reference)
+        corrections, sync_info = {}, {}
+        for lidar in p.lidars:
+            if lidar.clock_sync is not None:
+                corrections[lidar.name], sync_info[lidar.name] = (
+                    self.clock_sync(lidar, start_ns, stop_ns))
+        writer = dataset.TripWriter(out, rig, {})
+        stop = self.reader.end_time + 1 if stop_ns is None else stop_ns
+        if jobs <= 1:
+            parts = [self.read_window(writer, rig, corrections, start_ns,
+                                      stop)]
+        else:
+            # Integer ns: float64 would round the stamps by 256 ns.
+            edges = [start_ns + (stop - start_ns) * k // jobs
+                     for k in range(jobs + 1)]
+            job = {"bags": self.bags, "profile": p, "out": out, "rig": rig,
+                   "corrections": corrections}
+            # Spawned, not forked: the parent may run OpenMP / OpenCV
+            # threads.
+            with concurrent.futures.ProcessPoolExecutor(
+                    jobs, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
+                futures = [pool.submit(_convert_window, job, (a, b))
+                           for a, b in zip(edges[:-1], edges[1:])]
+                for k, _ in enumerate(
+                        concurrent.futures.as_completed(futures)):
+                    self.log(f"[convert] window {k + 1}/{jobs} done")
+                parts = [future.result() for future in futures]
+            rig.save(out / "rig.yaml")  # Also written by the workers.
+        imu_rows = [row for part in parts for row in part["imu"]]
+        wheel_rows = [row for part in parts for row in part["wheel"]]
+        gnss_fixes = [fix for part in parts for fix in part["gnss"]]
+        ins = [pose for part in parts for pose in part["ins"]]
+        counts = {name: sum(part["counts"][name] for part in parts)
+                  for name in parts[0]["counts"]}
+        first_sweep = next((part["first_sweep"] for part in parts
+                            if part["first_sweep"] is not None), None)
         if first_sweep is None:
             raise ValueError("no LiDAR sweep in the selected time range")
 
@@ -578,16 +531,12 @@ class Converter:
             writer.write_csv("wheel.csv", "t,speed", np.array(wheel_rows))
         meta = {"trip_id": trip_id or out.name, "garage_id": p.garage_id}
         if gnss_fixes:
-            first = gnss_fixes[0][1]
-            origin = p.gnss.origin or [first.latitude, first.longitude,
-                                       first.altitude]
+            origin = p.gnss.origin or list(gnss_fixes[0][1:4])
             rows = []
-            for t, fix in gnss_fixes:
-                enu = geodetic_to_enu(fix.latitude, fix.longitude,
-                                      fix.altitude, origin)
-                cov = np.asarray(fix.position_covariance, float)
+            for t, lat, lon, alt, cov, cov_type in gnss_fixes:
+                enu = geodetic_to_enu(lat, lon, alt, origin)
                 std = (float(np.sqrt(max(cov[0], cov[4], 1e-6)))
-                       if fix.position_covariance_type > 0 else 1.0)
+                       if cov_type > 0 else 1.0)
                 rows.append([t * 1e-9 + p.gnss.time_offset, *enu, std])
             writer.write_csv("gnss.csv", "t,x,y,z,std", np.array(rows))
             meta["gnss_origin"] = [float(v) for v in origin]
@@ -615,13 +564,28 @@ class Converter:
         return out
 
 
+def _convert_window(job: dict, bounds: tuple[int, int]) -> dict:
+    """Worker: one time window of the recording (Converter.read_window)."""
+    converter = Converter(job["bags"], job["profile"], log=_quiet)
+    try:
+        writer = dataset.TripWriter(job["out"], job["rig"], {})
+        return converter.read_window(writer, job["rig"], job["corrections"],
+                                     *bounds)
+    finally:
+        converter.close()
+
+
+def _quiet(*args) -> None:
+    del args
+
+
 def convert(bags: list[str | pathlib.Path], profile: profile_lib.Profile,
             out: str | pathlib.Path, trip_id: str | None = None,
             start: float = 0.0, duration: float | None = None,
-            log=print) -> pathlib.Path:
+            log=print, jobs: int = 1) -> pathlib.Path:
     """Converts a recording into a trip directory (see `Converter.run`)."""
     converter = Converter(bags, profile, log)
     try:
-        return converter.run(out, trip_id, start, duration)
+        return converter.run(out, trip_id, start, duration, jobs)
     finally:
         converter.close()

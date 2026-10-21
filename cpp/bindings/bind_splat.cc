@@ -1,5 +1,5 @@
 // Bindings of the 3DGS support code: LiDAR-anchored Gaussians, the ray
-// renderer, camera coverage and training masks.
+// renderer, camera coverage, training masks and the depth prior fusion.
 
 #include <memory>
 #include <utility>
@@ -7,6 +7,7 @@
 
 #include "bind_util.h"
 #include "gr/coverage.h"
+#include "gr/depth_prior.h"
 #include "gr/exposure.h"
 #include "gr/gaussians.h"
 #include "gr/image.h"
@@ -268,6 +269,81 @@ void BindSplat(py::module_& m) {
       .def_readwrite("max_radius", &TrainingMaskConfig::max_radius)
       .def_readwrite("box_step", &TrainingMaskConfig::box_step)
       .def_readwrite("dilate", &TrainingMaskConfig::dilate);
+  py::class_<DepthAlignConfig>(m, "DepthAlignConfig")
+      .def(py::init<>())
+      .def_readwrite("min_range", &DepthAlignConfig::min_range)
+      .def_readwrite("max_range", &DepthAlignConfig::max_range)
+      .def_readwrite("min_pixels", &DepthAlignConfig::min_pixels)
+      .def_readwrite("fit_shift", &DepthAlignConfig::fit_shift)
+      .def_readwrite("iterations", &DepthAlignConfig::iterations)
+      .def_readwrite("robust_scale", &DepthAlignConfig::robust_scale)
+      .def_readwrite("max_residual", &DepthAlignConfig::max_residual)
+      .def_readwrite("min_scale", &DepthAlignConfig::min_scale)
+      .def_readwrite("max_scale", &DepthAlignConfig::max_scale)
+      .def_readwrite("cell", &DepthAlignConfig::cell)
+      .def_readwrite("min_cell_pixels", &DepthAlignConfig::min_cell_pixels)
+      .def_readwrite("max_cell_residual", &DepthAlignConfig::max_cell_residual)
+      .def_readwrite("tolerance", &DepthAlignConfig::tolerance)
+      .def_readwrite("min_confidence", &DepthAlignConfig::min_confidence)
+      .def_readwrite("hole_radius", &DepthAlignConfig::hole_radius);
+  m.attr("DEPTH_NONE") = static_cast<int>(kDepthNone);
+  m.attr("DEPTH_LIDAR") = static_cast<int>(kDepthLidar);
+  m.attr("DEPTH_PRIOR") = static_cast<int>(kDepthPrior);
+
+  m.def(
+      "fuse_depth_prior",
+      [](const py::object& prior, const py::object& confidence,
+         const py::object& lidar, const py::object& samples,
+         const DepthAlignConfig& config) {
+        auto shape = F64Array::ensure(lidar);
+        Require(shape && shape.ndim() == 2, "lidar must be (height, width)");
+        const int height = static_cast<int>(shape.shape(0));
+        const int width = static_cast<int>(shape.shape(1));
+        Require(config.cell > 0, "cell must be positive");
+        const std::vector<float> p = ToDepth(prior, height, width);
+        const std::vector<float> c = ToDepth(confidence, height, width);
+        const std::vector<float> l = ToDepth(lidar, height, width);
+        Require(!p.empty(), "prior must be (height, width)");
+        std::vector<DepthSample> s;
+        if (!samples.is_none()) {
+          F64Array array = F64Array::ensure(samples);
+          Require(array && array.ndim() == 2 && array.shape(1) == 3,
+                  "samples must be (N, 3) rows of u, v, range");
+          const double* d = array.data();
+          s.resize(static_cast<size_t>(array.shape(0)));
+          for (size_t i = 0; i < s.size(); ++i) {
+            s[i] = {d[3 * i], d[3 * i + 1], d[3 * i + 2]};
+          }
+        }
+        FusedDepth fused;
+        {
+          py::gil_scoped_release release;
+          fused = FuseDepthPrior(p, c, l, s, height, width, config);
+        }
+        const DepthAlignment& a = fused.alignment;
+        py::dict alignment;
+        alignment["valid"] = a.valid;
+        alignment["scale"] = a.scale;
+        alignment["shift"] = a.shift;
+        alignment["raw_ratio"] = a.raw_ratio;
+        alignment["pixels"] = a.pixels;
+        alignment["residual_median"] = a.residual_median;
+        alignment["residual_p90"] = a.residual_p90;
+        alignment["inlier_fraction"] = a.inlier_fraction;
+        alignment["cells_checked"] = a.cells_checked;
+        alignment["cells_rejected"] = a.cells_rejected;
+        alignment["prior_pixels"] = fused.prior_pixels;
+        return py::make_tuple(ToImage(fused.range, height, width),
+                              ToImage(fused.confidence, height, width),
+                              ToImage(fused.source, height, width), alignment);
+      },
+      "prior"_a, "confidence"_a, "lidar"_a, "samples"_a = py::none(),
+      "config"_a = DepthAlignConfig(),
+      "Fits the prior range to the LiDAR (l = s p + b, robust) at the "
+      "samples ((N, 3) u, v, range of visible map points; None: the lidar "
+      "pixels) and fills the LiDAR holes with it; returns (range, "
+      "confidence, source HxW uint8 DEPTH_*, alignment dict). Ranges along "
+      "the ray, NaN where unknown; confidence in [0, 1] or None.");
   m.attr("MASK_MOVING") = static_cast<int>(kMaskMoving);
   m.attr("MASK_CHANGED") = static_cast<int>(kMaskChanged);
 

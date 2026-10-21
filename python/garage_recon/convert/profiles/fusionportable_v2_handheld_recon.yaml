@@ -12,11 +12,16 @@ backend:
   gyro_bias_prior: 0.002
 # The plane BA bent this 400 m loop-free corridor by +-2 m vertically against
 # the tracker ground truth, with or without IMU factors, and also with
-# range / incidence weighting (ba.angular_sigma): the sweeps carry a
-# systematic error (floor 3-7 cm high at 15-20 m in every direction). Off
-# until the LiDAR intrinsics are calibrated.
+# range / incidence weighting (ba.angular_sigma). That was with returns from
+# 1 m on; on the Mandeye and Oxford Spires handheld rigs the cause was the
+# dense near returns (ba.min_range, now 5 m by default), see README 4.3.
+# Kept off until this rig is re-run with the new default.
 ba:
   enabled: false
+# A person, not a car: the walked path is not cleared at car width.
+map:
+  dynamic:
+    ego_radius: 0.0
 # 1800+ images per camera: label every 10th.
 frames:
   frame_stride: 10

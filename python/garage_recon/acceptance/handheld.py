@@ -129,23 +129,29 @@ def _read_pcd(path: pathlib.Path) -> tuple[np.ndarray, np.ndarray | None]:
             if parts[0].upper() == "DATA":
                 break
         body = f.read()
-    fields = header["FIELDS"]
+    # Padding fields ("_", e.g. COUNT 4 of U1) may repeat; names must not.
+    fields = [n if n not in header["FIELDS"][:k] else f"{n}{k}"
+              for k, n in enumerate(header["FIELDS"])]
+    counts = [int(c) for c in header.get("COUNT", ["1"] * len(fields))]
     count = int(header.get("POINTS", header.get("WIDTH"))[0])
     if header["DATA"][0] == "ascii":
         data = np.loadtxt(body.decode("ascii").splitlines(), ndmin=2)
-        column = {n: data[:, k] for k, n in enumerate(fields)}
+        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        column = {n: data[:, s] for n, s in zip(fields, starts)}
     elif header["DATA"][0] == "binary":
         sizes = [int(s) for s in header["SIZE"]]
-        dtype = np.dtype([(n, "<" + _PCD_TYPES[(t, s)]) for n, t, s in
-                          zip(fields, header["TYPE"], sizes)])
+        dtype = np.dtype([
+            (n, "<" + _PCD_TYPES[(t, s)]) + ((c,) if c > 1 else ())
+            for n, t, s, c in zip(fields, header["TYPE"], sizes, counts)])
         column = np.frombuffer(body, dtype=dtype, count=count)
     else:
         raise ValueError(f"{path}: PCD DATA {header['DATA'][0]} not supported")
     xyz = np.column_stack([column["x"], column["y"], column["z"]]).astype(
         np.float64)
     intensity = None
-    if "intensity" in fields:
-        intensity = np.asarray(column["intensity"], np.float64)
+    lower = {n.lower(): n for n in fields}
+    if "intensity" in lower:
+        intensity = np.asarray(column[lower["intensity"]], np.float64)
     elif "rgb" in fields or "rgba" in fields:
         # PCL packs 8-bit colour into the bits of one float: luminance.
         packed = np.ascontiguousarray(

@@ -63,6 +63,22 @@ RenderResult RenderPoints(const CameraModel& camera,
                           int min_radius, int max_radius, double min_range,
                           double max_range);
 
+// Range of the first surface per pixel, as the mean of the points in it.
+// The z-buffer above keeps the nearest point of a pixel; on a surface whose
+// points scatter by a few cm (noise, roughness) or that is seen at a grazing
+// angle, that nearest point is biased towards the camera, and so are depth
+// targets taken from it. Here the z-buffer (splats as in RenderPoints)
+// decides which surface is first; the range is then the mean over the points
+// within `abs_tol` + `rel_tol` x range behind the nearest one, each splatted
+// over at most `mean_radius` pixels (NaN where no point falls).
+std::vector<float> RenderSurfaceDepth(const CameraModel& camera,
+                                      const CameraExposure& exposure,
+                                      const Points& points_world,
+                                      double point_spacing, int min_radius,
+                                      int max_radius, double min_range,
+                                      double max_range, double abs_tol,
+                                      double rel_tol, int mean_radius);
+
 struct VisibilityResult {
   RowMatX2d uv;  // NaN where the point does not project.
   std::vector<uint8_t> in_image;

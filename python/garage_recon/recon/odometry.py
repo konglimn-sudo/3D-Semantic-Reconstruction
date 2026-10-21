@@ -109,5 +109,6 @@ def run_trip_odometry(ds: TripDataset, cfg, out_dir: Path, log=print) -> TripOdo
     path_len = float(np.sum(np.linalg.norm(np.diff(poses[:, :3, 3], axis=0), axis=1)))
     log(f"[odometry] {ds.trip_id}: {n} frames, {len(result.kf_frames)} keyframes, path {path_len:.1f} m"
         f"{' (wheel/IMU prior)' if pipe.uses_prior else ''}"
-        f"{' (gyro prior)' if pipe.uses_gyro_prior else ''}")
+        f"{' (gyro prior)' if pipe.uses_gyro_prior else ''}"
+        f"{' (LiDAR-inertial)' if pipe.uses_lio else ''}")
     return result

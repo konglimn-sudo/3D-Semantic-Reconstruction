@@ -63,6 +63,19 @@ py::list BaRounds(const LidarBaSummary& summary) {
   return rounds;
 }
 
+py::list TripAlignments(const std::vector<TripAlignment>& alignments) {
+  py::list out;
+  for (const TripAlignment& alignment : alignments) {
+    out.append(py::dict(
+        "trip"_a = alignment.trip, "aligned"_a = alignment.aligned,
+        "T"_a = alignment.correction.Matrix(), "score"_a = alignment.score,
+        "fitness"_a = alignment.fitness, "rmse"_a = alignment.rmse,
+        "runner_up"_a = alignment.runner_up,
+        "hypotheses"_a = alignment.hypotheses));
+  }
+  return out;
+}
+
 py::array_t<double> Vec6Array(const std::vector<Vec6>& values) {
   py::array_t<double> array(
       {static_cast<py::ssize_t>(values.size()), static_cast<py::ssize_t>(6)});
@@ -96,16 +109,20 @@ void RequireLoops(const KeyframeSet& keyframes,
 void BindImu(py::module_& m) {
   py::class_<ImuSamples>(m, "ImuSamples")
       .def(py::init<>())
-      .def(py::init(
-               [](const Eigen::MatrixXd& rows, const Mat3& vehicle_from_imu) {
-                 Require(rows.rows() == 0 || rows.cols() >= 7,
-                         "expected rows of [t, gx, gy, gz, ax, ay, az]");
-                 return ImuSamples::FromRows(rows, vehicle_from_imu);
-               }),
+      .def(py::init([](const Eigen::MatrixXd& rows,
+                       const Mat3& vehicle_from_imu, const Vec3& position) {
+             Require(rows.rows() == 0 || rows.cols() >= 7,
+                     "expected rows of [t, gx, gy, gz, ax, ay, az]");
+             return ImuSamples::FromRows(rows, vehicle_from_imu, position);
+           }),
            "rows"_a, "R_vehicle_imu"_a = Mat3::Identity(),
+           "position"_a = Vec3::Zero(),
            "rows: (N, 7) [t, gx, gy, gz, ax, ay, az] in the IMU frame; stored "
-           "in the vehicle frame.")
+           "in the vehicle frame. position: the IMU origin in the vehicle "
+           "frame (T_vehicle_imu translation), the body origin of inertial "
+           "factors.")
       .def("__len__", &ImuSamples::size)
+      .def_readonly("position", &ImuSamples::position)
       .def_property_readonly(
           "t",
           [](const ImuSamples& samples) { return ToArray(samples.stamps); })
@@ -300,7 +317,24 @@ void BindOdometryPipeline(py::module_& m) {
            })
       .def_property_readonly("uses_prior", &OdometryPipeline::uses_prior)
       .def_property_readonly("uses_gyro_prior",
-                             &OdometryPipeline::uses_gyro_prior);
+                             &OdometryPipeline::uses_gyro_prior)
+      .def_property_readonly("uses_lio", &OdometryPipeline::uses_lio)
+      .def(
+          "lio_stats",
+          [](const OdometryPipeline& pipeline) {
+            Require(pipeline.uses_lio(), "the pipeline does not run the LIO");
+            const LioStats& s = pipeline.lio_stats();
+            py::dict out;
+            out["correspondences"] = s.correspondences;
+            out["iterations"] = s.iterations;
+            out["rmse"] = s.rmse;
+            out["min_translation_information"] = s.min_translation_information;
+            out["point_residuals"] = s.point_residuals;
+            out["stationary"] = s.stationary;
+            out["velocity"] = s.velocity;
+            return out;
+          },
+          "Statistics of the last LIO update.");
 }
 
 void BindKeyframes(py::module_& m) {
@@ -504,6 +538,23 @@ void BindBackend(py::module_& m) {
                      &BackendConfig::gravity_max_yaw_rate)
       .def_readwrite("iterations", &BackendConfig::iterations);
 
+  py::class_<TripAlignConfig>(m, "TripAlignConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &TripAlignConfig::enabled)
+      .def_readwrite("voxel", &TripAlignConfig::voxel)
+      .def_readwrite("icp_schedule", &TripAlignConfig::icp_schedule)
+      .def_readwrite("icp_iters", &TripAlignConfig::icp_iters)
+      .def_readwrite("min_score", &TripAlignConfig::min_score)
+      .def_readwrite("z_peak_ratio", &TripAlignConfig::z_peak_ratio)
+      .def_readwrite("max_candidates", &TripAlignConfig::max_candidates)
+      .def_readwrite("min_fitness", &TripAlignConfig::min_fitness)
+      .def_readwrite("max_rmse", &TripAlignConfig::max_rmse)
+      .def_readwrite("min_fitness_gap", &TripAlignConfig::min_fitness_gap)
+      .def_readwrite("distinct_t", &TripAlignConfig::distinct_t)
+      .def_readwrite("distinct_r", &TripAlignConfig::distinct_r)
+      .def_readwrite("sigma_t", &TripAlignConfig::sigma_t)
+      .def_readwrite("sigma_r", &TripAlignConfig::sigma_r);
+
   py::class_<RefineConfig>(m, "RefineConfig")
       .def(py::init<>())
       .def_readwrite("enabled", &RefineConfig::enabled)
@@ -538,10 +589,21 @@ void BindBackend(py::module_& m) {
       .def_readwrite("rounds", &LidarBaConfig::rounds)
       .def_readwrite("iterations", &LidarBaConfig::iterations);
 
+  py::class_<AppearanceLoopConfig>(m, "AppearanceLoopConfig")
+      .def(py::init<>())
+      .def_readwrite("coarse_voxel", &AppearanceLoopConfig::coarse_voxel)
+      .def_readwrite("z_peak_ratio", &AppearanceLoopConfig::z_peak_ratio)
+      .def_readwrite("max_hypotheses", &AppearanceLoopConfig::max_hypotheses)
+      .def_readwrite("min_fitness_gap", &AppearanceLoopConfig::min_fitness_gap)
+      .def_readwrite("distinct_t", &AppearanceLoopConfig::distinct_t)
+      .def_readwrite("distinct_r", &AppearanceLoopConfig::distinct_r);
+
   py::class_<GraphStageConfig>(m, "GraphStageConfig")
       .def(py::init<>())
       .def_readwrite("loops", &GraphStageConfig::loops)
+      .def_readwrite("appearance", &GraphStageConfig::appearance)
       .def_readwrite("backend", &GraphStageConfig::backend)
+      .def_readwrite("trip_align", &GraphStageConfig::trip_align)
       .def_readwrite("ba", &GraphStageConfig::ba)
       .def_readwrite("refine", &GraphStageConfig::refine)
       .def("required_voxels", &GraphStageConfig::RequiredVoxels,
@@ -601,12 +663,26 @@ void BindBackend(py::module_& m) {
       .def_readonly("lever", &Anchor::lever)
       .def_readonly("sigma_t", &Anchor::sigma_t)
       .def_readonly("sigma_r", &Anchor::sigma_r)
-      .def_readonly("sigma", &Anchor::sigma);
+      .def_readonly("sigma", &Anchor::sigma)
+      .def_readonly("weak", &Anchor::weak);
 
   m.def(
       "run_graph_stage",
       [](const KeyframeSet& keyframes, const std::vector<TripInputs>& trips,
-         const GraphStageConfig& config, const py::object& log) {
+         const GraphStageConfig& config, const py::object& log,
+         const py::object& appearance) {
+        std::vector<std::pair<int, int>> pairs;
+        if (!appearance.is_none()) {
+          auto array = py::array_t<int, py::array::c_style |
+                                            py::array::forcecast>::ensure(
+              appearance);
+          Require(array && (array.size() == 0 ||
+                            (array.ndim() == 2 && array.shape(1) == 2)),
+                  "appearance must be (N, 2) keyframe pairs");
+          for (py::ssize_t r = 0; array.size() && r < array.shape(0); ++r) {
+            pairs.emplace_back(array.at(r, 0), array.at(r, 1));
+          }
+        }
         for (double voxel : config.RequiredVoxels()) {
           Require(keyframes.HasVoxel(voxel),
                   "keyframes must keep sweeps at every voxel of "
@@ -624,7 +700,7 @@ void BindBackend(py::module_& m) {
         GraphStageResult result;
         {
           py::gil_scoped_release release;
-          result = RunGraphStage(keyframes, trips, config, logger);
+          result = RunGraphStage(keyframes, trips, config, logger, pairs);
         }
         RethrowIfSet(log_error);
         const InertialEstimate& inertial = result.inertial;
@@ -635,12 +711,14 @@ void BindBackend(py::module_& m) {
             "loops_tested"_a = result.loop_stats.tested,
             "loops_verified"_a = result.loops_verified,
             "ba_rounds"_a = BaRounds(result.ba),
+            "trip_alignments"_a = TripAlignments(result.trip_alignments),
             "velocities"_a = PointsToArray(
                 Points(inertial.velocities.begin(), inertial.velocities.end())),
             "biases"_a = Vec6Array(inertial.biases),
             "inertial_valid"_a = ToBoolArray(inertial.valid));
       },
       "keyframes"_a, "trips"_a, "config"_a, "log"_a = py::none(),
+      "appearance"_a = py::none(),
       "Whole back-end: anchors, IMU / wheel / bias (or gravity) factors, graph "
       "without loops, loop detection + PCM, graph with loops, LiDAR bundle "
       "adjustment (or scan-to-map refinement). Returns a dict with poses "

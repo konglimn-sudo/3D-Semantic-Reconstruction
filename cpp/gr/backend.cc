@@ -4,12 +4,16 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <set>
+#include <string>
 #include <utility>
 
 #include "gr/check.h"
+#include "gr/cloud_compare.h"
 #include "gr/numeric.h"
 #include "gr/pose_graph.h"
 #include "gr/registration.h"
+#include "gr/voxel.h"
 
 namespace gr {
 namespace {
@@ -74,19 +78,28 @@ void AddGnssAnchors(const KeyframeSet& keyframes, const std::vector<int>& trip,
   }
 }
 
-// Start velocity of a keyframe without an estimate: the wheel speed along the
-// vehicle x axis, else the finite difference of neighbouring keyframes.
+// The wheel speed (vehicle x axis at the vehicle origin) moved to the
+// inertial body origin, the IMU: v + w x p, in the vehicle axes.
+Vec3 BodyVelocityFromWheel(const TripInputs& inputs, double stamp) {
+  const Vec3 wheel(Interp1(inputs.wheel.stamps, inputs.wheel.speed, stamp),
+                   0.0, 0.0);
+  const Vec3 omega =
+      InterpolateSeries(inputs.imu.stamps, inputs.imu.gyro, stamp);
+  return wheel + omega.cross(inputs.imu.position);
+}
+
+// Start velocity of a keyframe's inertial body without an estimate: from the
+// wheel speed, else the finite difference of neighbouring keyframes.
 Vec3 InitialVelocity(const KeyframeSet& keyframes, const std::vector<int>& trip,
                      size_t a, const std::vector<Pose>& poses,
-                     const TripInputs& inputs, const Pose& lidar_from_vehicle) {
+                     const TripInputs& inputs, const Pose& lidar_from_body) {
   const int k = trip[a];
-  const Pose vehicle = poses[static_cast<size_t>(k)] * lidar_from_vehicle;
+  const Pose body = poses[static_cast<size_t>(k)] * lidar_from_body;
   const double stamp = keyframes[static_cast<size_t>(k)].stamp;
   const WheelSamples& wheel = inputs.wheel;
   if (wheel.size() > 1 && stamp >= wheel.stamps.front() &&
       stamp <= wheel.stamps.back()) {
-    return vehicle.rotation *
-           Vec3(Interp1(wheel.stamps, wheel.speed, stamp), 0.0, 0.0);
+    return body.rotation * BodyVelocityFromWheel(inputs, stamp);
   }
   if (trip.size() < 2) return Vec3::Zero();
   const size_t a0 = a == 0 ? 0 : a - 1;
@@ -95,8 +108,8 @@ Vec3 InitialVelocity(const KeyframeSet& keyframes, const std::vector<int>& trip,
   const size_t k1 = static_cast<size_t>(trip[a1]);
   const double dt = keyframes[k1].stamp - keyframes[k0].stamp;
   if (dt <= 0.0) return Vec3::Zero();
-  return ((poses[k1] * lidar_from_vehicle).translation -
-          (poses[k0] * lidar_from_vehicle).translation) /
+  return ((poses[k1] * lidar_from_body).translation -
+          (poses[k0] * lidar_from_body).translation) /
          dt;
 }
 
@@ -119,7 +132,10 @@ int AddInertialFactors(const KeyframeSet& keyframes,
     const std::vector<int>& trip = keyframes.TripIndices(static_cast<int>(t));
     const ImuSamples& imu = inputs.imu;
     if (trip.empty() || imu.size() < 2) continue;
-    const Pose lidar_from_vehicle = inputs.vehicle_from_lidar.Inverse();
+    // The inertial body: vehicle axes at the IMU, where the accelerometer
+    // measures (ImuSamples::position).
+    const Pose lidar_from_body =
+        inputs.vehicle_from_lidar.Inverse() * imu.VehicleFromBody();
     const WheelSamples& wheel = inputs.wheel;
     std::vector<int> nodes;
     for (size_t a = 0; a < trip.size(); ++a) {
@@ -132,17 +148,17 @@ int AddInertialFactors(const KeyframeSet& keyframes,
       } else {
         graph.AddInertialState(k,
                                InitialVelocity(keyframes, trip, a, poses,
-                                               inputs, lidar_from_vehicle),
+                                               inputs, lidar_from_body),
                                Vec6::Zero());
       }
       nodes.push_back(k);
       if (config.wheel_factors && wheel.size() > 1 &&
           stamp >= wheel.stamps.front() && stamp <= wheel.stamps.back()) {
         graph.AddBodyVelocity(
-            k, Vec3(Interp1(wheel.stamps, wheel.speed, stamp), 0.0, 0.0),
+            k, BodyVelocityFromWheel(inputs, stamp),
             Vec3(config.wheel_sigma, config.wheel_lateral_sigma,
                  config.wheel_lateral_sigma),
-            lidar_from_vehicle);
+            lidar_from_body);
       }
     }
     if (nodes.empty()) continue;
@@ -164,7 +180,7 @@ int AddInertialFactors(const KeyframeSet& keyframes,
       const std::optional<ImuPreintegration> preintegration =
           PreintegrateImu(imu, t0, t1, graph.Bias(i), noise);
       if (!preintegration) continue;
-      graph.AddImu(i, j, *preintegration, lidar_from_vehicle);
+      graph.AddImu(i, j, *preintegration, lidar_from_body);
       ++num_imu;
     }
   }
@@ -220,13 +236,153 @@ std::vector<Anchor> MakeAnchors(const KeyframeSet& keyframes,
       anchor.pose = keyframes[static_cast<size_t>(trip.front())].odom;
       anchor.sigma_t = 50.0;
       anchor.sigma_r = 90.0;
+      anchor.weak = true;
       anchors.push_back(anchor);
-      LogLine(log, StringPrintf("[backend] trip %zu: no entrance anchor, "
-                                "relying on inter-trip loops",
+      LogLine(log, StringPrintf("[backend] trip %zu: no entrance anchor",
                                 t));
     }
   }
   return anchors;
+}
+
+namespace {
+
+// The keyframe sweeps of `trips` at `poses`, merged and downsampled.
+Points TripMap(const KeyframeSet& keyframes, const std::vector<Pose>& poses,
+               const std::vector<int>& trips, double voxel) {
+  Points merged;
+  for (int t : trips) {
+    for (int k : keyframes.TripIndices(t)) {
+      const size_t kk = static_cast<size_t>(k);
+      const Points world = TransformPoints(keyframes.Cloud(kk, voxel),
+                                           poses[kk]);
+      merged.insert(merged.end(), world.begin(), world.end());
+    }
+  }
+  return VoxelDownsample(merged, voxel);
+}
+
+}  // namespace
+
+std::vector<TripAlignment> AlignTrips(const KeyframeSet& keyframes,
+                                      const TripAlignConfig& config,
+                                      std::vector<Pose>& poses,
+                                      std::vector<Anchor>& anchors,
+                                      const Logger& log) {
+  GR_CHECK(poses.size() == keyframes.size());
+  GR_CHECK(keyframes.HasVoxel(config.voxel));
+  const int num_trips = keyframes.num_trips();
+  std::vector<uint8_t> anchored(static_cast<size_t>(num_trips), 0);
+  for (const Anchor& anchor : anchors) {
+    if (!anchor.weak) {
+      anchored[static_cast<size_t>(
+          keyframes[static_cast<size_t>(anchor.keyframe)].trip)] = 1;
+    }
+  }
+  std::vector<int> placed;
+  for (int t = 0; t < num_trips; ++t) {
+    if (anchored[static_cast<size_t>(t)] && !keyframes.TripIndices(t).empty()) {
+      placed.push_back(t);
+    }
+  }
+  std::vector<TripAlignment> out;
+  for (int t = 0; t < num_trips; ++t) {
+    const std::vector<int>& trip = keyframes.TripIndices(t);
+    if (anchored[static_cast<size_t>(t)] || trip.empty()) continue;
+    if (placed.empty()) {
+      placed.push_back(t);
+      LogLine(log, StringPrintf("[align] trip %d: reference frame (no trip "
+                                "has an anchor)",
+                                t));
+      continue;
+    }
+    TripAlignment alignment;
+    alignment.trip = t;
+    const Points source = TripMap(keyframes, poses, {t}, config.voxel);
+    const Points reference = TripMap(keyframes, poses, placed, config.voxel);
+    // Every hypothesis above the coarse score, refined by ICP.
+    struct Fit {
+      double score;
+      IcpResult icp;
+    };
+    std::vector<Fit> fits;
+    // The defaults suit 5 cm maps; at the keyframe voxel a plane needs a
+    // wider neighbourhood for its normal (about 20 points).
+    CoarseAlignConfig coarse_config;
+    coarse_config.voxel = config.voxel;
+    coarse_config.normal_radius = 2.5 * config.voxel;
+    for (const CoarseAlignment& coarse : AlignGravityAlignedCandidates(
+             source, reference, coarse_config, config.z_peak_ratio)) {
+      if (static_cast<int>(fits.size()) >= config.max_candidates) break;
+      if (coarse.score < config.min_score) continue;
+      fits.push_back({coarse.score,
+                      AlignMultiScale(source, reference,
+                                      coarse.reference_from_source,
+                                      config.icp_schedule, config.voxel,
+                                      config.icp_iters)});
+    }
+    alignment.hypotheses = static_cast<int>(fits.size());
+    std::string verdict = "no coarse hypothesis";
+    if (!fits.empty()) {
+      const Fit& best = *std::max_element(
+          fits.begin(), fits.end(), [](const Fit& a, const Fit& b) {
+            return a.icp.fitness < b.icp.fitness;
+          });
+      for (const Fit& fit : fits) {
+        const Pose delta = best.icp.pose.Inverse() * fit.icp.pose;
+        const bool distinct =
+            delta.translation.norm() > config.distinct_t ||
+            RadToDeg(Eigen::AngleAxisd(delta.rotation).angle()) >
+                config.distinct_r;
+        if (distinct) {
+          alignment.runner_up = std::max(alignment.runner_up, fit.icp.fitness);
+        }
+      }
+      alignment.score = best.score;
+      alignment.fitness = best.icp.fitness;
+      alignment.rmse = best.icp.rmse;
+      alignment.correction = best.icp.pose;
+      if (best.icp.fitness < config.min_fitness ||
+          best.icp.rmse > config.max_rmse) {
+        verdict = "ICP rejected";
+      } else if (best.icp.fitness - alignment.runner_up <
+                 config.min_fitness_gap) {
+        verdict = "ambiguous";
+      } else {
+        alignment.aligned = true;
+        verdict = "placed";
+      }
+    }
+    const double moved = alignment.correction.translation.norm();
+    const double turned = RadToDeg(
+        Eigen::AngleAxisd(alignment.correction.rotation).angle());
+    LogLine(log, StringPrintf("[align] trip %d onto %zu trip(s): %d "
+                              "hypotheses, best ICP fitness %.3f (coarse "
+                              "score %.2f, rmse %.1f cm), distinct runner-up "
+                              "%.3f: %s (%.2f m, %.1f deg)",
+                              t, placed.size(), alignment.hypotheses,
+                              alignment.fitness, alignment.score,
+                              100.0 * alignment.rmse, alignment.runner_up,
+                              verdict.c_str(), moved, turned));
+    if (alignment.aligned) {
+      for (int k : trip) {
+        const size_t kk = static_cast<size_t>(k);
+        poses[kk] = alignment.correction * poses[kk];
+      }
+      for (Anchor& anchor : anchors) {
+        if (!anchor.weak ||
+            keyframes[static_cast<size_t>(anchor.keyframe)].trip != t) {
+          continue;
+        }
+        anchor.pose = poses[static_cast<size_t>(anchor.keyframe)];
+        anchor.sigma_t = config.sigma_t;
+        anchor.sigma_r = config.sigma_r;
+      }
+      placed.push_back(t);
+    }
+    out.push_back(alignment);
+  }
+  return out;
 }
 
 std::vector<GravityMeasurement> MeasureKeyframeGravity(
@@ -496,10 +652,10 @@ std::vector<Pose> RefineScanToMap(
   return refined;
 }
 
-GraphStageResult RunGraphStage(const KeyframeSet& keyframes,
-                               const std::vector<TripInputs>& trips,
-                               const GraphStageConfig& config,
-                               const Logger& log) {
+GraphStageResult RunGraphStage(
+    const KeyframeSet& keyframes, const std::vector<TripInputs>& trips,
+    const GraphStageConfig& config, const Logger& log,
+    const std::vector<std::pair<int, int>>& appearance) {
   for (double voxel : config.RequiredVoxels()) {
     GR_CHECK(keyframes.HasVoxel(voxel));
   }
@@ -532,13 +688,43 @@ GraphStageResult RunGraphStage(const KeyframeSet& keyframes,
                               initial_summary.imu_factors,
                               initial_summary.imu_chi2_median));
   }
+  if (config.trip_align.enabled) {
+    result.trip_alignments =
+        AlignTrips(keyframes, config.trip_align, poses, result.anchors, log);
+    const bool moved = std::any_of(
+        result.trip_alignments.begin(), result.trip_alignments.end(),
+        [](const TripAlignment& alignment) { return alignment.aligned; });
+    if (moved) {
+      // The velocities of the moved trips are in their old frame.
+      result.inertial = InertialEstimate();
+      poses = OptimizeGraph(keyframes, {}, result.anchors, result.gravity,
+                            config.backend, &poses, nullptr, &initial_summary,
+                            imu_trips, &result.inertial);
+      log_cost(initial_summary, 0);
+    }
+  }
 
-  const std::vector<LoopConstraint> verified =
+  std::vector<LoopConstraint> verified =
       DetectLoops(keyframes, poses, config.loops, &result.loop_stats);
-  result.loops_verified = static_cast<int>(verified.size());
   LogLine(log, StringPrintf("[loops] %d candidates verified by ICP, %zu "
                             "accepted",
                             result.loop_stats.tested, verified.size()));
+  if (config.loops.enabled && !appearance.empty()) {
+    std::set<std::pair<int, int>> known;
+    for (const LoopConstraint& loop : verified) known.insert({loop.i, loop.j});
+    std::vector<std::pair<int, int>> pairs;
+    for (const auto& pair : appearance) {
+      if (!known.count(pair)) pairs.push_back(pair);
+    }
+    int runs = 0;
+    const std::vector<LoopConstraint> found = VerifyAppearanceLoops(
+        keyframes, poses, pairs, config.loops, config.appearance, &runs);
+    LogLine(log, StringPrintf("[loops] %zu appearance candidates: %d ICP "
+                              "runs, %zu accepted",
+                              pairs.size(), runs, found.size()));
+    verified.insert(verified.end(), found.begin(), found.end());
+  }
+  result.loops_verified = static_cast<int>(verified.size());
   result.loops =
       SelectConsistentLoops(verified, keyframes, poses, config.loops);
   LogLine(log, StringPrintf("[loops] PCM kept %zu/%zu", result.loops.size(),
