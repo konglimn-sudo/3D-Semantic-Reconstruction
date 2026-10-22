@@ -3,6 +3,9 @@
 The vehicle drives on the floor, so its trajectory is the most robust source
 of floor heights: flat stretches give the levels, sloped stretches give the
 ramps. Map points then refine a per-level floor height grid (drainage slopes).
+The grid takes the floor points near the level's own trajectory height at
+their position, not near one constant: a level may rise gently along a long
+aisle (FusionPortableV2: 4.5 m over 400 m at 1.1 %, below the ramp slope).
 """
 
 from __future__ import annotations
@@ -130,7 +133,7 @@ def _segments(mask: np.ndarray) -> list[tuple[int, int]]:
 
 def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray, normals: np.ndarray, cfg, log=print) -> LevelModel:
     lc = cfg.levels
-    flat_z, ramp_segments = [], []
+    flat_z, flat_xyz, ramp_segments = [], [], []
     for P in vehicle_paths:
         p = P[:, :3, 3]
         s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p[:, :2], axis=0), axis=1))])
@@ -142,6 +145,7 @@ def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray, normals: np.
             slope[k] = (p[b, 2] - p[a, 2]) / ds if ds > 0.2 else 0.0
         flat = np.abs(slope) < lc.flat_slope
         flat_z.append(p[flat, 2])
+        flat_xyz.append(p[flat])
         for a, b in _segments(np.abs(slope) >= 2 * lc.flat_slope):
             if s[b - 1] - s[a] > 3.0:
                 ramp_segments.append(p[a:b])
@@ -158,14 +162,7 @@ def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray, normals: np.
     if len(level_z) == 0:
         level_z = np.array([float(np.median(zs))]) if len(zs) else np.array([0.0])
 
-    # Ceiling per level from downward-facing surfaces above the floor.
     nz = normals[:, 2]
-    ceiling = []
-    for i, z in enumerate(level_z):
-        top = level_z[i - 1] if i > 0 else z + 6.0
-        sel = (nz < -0.85) & (xyz[:, 2] > z + 2.0) & (xyz[:, 2] < top)
-        ceiling.append(float(np.percentile(xyz[sel, 2], 90)) if sel.sum() > 50 else z + 3.0)
-
     ramps = _fit_ramps(ramp_segments, level_z, xyz, nz, log)
 
     # Floor height grid per level: per-cell median of upward-facing points near
@@ -178,9 +175,21 @@ def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray, normals: np.
     lo, hi = xyz[:, :2].min(axis=0) - 1.0, xyz[:, :2].max(axis=0) + 1.0
     res = float(lc.grid_res)
     W, H = int(np.ceil((hi[0] - lo[0]) / res)), int(np.ceil((hi[1] - lo[1]) / res))
+    # The trajectory height of each level near every point: flat path samples
+    # go to the nearest level height.
+    from scipy.spatial import cKDTree
+    path = np.concatenate(flat_xyz) if flat_xyz else np.zeros((0, 3))
+    owner = (np.argmin(np.abs(path[:, 2][:, None] - level_z[None, :]), axis=1)
+             if len(path) else np.zeros(0, int))
     grids = []
-    for z in level_z:
-        sel = up & ~on_ramp & (np.abs(xyz[:, 2] - z) < lc.floor_band)
+    for i, z in enumerate(level_z):
+        mine = path[owner == i]
+        if len(mine) >= lc.min_samples:
+            _, nearest = cKDTree(mine[:, :2]).query(xyz[:, :2], k=1)
+            reference = mine[nearest, 2]
+        else:
+            reference = np.full(len(xyz), z)
+        sel = up & ~on_ramp & (np.abs(xyz[:, 2] - reference) < lc.floor_band)
         g = _cell_median(xyz[sel, :2], xyz[sel, 2], lo[0], lo[1], res, W, H)
         if np.isfinite(g).any():
             missing = ~np.isfinite(g)
@@ -189,6 +198,16 @@ def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray, normals: np.
         else:
             g = np.full((H, W), z)
         grids.append(FloorGrid(float(lo[0]), float(lo[1]), res, g))
+
+    # Ceiling per level from downward-facing surfaces 2 m or more above its
+    # floor (up to the next level above): the median clearance added to the
+    # level height.
+    ceiling = []
+    for i, z in enumerate(level_z):
+        h = xyz[:, 2] - grids[i].sample(xyz[:, :2])
+        top = (level_z[i - 1] - z) if i > 0 else 6.0
+        sel = (nz < -0.85) & (h > 2.0) & (h < top)
+        ceiling.append(float(z + np.percentile(h[sel], 90)) if sel.sum() > 50 else z + 3.0)
     log(f"[levels] {len(level_z)} levels at z={np.round(level_z, 2).tolist()}, ceilings "
         f"{np.round(ceiling, 2).tolist()}, {len(ramps)} ramps "
         f"{[round(r.slope, 3) for r in ramps]}")

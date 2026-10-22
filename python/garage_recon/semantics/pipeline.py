@@ -39,11 +39,13 @@ import numpy as np
 from garage_recon import _core
 from garage_recon import core_config
 from garage_recon import provenance
+from garage_recon.models import registry
 from garage_recon.io import export
 from garage_recon.nav import navmap
 from garage_recon.recon import bev
 from garage_recon.recon import pipeline as recon_pipeline
 from garage_recon.semantics import frame_labels
+from garage_recon.semantics import instances as instances_lib
 from garage_recon.semantics import language_field
 from garage_recon.semantics import markings as markings_lib
 from garage_recon.semantics import numbers as numbers_lib
@@ -286,11 +288,22 @@ class SemanticsPipeline:
                                self.recon.levels(), self.log)
         with np.load(self.out / "labels.npz") as z:
             stored = {k: z[k] for k in z.files}
+        # Merged over the rule labels as the objects stage left them, so the
+        # stage can be re-run (the objects stage drops `labels_rules`).
+        stored.setdefault("labels_rules", stored["labels"].copy())
         stored["labels"], count = objects2d.merge(
-            stored["labels"], result["static"], result["labels"],
+            stored["labels_rules"], result["static"], result["labels"],
             result["confidence"], list(self.cfg.objects2d.override),
             float(self.cfg.objects2d.min_confidence))
         np.savez_compressed(self.out / "labels.npz", **stored)
+        # Lights and signs hang overhead: the clearance the objects stage
+        # wrote is redone with them.
+        point_map = self.point_map()
+        for path in sorted((self.recon.work / "bev").glob("level_*.npz")):
+            grid, rasters = bev.load_bev(path)
+            rasters["clearance"] = clearance_raster(point_map,
+                                                    stored["labels"], grid)
+            bev.save_bev(path, grid, rasters)
         self.log(f"[objects2d] {count} map points relabelled")
         self.record("objects2d", uses_cameras=True)
 
@@ -389,10 +402,31 @@ class SemanticsPipeline:
         self.record("frames", uses_cameras=True)
 
     # ------------------------------------------------------ language route
-    def _language_ready(self, stage: str) -> bool:
+    def _language_models(self):
+        """The segmenter / encoder pair of the language route: the 2D
+        models, or with `features.source: detector` the detector's instances
+        (models.detection_language), or None."""
         models = self.recon.models
+        if self.cfg.features.get("source", "segmenter") == "detector":
+            if models.detector is None:
+                return None
+            if getattr(self, "_detection_language", None) is None:
+                from garage_recon.models import detection_language
+                self._detection_language = detection_language.DetectionLanguage(
+                    models.detector, models.segmenter,
+                    self.cfg.objects2d.prompts,
+                    self.cfg.objects2d.max_mask_fraction)
+            adapter = self._detection_language
+            return registry.ModelSuite(segmenter=adapter, encoder=adapter,
+                                       name=f"{models.name}+detector")
         if models.segmenter is None or models.encoder is None:
-            self.log(f"[{stage}] skipped (no segmenter / language encoder)")
+            return None
+        return models
+
+    def _language_ready(self, stage: str) -> bool:
+        if self._language_models() is None:
+            self.log(f"[{stage}] skipped (no segmenter / language encoder; "
+                     f"features.source {self.cfg.features.get('source', 'segmenter')})")
             return False
         return True
 
@@ -406,11 +440,11 @@ class SemanticsPipeline:
                 "features"):
             return
         keys = self._frame_keys()
+        models = self._language_models()
         masks = language_field.extract_features(
-            self.recon.pose_set(), self.recon.models, keys,
-            self.out / "features")
+            self.recon.pose_set(), models, keys, self.out / "features")
         self.log(f"[features] {len(keys)} images, {masks} masks with "
-                 f"embeddings ({self.recon.models.name} models)")
+                 f"embeddings ({models.name} models)")
         self.record("features", uses_cameras=True)
 
     def _carriers(self) -> tuple[np.ndarray, np.ndarray]:
@@ -466,7 +500,7 @@ class SemanticsPipeline:
         embeddings = language_field.identity_embeddings(
             association, keys, self.out / "features", section)
         class_ids, class_embeddings = language_field.class_text_embeddings(
-            self.recon.models.encoder)
+            self._language_models().encoder)
         identity_class, identity_score = language_field.classify(
             embeddings["embeddings"], class_ids, class_embeddings,
             float(section.min_score))
@@ -493,6 +527,15 @@ class SemanticsPipeline:
         directory.mkdir(exist_ok=True)
         np.savez_compressed(directory / "labels.npz", labels=labels,
                             identity=identity)
+        objects = instances_lib.instances(
+            point_map.xyz, identity, embeddings["ids"], identity_class,
+            identity_score, self.recon.levels(),
+            int(section.get("instance_min_points", 5)),
+            float(section.get("instance_overlap", 0.3)),
+            float(section.get("instance_pad", 0.1)),
+            float(section.get("instance_max_extent", 8.0)))
+        (directory / "instances.json").write_text(
+            json.dumps(objects, ensure_ascii=False, indent=1))
         label_dir = (directory / "frames" if section.write_label_images
                      else None)
         # Frames are rendered from the full-resolution static map.
@@ -508,13 +551,15 @@ class SemanticsPipeline:
         summary = {
             "identities": int(len(embeddings["ids"])),
             "classified": int((identity_class > 0).sum()),
+            "instances": {name: sum(o["class"] == name for o in objects)
+                          for name in sorted({o["class"] for o in objects})},
             "point_classes": counts,
             "frames": len(rates),
             "cross_view_consistency_mean": (float(rates.mean()) if len(rates)
                                             else None),
             "cross_view_consistency_p10": (float(np.percentile(rates, 10))
                                            if len(rates) else None),
-            "models": self.recon.models.name,
+            "models": self._language_models().name,
             "pose_set_id": self.recon.pose_set().pose_set_id,
         }
         language_field.write_summary(directory / "summary.json", summary)
@@ -531,7 +576,22 @@ class SemanticsPipeline:
         slots = [slots_lib.Slot(**s) for s in json.loads(
             (self.out / "slots.json").read_text())]
         summary = numbers_lib.read_numbers(self.recon, slots, self.cfg,
-                                           self.log)
+                                           self.log, self.out / "ocr_cache.json")
+        landmarks = summary.pop("landmark_list", [])
+        path = self.out / "language" / "instances.json"
+        if path.exists() and landmarks:  # Text onto the signs it is on.
+            objects = json.loads(path.read_text())
+            summary["landmarks_on_instances"] = instances_lib.attach_text(
+                objects, landmarks)
+            path.write_text(json.dumps(objects, ensure_ascii=False, indent=1))
+        (self.out / "landmarks.json").write_text(
+            json.dumps(landmarks, ensure_ascii=False, indent=1))
+        (self.out / "landmarks.geojson").write_text(json.dumps({
+            "type": "FeatureCollection", "features": [
+                {"type": "Feature", "geometry": {"type": "Point",
+                                                 "coordinates": l["xyz"]},
+                 "properties": {k: v for k, v in l.items() if k != "xyz"}}
+                for l in landmarks]}, ensure_ascii=False))
         (self.out / "numbers.json").write_text(json.dumps({
             "summary": summary,
             "slots": {s.slot_id: {"number": s.number, "zone": s.zone,
@@ -597,6 +657,19 @@ class SemanticsPipeline:
                 lo, hi = points.min(axis=0) - 1.0, points.max(axis=0) + 1.0
                 lots[level] = np.array([[lo[0], lo[1]], [hi[0], lo[1]],
                                         [hi[0], hi[1]], [lo[0], hi[1]]])
+        # Object instances of the language route, and the text landmarks.
+        path = self.out / "language" / "instances.json"
+        objects = json.loads(path.read_text()) if path.exists() else []
+        export.write_geojson(directory / "objects.geojson", [
+            export.feature("Point", o["centroid"], {
+                k: v for k, v in o.items() if k != "centroid"})
+            for o in objects])
+        path = self.out / "landmarks.json"
+        landmarks = json.loads(path.read_text()) if path.exists() else []
+        export.write_geojson(directory / "landmarks.geojson", [
+            export.feature("Point", m["xyz"], {
+                k: v for k, v in m.items() if k != "xyz"})
+            for m in landmarks])
         export.write_lanelet2_osm(
             directory / "lanelet2_map.osm", slots,
             {i: float(z) for i, z in enumerate(levels.z)}, lots,

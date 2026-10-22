@@ -36,13 +36,20 @@ def fuse_floor_texture(pose_set: pose_set_lib.PoseSet, grid: bev.BevGrid,
     used = 0
     for t, data in enumerate(pose_set.datasets):
         rig = pose_set.rig(t)
-        for name in rig.fisheye_cameras:
+        for name in rig.cameras:  # Fisheye and pinhole alike.
             camera = rig.cameras[name].make_model()
             for ns in data.camera_stamps_ns(name):
                 center = pose_set.camera_center_pose(t, name, int(ns))
-                vehicle_z = (center @ geometry.inv(
-                    rig.cameras[name].T_vehicle_cam))[2, 3]
-                if abs(vehicle_z - level_z) > 1.0:
+                vehicle = center @ geometry.inv(rig.cameras[name].T_vehicle_cam)
+                # Against the floor under the vehicle, not one level height
+                # (a level may rise along an aisle).
+                i = int((vehicle[0, 3] - grid.x0) / grid.res)
+                j = int((vehicle[1, 3] - grid.y0) / grid.res)
+                inside = 0 <= i < grid.width and 0 <= j < grid.height
+                floor = floor_z[j, i] if inside else np.nan
+                if not np.isfinite(floor):
+                    floor = level_z
+                if abs(vehicle[2, 3] - floor) > 1.0:
                     continue  # The vehicle is on another level or a ramp.
                 camera_from_world = geometry.inv(
                     pose_set.camera_exposure(t, name, int(ns)))

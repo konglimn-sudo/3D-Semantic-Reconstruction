@@ -181,8 +181,14 @@ def vectorize(mask: np.ndarray, grid: BevGrid, cfg, level: int) -> list[MarkingS
     dist = ndimage.distance_transform_edt(mask)
     lab, n = ndimage.label(branches, structure=np.ones((3, 3)))
     segs: list[MarkingSegment] = []
-    for c in range(1, n + 1):
-        jj, ii = np.where(lab == c)
+    # Each branch within its own bounding box: np.where over the whole raster
+    # per branch costs branches x cells (hours on a 400 m level with camera
+    # texture).
+    for c, box in enumerate(ndimage.find_objects(lab), start=1):
+        if box is None:
+            continue
+        jj, ii = np.where(lab[box] == c)
+        jj, ii = jj + box[0].start, ii + box[1].start
         if len(jj) * res < mc.min_length * 0.5:
             continue
         pts = np.stack([ii + 0.5, jj + 0.5], axis=1)
@@ -219,38 +225,56 @@ def classify_markings(segs: list[MarkingSegment], paths_xy: dict[int, np.ndarray
 
 
 def merge_collinear(segs: list[MarkingSegment], cfg) -> list[MarkingSegment]:
+    """Merges segments that are parallel (within `merge_angle`), on one line
+    (both ends of the other within `merge_offset` of it) and at most
+    `merge_gap` apart along it. Each segment absorbs every partner it finds,
+    tested against all remaining segments at once (a level with camera
+    texture has thousands of fragments; pairwise loops restarted after each
+    merge took hours)."""
     mc = cfg.markings
     segs = list(segs)
-    changed = True
-    while changed:
-        changed = False
-        for a in range(len(segs)):
-            for b in range(a + 1, len(segs)):
-                A, B = segs[a], segs[b]
-                pa0, pa1, pb0, pb1 = map(np.asarray, (A.p0, A.p1, B.p0, B.p1))
-                da = (pa1 - pa0) / max(np.linalg.norm(pa1 - pa0), 1e-9)
-                db = (pb1 - pb0) / max(np.linalg.norm(pb1 - pb0), 1e-9)
-                if np.degrees(np.arccos(min(1.0, abs(da @ db)))) > mc.merge_angle:
-                    continue
-                nrm = np.array([-da[1], da[0]])
-                if max(abs((pb0 - pa0) @ nrm), abs((pb1 - pa0) @ nrm)) > mc.merge_offset:
-                    continue
-                ta = sorted([0.0, (pa1 - pa0) @ da])
-                tb = sorted([(pb0 - pa0) @ da, (pb1 - pa0) @ da])
-                gap = max(tb[0] - ta[1], ta[0] - tb[1])
-                if gap > mc.merge_gap:
-                    continue
-                t0, t1 = min(ta[0], tb[0]), max(ta[1], tb[1])
-                la, lb = A.length, B.length
-                w = (A.width * la + B.width * lb) / max(la + lb, 1e-9)
-                segs[a] = MarkingSegment(A.level, (pa0 + t0 * da).tolist(), (pa0 + t1 * da).tolist(), w, A.cls,
-                                         min(1.0, (A.confidence * la + B.confidence * lb) / max(la + lb, 1e-9)))
-                segs.pop(b)
-                changed = True
+    n = len(segs)
+    if n < 2:
+        return segs
+    p0 = np.array([s.p0 for s in segs], float)
+    p1 = np.array([s.p1 for s in segs], float)
+    alive = np.ones(n, bool)
+    cos_max = np.cos(np.radians(mc.merge_angle))
+
+    def unit(v):
+        return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-9)
+
+    for a in range(n):
+        while alive[a]:
+            others = np.nonzero(alive)[0]
+            others = others[others != a]
+            if len(others) == 0:
                 break
-            if changed:
+            da = unit(p1[a] - p0[a])
+            db = unit(p1[others] - p0[others])
+            nrm = np.array([-da[1], da[0]])
+            ok = np.abs(db @ da) >= cos_max
+            ok &= np.maximum(np.abs((p0[others] - p0[a]) @ nrm),
+                             np.abs((p1[others] - p0[a]) @ nrm)) <= mc.merge_offset
+            la = float(np.linalg.norm(p1[a] - p0[a]))
+            t0 = (p0[others] - p0[a]) @ da
+            t1 = (p1[others] - p0[a]) @ da
+            gap = np.maximum(np.minimum(t0, t1) - la, -np.maximum(t0, t1))
+            ok &= gap <= mc.merge_gap
+            if not ok.any():
                 break
-    return segs
+            k = int(others[np.argmax(ok)])
+            A, B = segs[a], segs[k]
+            lo = min(0.0, t0[np.argmax(ok)], t1[np.argmax(ok)])
+            hi = max(la, t0[np.argmax(ok)], t1[np.argmax(ok)])
+            lb = B.length
+            w = (A.width * la + B.width * lb) / max(la + lb, 1e-9)
+            conf = min(1.0, (A.confidence * la + B.confidence * lb) / max(la + lb, 1e-9))
+            start, end = p0[a] + lo * da, p0[a] + hi * da
+            segs[a] = MarkingSegment(A.level, start.tolist(), end.tolist(), w, A.cls, conf)
+            p0[a], p1[a] = start, end
+            alive[k] = False
+    return [segs[i] for i in range(n) if alive[i]]
 
 
 def extract_markings(rasters: dict, grid: BevGrid, cfg, yaw: float = 0.0, segmenter: MarkingSegmenter | None = None,

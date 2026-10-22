@@ -519,8 +519,8 @@ objects2d:                   # objects named by a 2D detector (models.owlv2; mas
     _ignore: [a car, a pillar, a pedestrian crosswalk, a person, a railing, a handrail]
   max_mask_fraction: {default: 0.08, barrier: 0.2}  # of the image; larger masks are dropped
   height:                    # [min, max] m above the floor of the level (README 5.2 rules)
-    speed_bump: [-0.2, 0.25]
-    wheel_stopper: [-0.2, 0.3]
+    speed_bump: [0.02, 0.25]   # raised above the floor (flat-floor detections: median 0.00 m)
+    wheel_stopper: [0.02, 0.3]
     light: [1.8, 100.0]
     sign: [0.5, 100.0]
     barrier: [-0.2, 2.5]
@@ -532,6 +532,10 @@ objects2d:                   # objects named by a 2D detector (models.owlv2; mas
 features:
   enabled: true
   frame_stride: 1
+  source: segmenter          # segmenter: models.sam2 + models.siglip masks and embeddings;
+                             # detector: the objects2d detections (models.owlv2 + sam2) as
+                             # instances with their class (zero-shot mask classes fail on real
+                             # garages, README 5.2)
 identities:                  # C++ IdentityAssociator
   carrier_voxel: 0.1         # static map points that carry identities
   max_range: 12.0
@@ -551,6 +555,11 @@ language:
   range_scale: 5.0           # view weight 1 / (1 + range / range_scale)
   border_weight: 0.5         # masks cut by the image border
   write_label_images: false
+  instance_min_points: 5
+  instance_overlap: 0.3      # same-class identities whose 5-95 % boxes overlap this much
+                             # of the smaller box are one instance (0: one per identity)
+  instance_pad: 0.1          # m: boxes grown by this for the overlap
+  instance_max_extent: 8.0   # m: a merged instance's longest horizontal side
 
 numbers:                     # slot numbers / zones read by OCR (models.ocr)
   enabled: true
@@ -558,11 +567,17 @@ numbers:                     # slot numbers / zones read by OCR (models.ocr)
   max_range: 10.0            # m along the camera ray
   max_distance: 0.5          # text on the floor within this of a slot outline (m)
   min_score: 1.0             # summed OCR score of the winning text
+  text_max_range: 25.0       # m: signs placed on the LiDAR map surface up to this range
+  landmark_radius: 3.0       # m: readings of one text closer than this are one landmark
+  landmark_min_views: 2
+  landmark_min_score: 1.0
+  landmark_similarity: 0.6   # one sign: same-kind texts this alike (or exits) within the radius
 
 nav:                         # semantic navigation map (stage nav)
   enabled: true
   res: 0.1                   # grid (m)
   margin: 2.0                # grid margin around the level's points (m)
+  zone_sign_radius: 30.0     # m: a slot without a zone takes the nearest zone sign (OCR) of its level
   vehicle:
     width: 1.9               # the route keeps width / 2 + margin from obstacles
     length: 4.8

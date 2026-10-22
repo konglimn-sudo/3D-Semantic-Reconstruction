@@ -221,9 +221,11 @@ def extract_structure(pm: PointMap, levels: LevelModel, paths_xy: list[np.ndarra
         # Columns: compact persistent components (+ bulges found in walls).
         lab_p, n_p = _components(persistent & ~wall_cells)
         cands = []
-        for c in range(1, n_p + 1):
-            jj, ii = np.where(lab_p == c)
-            cands.append((ii, jj))
+        for c, box in enumerate(ndimage.find_objects(lab_p), start=1):
+            if box is None:
+                continue
+            jj, ii = np.where(lab_p[box] == c)  # Within its bounding box.
+            cands.append((ii + box[1].start, jj + box[0].start))
         cands += bulge_cols
         boxes = []
         for ii, jj in cands:

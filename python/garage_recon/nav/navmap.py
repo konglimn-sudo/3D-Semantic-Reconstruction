@@ -7,6 +7,7 @@ paths. Outputs go to work/semantics/nav/ (see export.py) with qa.json.
 
 from __future__ import annotations
 
+import collections
 import json
 
 import numpy as np
@@ -63,7 +64,9 @@ def build(semantics, cfg, log=print) -> dict:
                                    origin_level, cfg)
     goals = goals_lib.add_slot_goals(graph, layers_by_level, slots, cfg)
     names = address.level_names(levels.n, cfg)
-    address.assign_zones(goals, cfg)
+    path = semantics.out / "landmarks.json"
+    landmarks = json.loads(path.read_text()) if path.exists() else []
+    address.assign_zones(goals, cfg, landmarks)
     for goal in goals:
         goal["level_name"] = names[goal["level"]]
         goal["address"] = address.address(goal, names)
@@ -71,6 +74,13 @@ def build(semantics, cfg, log=print) -> dict:
     report = qa.check(graph, layers_by_level, goals, origin, paths, cfg)
     report["origin"] = {"xyz": np.round(origin_xyz, 3).tolist(),
                         "level": origin_level}
+    report["landmarks"] = {k: sum(l["kind"] == k for l in landmarks)
+                           for k in sorted({l["kind"] for l in landmarks})}
+    report["zones_from_signs"] = sum(g.get("zone_source") == "sign"
+                                     for g in goals)
+    # Slots a zone query ("5A区") finds, per level and zone.
+    report["zone_slots"] = dict(collections.Counter(
+        f"{names[g['level']]}-{g['zone']}" for g in goals if g.get("zone")))
     for level, layers in layers_by_level.items():
         export.write_ros_map(out, layers, f"level_{level}")
         np.savez_compressed(out / f"level_{level}_layers.npz",
@@ -79,6 +89,9 @@ def build(semantics, cfg, log=print) -> dict:
                              graph, goals)
     export.write_graph(out, graph)
     export.write_goals(out, goals, names)
+    # Exits, gates, zone and level signs: landmarks of the navigation map.
+    (out / "landmarks.json").write_text(json.dumps(landmarks, indent=1,
+                                                   ensure_ascii=False))
     (out / "qa.json").write_text(json.dumps(report, indent=1,
                                             ensure_ascii=False))
     log(f"[nav] {report['nodes']} nodes, "

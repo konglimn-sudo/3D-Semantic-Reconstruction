@@ -415,7 +415,8 @@ def static_objects_from_map(pm, labels: np.ndarray, levels: LevelModel, yaw: flo
     next_id = 50000
     floor_pts = pm.xyz[(labels == cid("floor")) | (labels == cid("ramp"))]
     for lv in range(levels.n):
-        support = _support_grid(floor_pts[np.abs(floor_pts[:, 2] - levels.z[lv]) < 1.0], 0.5)
+        near = np.abs(floor_pts[:, 2] - levels.floor_z(floor_pts[:, :2], lv)) < 1.0
+        support = _support_grid(floor_pts[near], 0.5)
         pending: dict = {}  # (slot, trips) -> point indices, so fragments of one car merge
         gidx = np.where(cand & (pm.level == lv))[0]
         if len(gidx) < oc.min_points:
