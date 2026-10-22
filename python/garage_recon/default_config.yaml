@@ -352,6 +352,7 @@ models:
   sam2: null
   siglip: null
   ocr: null
+  owlv2: null                # e.g. {model: google/owlv2-large-patch14-ensemble, threshold: 0.2}
   oracle:
     segmenter: {min_pixels: 20, split_probability: 0.05}
     encoder: {dimension: 64, mask_noise: 0.35, text_noise: 0.1, confusion: 0.1}
@@ -495,6 +496,36 @@ frames:
   depth_rel_tol: 0.03
   render_spacing: 0.05
   write_label_images: true
+
+objects2d:                   # objects named by a 2D detector (models.owlv2; masks from models.sam2
+  enabled: true              # box prompts, else the boxes), lifted onto the map (README 5.2)
+  frame_stride: 4            # every n-th image of each camera
+  spacing: 0.05              # map point splat (m)
+  max_range: 15.0
+  boundary: 1                # label-boundary pixels do not vote
+  min_views: 2
+  min_confidence: 0.5        # vote share of the winning class
+  override: [unlabeled, other, floor, ceiling, wall, column, beam, mep]  # rule labels it may replace
+  prompts:                   # taxonomy class -> OWLv2 text queries
+    light: [a ceiling light]
+    sign: [a sign, an exit sign]
+    barrier: [a barrier gate]
+    wheel_stopper: [a wheel stopper]
+    speed_bump: [a speed bump]
+    two_wheeler: [a bicycle, a motorcycle]
+    other: [a fire extinguisher, a fire hydrant cabinet, a traffic cone]
+    # Compete for boxes, then dropped: cars and columns come from the rules,
+    # people move (objects4d), railings are no barrier gates.
+    _ignore: [a car, a pillar, a pedestrian crosswalk, a person, a railing, a handrail]
+  max_mask_fraction: {default: 0.08, barrier: 0.2}  # of the image; larger masks are dropped
+  height:                    # [min, max] m above the floor of the level (README 5.2 rules)
+    speed_bump: [-0.2, 0.25]
+    wheel_stopper: [-0.2, 0.3]
+    light: [1.8, 100.0]
+    sign: [0.5, 100.0]
+    barrier: [-0.2, 2.5]
+    other: [-0.2, 2.5]
+    two_wheeler: [-0.2, 2.0]
 
 # Language route (2D models decide "what", the 3D identity field keeps the
 # views consistent): features -> identities -> language.

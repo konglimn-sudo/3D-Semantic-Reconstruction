@@ -1,4 +1,5 @@
-"""SAM 2.1 automatic masks as the Segmenter2D (README 5.2; Apache 2.0).
+"""SAM 2.1 as the Segmenter2D (README 5.2; Apache 2.0); box prompts for
+detected objects (`masks_from_boxes`, stage objects2d).
 
 The automatic mask generator prompts a grid of points and keeps the masks
 that are confident and stable. Its masks overlap (an object and its parts);
@@ -42,6 +43,24 @@ class Sam2Segmenter:
             min_mask_region_area=int(min_mask_region_area))
         self.max_side = int(max_side)
         self.min_area = int(min_area)
+
+    def masks_from_boxes(self, frame: interfaces.Frame,
+                         boxes: np.ndarray) -> np.ndarray:
+        """(N, H, W) bool masks of the objects in (N, 4) x0 y0 x1 y1 boxes
+        (box prompts: one image encoding, all boxes in one decoder pass)."""
+        h, w = frame.image.shape[:2]
+        if len(boxes) == 0:
+            return np.zeros((0, h, w), bool)
+        predictor = self.generator.predictor
+        with self.torch.inference_mode(), self.torch.autocast(
+                "cuda", dtype=self.torch.bfloat16):
+            predictor.set_image(np.ascontiguousarray(frame.image))
+            masks, _, _ = predictor.predict(
+                box=np.asarray(boxes, np.float32), multimask_output=False)
+        masks = np.asarray(masks)
+        if masks.ndim == 4:  # (N, 1, H, W)
+            masks = masks[:, 0]
+        return masks.reshape(-1, h, w) > 0
 
     def segment(self, frame: interfaces.Frame) -> np.ndarray:
         """(H, W) int32 mask ids, -1 where no mask."""
