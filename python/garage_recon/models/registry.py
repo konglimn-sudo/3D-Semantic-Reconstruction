@@ -6,8 +6,8 @@
     real     The GPU models of the config (models.da3, ...), imported lazily.
     auto     oracle when a gt/ directory is given, otherwise none.
 Real adapters implement the protocols of interfaces.py: Depth Anything 3
-(da3.py), RoMa and DINOv2 (dino.py); SAM 2, SigLIP 2 and OCR are added with
-their stages.
+(da3.py), RoMa and DINOv2 (dino.py), SAM 2.1 (sam.py), SigLIP 2 (siglip.py)
+and RapidOCR (ocr.py).
 """
 
 from __future__ import annotations
@@ -82,6 +82,14 @@ def build(models_cfg, gt_dir: str | pathlib.Path | None = None) -> ModelSuite:
         if models_cfg.get("dino"):
             suite.features = _Lazy("dino", "Dinov2Features",
                                    models_cfg.get("dino"))
+        if models_cfg.get("sam2"):
+            suite.segmenter = _Lazy("sam", "Sam2Segmenter",
+                                    models_cfg.get("sam2"))
+        if models_cfg.get("siglip"):
+            suite.encoder = _Lazy("siglip", "Siglip2Encoder",
+                                  models_cfg.get("siglip"))
+        if models_cfg.get("ocr"):
+            suite.ocr = _Lazy("ocr", "RapidOcrReader", models_cfg.get("ocr"))
         return suite
     if backend != "oracle":
         raise ValueError(f"unknown model backend: {backend}")

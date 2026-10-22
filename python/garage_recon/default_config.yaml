@@ -200,9 +200,12 @@ gs:                          # 3DGS on the LiDAR skeleton (README 8.3): gsplat 3
   saturated_fixed_appearance: true  # that loss moves the Gaussians, not the image gain / bias
   dark: 3
   images_on_gpu: true        # compact image targets live on the GPU (host memory is the limit)
-  sky_weight: 0.0            # opacity penalty on "sky": rays above the horizon that meet no LiDAR /
-  sky_min_elevation: 5.0     # prior surface (deg). Off: far facades and trees count as sky too
-                             # (Keble 0.1: holdout 24.0 -> 21.6 dB, 8% of LiDAR rays missed)
+  sky_weight: 0.0            # opacity penalty on sky pixels, per image pixel (0 = off)
+  sky_source: segmentation   # segmentation: DINOv2 + ADE20K sky (models.dino.ade20k_head) and no
+                             # LiDAR / prior surface; depth: above the horizon and no surface (far
+                             # facades and trees count as sky too: Keble 24.0 -> 21.6 dB)
+  sky_threshold: 0.5         # segmentation: sky probability
+  sky_min_elevation: 5.0     # depth: deg above the horizon
   depth_max_range: 60.0      # LiDAR depth targets without a depth_prior stage
   mask: {dilate: 4}          # C++ TrainingMaskConfig: moving points
   coverage: {max_range: 40.0, point_spacing: 0.05}  # C++ CoverageConfig
@@ -341,6 +344,14 @@ models:
     weights: null
     device: cuda
     resolution: 518
+    ade20k_head: null        # Meta's linear ADE20K head for ViT-L/14 (Apache 2.0): semantic sky
+  # Language route and slot numbers (README 5.2, stage D); null = off. E.g.
+  #   sam2: {checkpoint: .../sam2.1_hiera_large.pt}          SAM 2.1, Apache 2.0
+  #   siglip: {model: google/siglip2-so400m-patch14-384}      SigLIP 2, Apache 2.0
+  #   ocr: {min_score: 0.5}                                   RapidOCR (PP-OCR), Apache 2.0
+  sam2: null
+  siglip: null
+  ocr: null
   oracle:
     segmenter: {min_pixels: 20, split_probability: 0.05}
     encoder: {dimension: 64, mask_noise: 0.35, text_noise: 0.1, confusion: 0.1}

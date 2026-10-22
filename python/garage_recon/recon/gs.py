@@ -172,7 +172,8 @@ def _load_images(pose_set, point_map, cfg, work: pathlib.Path, log):
         # Sky: rays above the horizon (world z up) that meet no LiDAR or
         # prior surface; Gaussians there only explain the background.
         sky = None
-        if float(section.get("sky_weight") or 0.0) > 0:
+        if (float(section.get("sky_weight") or 0.0) > 0
+                and section.get("sky_source", "segmentation") == "depth"):
             up = np.nan_to_num(rays @ world_from_cam[:3, :3].T)[..., 2]
             horizon = np.sin(np.radians(float(section.sky_min_elevation)))
             sky = (up > horizon) & ~np.isfinite(depth) & (ray_z > 0)
@@ -188,6 +189,50 @@ def _load_images(pose_set, point_map, cfg, work: pathlib.Path, log):
     log(f"[gs] {len(images)} images ({sum(i.holdout for i in images)} held "
         f"out)")
     return images
+
+
+def _segment_sky(images, cfg, out_dir, log):
+    """Sky masks from DINOv2 + the ADE20K head (models.dino.ade20k_head): sky
+    where the class probability passes `gs.sky_threshold` and no LiDAR or
+    prior surface was found. Sky by "no depth" alone also takes far facades
+    and trees beyond the LiDAR range (README 8.3)."""
+    import cv2
+    from garage_recon.models import dino
+    settings = dict(cfg.models.get("dino") or {})
+    if not settings.get("ade20k_head"):
+        log("[gs] sky: no models.dino.ade20k_head configured, no sky masks")
+        return
+    model = dino.Dinov2Features(**settings)
+    threshold = float(cfg.gs.get("sky_threshold", 0.5))
+    bright = int(cfg.gs.saturated)
+    # Small blobs (dark ceilings, glare) are not sky.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    start, share = time.time(), []
+    preview = []
+    for n, im in enumerate(images):
+        p = model.class_probability(im.rgb, model.ADE20K_SKY)
+        # Saturated pixels are out of `mask`, but most of a bright sky is
+        # saturated: they count, the black outside the fisheye does not.
+        usable = im.mask | (im.rgb.max(axis=2) >= bright)
+        sky = (p > threshold) & (im.depth == 0) & usable
+        im.sky = cv2.morphologyEx(sky.astype(np.uint8), cv2.MORPH_OPEN,
+                                  kernel) > 0
+        share.append(im.sky.mean())
+        if n % max(1, len(images) // 4) == 0 and len(preview) < 4:
+            over = im.rgb.copy()
+            over[im.sky] = (0.4 * over[im.sky] + [153, 0, 0]).astype(np.uint8)
+            preview.append(cv2.resize(np.concatenate([im.rgb, over], axis=1),
+                                      None, fx=0.3, fy=0.3))
+    del model
+    import torch
+    torch.cuda.empty_cache()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if preview:
+        width = min(p.shape[1] for p in preview)
+        cv2.imwrite(str(out_dir / "sky_preview.jpg"),
+                    np.concatenate([p[:, :width] for p in preview])[..., ::-1])
+    log(f"[gs] sky: {np.mean(share) * 100:.1f}% of the pixels (median image "
+        f"{np.median(share) * 100:.1f}%), {time.time() - start:.0f}s")
 
 
 def _coverage(points, normals, images, pose_set, cfg):
@@ -678,8 +723,10 @@ class BlockTrainer:
                 rel = torch.abs(z - depth)[valid] / depth[valid]
                 loss = loss + float(c.depth_weight) * (rel * w[valid]).sum() / (
                     w[valid].sum() + 1e-6)
-            if sky is not None and sky.any():
-                loss = loss + float(c.sky_weight) * alpha[sky].mean()
+            if sky is not None and sky.any() and float(c.sky_weight) > 0:
+                # Per image pixel, like the photometric loss: a mean over
+                # the few sky pixels outweighs everything else.
+                loss = loss + float(c.sky_weight) * (alpha * sky).mean()
             sat = self._saturated(i)
             if sat is not None and sat.any():
                 # One-sided: a saturated pixel only says "at least this
@@ -738,13 +785,18 @@ class BlockTrainer:
                              f"{time.time() - start:.0f}s")
         return time.time() - start
 
-    def evaluate(self, ids, preview_dir=None, previews=4):
-        """PSNR / SSIM on the given images (masked pixels only)."""
+    def evaluate(self, ids, preview_dir=None, previews=4, no_sky=False):
+        """PSNR / SSIM on the given images (masked pixels only; `no_sky`:
+        also without the sky pixels)."""
         torch = self.torch
         out = []
         with torch.no_grad():
             for n, i in enumerate(ids):
-                target, mask, _, _, _, _ = self._image(i)
+                target, mask, _, _, _, sky = self._image(i)
+                if no_sky:
+                    if sky is None:
+                        return []
+                    mask = mask & ~sky
                 rgb, _, _, _ = self.render(i, int(self.cfg.sh_degree))
                 rgb = rgb.clamp(0, 1)
                 m = mask[..., None].float()
@@ -847,6 +899,11 @@ def run_gs(pose_set: pose_set_lib.PoseSet, point_map: static_map.PointMap,
     out_dir = work / "gs"
     out_dir.mkdir(parents=True, exist_ok=True)
     images = _load_images(pose_set, point_map, cfg, work, log)
+    if cfg.gs.get("sky_source", "segmentation") == "segmentation" and (
+            float(cfg.gs.get("sky_weight") or 0.0) > 0
+            or (cfg.models.get("dino") or {}).get("ade20k_head")):
+        # Also without the loss, for holdout_psnr_nosky.
+        _segment_sky(images, cfg, work / "gs", log)
     prior_path = work / "depth_prior" / "points.npz"
     prior = dict(np.load(prior_path)) if (
         prior_path.exists() and cfg.gs.use_prior_points) else None
@@ -928,6 +985,7 @@ def run_gs(pose_set: pose_set_lib.PoseSet, point_map: static_map.PointMap,
         trainer.neighbour_appearance(holdout)
         test = trainer.evaluate(holdout, out_dir / "previews")
         bright = trainer.saturation_agreement(holdout)
+        no_sky = trainer.evaluate(holdout, no_sky=True)
         fit = trainer.evaluate(train)
         appearance.append({"block": np.full(len(block_images), b, np.int32),
                            **trainer.appearance()})
@@ -943,6 +1001,7 @@ def run_gs(pose_set: pose_set_lib.PoseSet, point_map: static_map.PointMap,
                  "holdout_psnr_raw": float(np.mean([p for p, _ in raw])) if raw else None,
                  "holdout_ssim_raw": float(np.mean([s for _, s in raw])) if raw else None,
                  "holdout_saturated_bright": bright,
+                 "holdout_psnr_nosky": float(np.mean([p for p, _ in no_sky])) if no_sky else None,
                  "frozen_fraction": float(np.mean(
                      (model["flags"][core] & FLAG_FROZEN) > 0))}
         summary["blocks"].append(stats)
