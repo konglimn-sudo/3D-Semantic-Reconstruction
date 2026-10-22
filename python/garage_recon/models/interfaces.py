@@ -83,6 +83,20 @@ class TextResult:
     score: float
 
 
+@dataclasses.dataclass
+class Detection:
+    box: np.ndarray  # (4,) x0, y0, x1, y1 pixels.
+    query: int  # Index of the text query it answers.
+    score: float
+
+
+class Detector2D(Protocol):
+    """Open-vocabulary detection: boxes of the objects text queries name."""
+
+    def detect(self, frame: Frame, queries: list[str]) -> list[Detection]:
+        """Detections of the queries in the frame."""
+
+
 class Segmenter2D(Protocol):
     """Class-agnostic segmentation into masks."""
 

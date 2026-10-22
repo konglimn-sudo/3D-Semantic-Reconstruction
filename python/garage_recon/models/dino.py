@@ -119,12 +119,15 @@ class RomaMatcher:
 
 
 class Dinov2Features:
-    """DINOv2 ViT-L/14 patch tokens."""
+    """DINOv2 ViT-L/14 patch tokens; with `ade20k_head` (Meta's linear
+    ADE20K head on the last-layer tokens, Apache 2.0) also semantic classes,
+    e.g. the sky."""
 
     needs_images = True
+    ADE20K_SKY = 2  # Class index in ADE20K-150.
 
     def __init__(self, weights: str | None = None, device: str = "cuda",
-                 resolution: int = 518):
+                 resolution: int = 518, ade20k_head: str | None = None):
         import torch
         from romatch.models.transformer import vit_large
         self.torch = torch
@@ -137,6 +140,17 @@ class Dinov2Features:
         self.stride = 14
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device)[:, None, None]
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device)[:, None, None]
+        self.head = None
+        if ade20k_head:
+            sd = torch.load(ade20k_head, map_location=device,
+                            weights_only=False)["state_dict"]
+            bn = {k.rsplit(".", 1)[1]: v.float() for k, v in sd.items()
+                  if k.startswith("decode_head.bn.")}
+            scale = bn["weight"] / torch.sqrt(bn["running_var"] + 1e-5)
+            # BatchNorm folded into the 1x1 convolution.
+            weight = sd["decode_head.conv_seg.weight"][:, :, 0, 0].float()
+            self.head = (weight * scale[None], sd["decode_head.conv_seg.bias"].float()
+                         + weight @ (bn["bias"] - bn["running_mean"] * scale))
 
     def _tokens(self, image: np.ndarray):
         torch = self.torch
@@ -160,6 +174,20 @@ class Dinov2Features:
     def tokens(self, image: np.ndarray):
         """(h, w, D) torch patch tokens of an RGB image (GPU)."""
         return self._tokens(image)[0]
+
+    def class_probability(self, image: np.ndarray, label: int) -> np.ndarray:
+        """(H, W) float32 probability of ADE20K class `label`, at the image
+        size (patch logits bilinearly upsampled). Needs `ade20k_head`."""
+        if self.head is None:
+            raise ValueError("Dinov2Features: no ade20k_head configured")
+        torch = self.torch
+        weight, bias = self.head
+        logits = self._tokens(image)[0] @ weight.T + bias
+        p = torch.softmax(logits, dim=-1)[..., label]
+        h, w = image.shape[:2]
+        return torch.nn.functional.interpolate(
+            p[None, None], (h, w), mode="bilinear",
+            align_corners=False)[0, 0].cpu().numpy().astype(np.float32)
 
 
 def vlad_descriptors(token_sets, num_words: int = 32, iterations: int = 20,

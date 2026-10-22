@@ -47,6 +47,7 @@ from garage_recon.semantics import frame_labels
 from garage_recon.semantics import language_field
 from garage_recon.semantics import markings as markings_lib
 from garage_recon.semantics import numbers as numbers_lib
+from garage_recon.semantics import objects2d
 from garage_recon.semantics import objects4d
 from garage_recon.semantics import occupancy
 from garage_recon.semantics import rules
@@ -54,7 +55,8 @@ from garage_recon.semantics import slots as slots_lib
 from garage_recon.semantics import structure as structure_lib
 from garage_recon.semantics import taxonomy
 
-STAGES = ("structure", "markings", "slots", "objects", "occupancy", "frames",
+STAGES = ("structure", "markings", "slots", "objects", "objects2d",
+          "occupancy", "frames",
           "features", "identities", "language", "numbers", "rules", "nav",
           "export")
 
@@ -271,6 +273,26 @@ class SemanticsPipeline:
             bev.to_png(path.with_name(f"level_{grid.level}_clearance.png"),
                        rasters["clearance"], 1.5, 3.5)
         self.record("objects", uses_cameras=False)
+
+    def stage_objects2d(self) -> None:
+        """Objects of the 2D detector lifted onto the map (README 5.2)."""
+        models = self.recon.models
+        if not self.cfg.objects2d.enabled or models.detector is None:
+            self.log("[objects2d] skipped (disabled or no detector: "
+                     "models.owlv2)")
+            return
+        result = objects2d.run(self.recon.pose_set(), self.point_map(), models,
+                               self.cfg, self.out / "objects2d",
+                               self.recon.levels(), self.log)
+        with np.load(self.out / "labels.npz") as z:
+            stored = {k: z[k] for k in z.files}
+        stored["labels"], count = objects2d.merge(
+            stored["labels"], result["static"], result["labels"],
+            result["confidence"], list(self.cfg.objects2d.override),
+            float(self.cfg.objects2d.min_confidence))
+        np.savez_compressed(self.out / "labels.npz", **stored)
+        self.log(f"[objects2d] {count} map points relabelled")
+        self.record("objects2d", uses_cameras=True)
 
     def stage_occupancy(self) -> None:
         """Per-keyframe semantic occupancy with visibility masks."""

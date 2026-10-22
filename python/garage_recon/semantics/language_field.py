@@ -43,10 +43,11 @@ class FrameKey:
 
 
 def frame_keys(pose_set: pose_set_lib.PoseSet, stride: int) -> list[FrameKey]:
-    """Fisheye images of every trip in time order (every `stride`-th)."""
+    """Images of every camera (fisheye and pinhole) of every trip in time
+    order (every `stride`-th)."""
     keys = []
     for t, data in enumerate(pose_set.datasets):
-        for camera in pose_set.rig(t).fisheye_cameras:
+        for camera in pose_set.rig(t).cameras:
             for ns in data.camera_stamps_ns(camera)[::stride]:
                 keys.append(FrameKey(t, data.trip_id, camera, int(ns)))
     return sorted(keys, key=lambda k: (k.trip, k.stamp_ns, k.camera))
