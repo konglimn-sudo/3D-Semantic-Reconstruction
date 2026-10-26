@@ -18,10 +18,10 @@
 #include "pybind11/pybind11.h"
 #include "pybind11/stl.h"
 
-#include "gr/exposure.h"
-#include "gr/logging.h"
-#include "gr/pose.h"
-#include "gr/types.h"
+#include "gr/core/logging.h"
+#include "gr/core/pose.h"
+#include "gr/core/types.h"
+#include "gr/sensors/exposure.h"
 
 namespace gr::bindings {
 
@@ -91,6 +91,9 @@ void BindRecon(pybind11::module_& m);
 void BindLabels(pybind11::module_& m);
 void BindSplat(pybind11::module_& m);
 void BindNav(pybind11::module_& m);
+void BindLocalization(pybind11::module_& m);
+void BindMapping(pybind11::module_& m);
+void BindSemantics(pybind11::module_& m);
 
 }  // namespace gr::bindings
 

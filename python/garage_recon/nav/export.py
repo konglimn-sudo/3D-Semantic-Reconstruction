@@ -8,6 +8,8 @@
     graph.json / graph.geojson  route graph (nodes, edges with kind / width)
     goals.json / goals.geojson  slot goals (park and approach poses,
                                 address, route length)
+    pois.json / pois.geojson    points of interest: the entrance (route
+                                origin), exit and gate signs
 """
 
 from __future__ import annotations
@@ -40,7 +42,8 @@ def write_ros_map(directory: pathlib.Path, layers, name: str) -> None:
 def write_preview(path: pathlib.Path, layers, graph, goals: list[dict]
                   ) -> None:
     """Colour preview: drivable white, structure black, parked blue,
-    overhead red, low objects orange, slots green, graph magenta."""
+    overhead red, low objects orange, slots green, aisles magenta, lanes
+    violet, one-way edges with a red arrow."""
     g = layers.grid
     rgb = np.full((g.height, g.width, 3), 128, np.uint8)
     rgb[layers.drivable] = (255, 255, 255)
@@ -57,10 +60,21 @@ def write_preview(path: pathlib.Path, layers, graph, goals: list[dict]
     for edge in graph.edges:
         if edge.level != g.level:
             continue
-        color = {"aisle": (220, 0, 220), "connector": (0, 160, 0),
-                 "ramp": (255, 120, 0), "bridge": (0, 200, 255)}[edge.kind]
+        color = {"aisle": (220, 0, 220), "lane": (130, 0, 255),
+                 "connector": (0, 160, 0), "ramp": (255, 120, 0),
+                 "bridge": (0, 200, 255)}[edge.kind]
         cv2.polylines(rgb, [pixels(edge.points)], False, color,
                       1 if edge.kind == "connector" else 2)
+        if edge.one_way:  # Direction of travel at the middle.
+            mid = len(edge.points) // 2
+            a, b = pixels(edge.points[[max(mid - 1, 0), min(mid + 1,
+                                       len(edge.points) - 1)]])
+            if np.any(a != b):
+                d = (b - a) / max(np.linalg.norm(b - a), 1e-9)
+                tip = (a + b) // 2 + np.round(8 * d).astype(np.int32)
+                cv2.arrowedLine(rgb, tuple(int(v) for v in (a + b) // 2),
+                                tuple(int(v) for v in tip), (255, 0, 0), 2,
+                                tipLength=0.6)
     for goal in goals:
         if goal["level"] != g.level:
             continue
@@ -104,11 +118,23 @@ def write_goals(directory: pathlib.Path, goals: list[dict],
     features = []
     for goal in goals:
         properties = {k: v for k, v in goal.items()
-                      if k not in ("park", "approach", "entrance")}
+                      if k not in ("park", "approach", "entrance", "corners")}
         properties["yaw_head_in"] = goal["park"]["yaw_head_in"]
         features.append(_feature(
             {"type": "Point", "coordinates": goal["park"]["xyz"]},
             properties))
     (directory / "goals.geojson").write_text(json.dumps(
+        {"type": "FeatureCollection", "features": features},
+        ensure_ascii=False))
+
+
+def write_pois(directory: pathlib.Path, pois: list[dict]) -> None:
+    """pois.json and pois.geojson (sign positions)."""
+    (directory / "pois.json").write_text(json.dumps(
+        pois, ensure_ascii=False, indent=1))
+    features = [_feature({"type": "Point", "coordinates": p["xyz"]},
+                         {k: v for k, v in p.items() if k != "xyz"})
+                for p in pois]
+    (directory / "pois.geojson").write_text(json.dumps(
         {"type": "FeatureCollection", "features": features},
         ensure_ascii=False))

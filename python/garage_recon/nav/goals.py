@@ -70,6 +70,7 @@ def add_slot_goals(graph: graph_lib.NavGraph, layers_by_level: dict, slots,
                      "yaw_back_in": round(_wrap(yaw_in + np.pi), 4)},
             "entrance": [round(float(entrance[0]), 3),
                          round(float(entrance[1]), 3), round(slot.z, 3)],
+            "corners": np.round(np.asarray(slot.corners, float), 3).tolist(),
             "width": round(float(slot.width), 3),
             "depth": round(float(slot.depth), 3),
             "occupied_at_capture": slot.occupied,
@@ -107,10 +108,19 @@ def origin_node(graph: graph_lib.NavGraph, layers_by_level: dict, xyz,
 
 def add_routes(graph: graph_lib.NavGraph, goals: list[dict],
                origin: int | None) -> None:
-    """Route length from the origin to every goal (None if unreachable)."""
-    distances = (graph.route_graph().distances(origin) if origin is not None
+    """Route length from the origin to every goal (None if unreachable) and
+    the lowest height limit along the route (`route_height_limit`, m; None
+    if nothing hangs over it): a taller vehicle needs another route."""
+    route_graph = graph.route_graph()
+    distances = (route_graph.distances(origin) if origin is not None
                  else np.full(len(graph.nodes), np.inf))
     for goal in goals:
         d = distances[goal["node"]] if goal["node"] is not None else np.inf
         goal["reachable"] = bool(np.isfinite(d))
         goal["route_length"] = round(float(d), 2) if np.isfinite(d) else None
+        goal["route_height_limit"] = None
+        if goal["reachable"]:
+            path = route_graph.shortest_path(origin, goal["node"])
+            limits = [graph.edges[e].height_limit for e in path["edges"]]
+            limits = [v for v in limits if v is not None]
+            goal["route_height_limit"] = min(limits) if limits else None

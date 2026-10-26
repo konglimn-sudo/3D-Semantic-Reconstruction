@@ -12,6 +12,7 @@ import numpy as np
 
 from garage_recon import _core
 from garage_recon import geometry
+from garage_recon import parallel
 from garage_recon.recon import bev
 from garage_recon.recon import pose_set as pose_set_lib
 from garage_recon.recon import static_map
@@ -33,7 +34,7 @@ def fuse_floor_texture(pose_set: pose_set_lib.PoseSet, grid: bev.BevGrid,
         static = (point_map.xyz if point_map.dynamic is None
                   else point_map.xyz[~point_map.dynamic])
         occluders = _core.PointCloudIndex(static)
-    used = 0
+    frames = []
     for t, data in enumerate(pose_set.datasets):
         rig = pose_set.rig(t)
         for name in rig.cameras:  # Fisheye and pinhole alike.
@@ -53,18 +54,27 @@ def fuse_floor_texture(pose_set: pose_set_lib.PoseSet, grid: bev.BevGrid,
                     continue  # The vehicle is on another level or a ramp.
                 camera_from_world = geometry.inv(
                     pose_set.camera_exposure(t, name, int(ns)))
-                image = data.load_image(name, int(ns))
-                if occluders is None:
-                    fuser.add_frame(camera, camera_from_world, image, None,
-                                    float(section.depth_tol),
-                                    float(section.max_range),
-                                    float(section.min_cos))
-                else:
-                    fuser.add_frame_occluded(
-                        camera, camera_from_world, image, occluders,
-                        float(cfg.map.voxel), float(section.depth_tol),
-                        float(section.max_range), float(section.min_cos))
-                used += 1
+                frames.append((data, name, int(ns), camera, camera_from_world))
+
+    def prepare(frame):
+        """Image and occlusion depth of a frame (in parallel)."""
+        data, name, ns, camera, camera_from_world = frame
+        image = data.load_image(name, ns)
+        depth = None
+        if occluders is not None:
+            depth = _core.FloorTextureFuser.occlusion_depth(
+                camera, camera_from_world, occluders, float(cfg.map.voxel),
+                float(section.max_range))
+        return image, depth
+
+    # Images and depths in parallel; the fuser takes them in order.
+    threads = parallel.workers(section.get("workers"))
+    for frame, (image, depth) in zip(
+            frames, parallel.ordered_map(prepare, frames, threads)):
+        fuser.add_frame(frame[3], frame[4], image, depth,
+                        float(section.depth_tol), float(section.max_range),
+                        float(section.min_cos))
+    used = len(frames)
     rgb, score, observations = fuser.result()
     log(f"[texture] level {grid.level}: fused {used} images, "
         f"{100.0 * (observations > 0).mean():.0f}% of cells observed")

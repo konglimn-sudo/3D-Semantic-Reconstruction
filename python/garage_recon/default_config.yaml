@@ -409,6 +409,7 @@ floor_texture:
   min_cos: 0.25
   occlusion_test: true
   depth_tol: 0.15
+  workers: 0                 # threads decoding / rendering frames (0: one per CPU)
 
 stereo:
   enabled: false
@@ -496,6 +497,7 @@ frames:
   depth_rel_tol: 0.03
   render_spacing: 0.05
   write_label_images: true
+  workers: 0                 # threads labelling frames (0: one per CPU)
 
 objects2d:                   # objects named by a 2D detector (models.owlv2; masks from models.sam2
   enabled: true              # box prompts, else the boxes), lifted onto the map (README 5.2)
@@ -606,6 +608,55 @@ nav:                         # semantic navigation map (stage nav)
   origin: null               # [x, y, level]; null: where the first trip starts
   level_names: null          # e.g. [B1, B2] (level 0 = top); null: L0, L1, ...
   zones: []                  # [{name: A, level: 0, polygon: [[x, y], ...]}]
+  lanes:                     # lanes along the slot rows (nav/lanes.py)
+    enabled: true
+    max_row_angle: 10.0      # facing rows: entrance normals opposite within this (deg) ...
+    min_aisle: 4.0           # ... and their entrance lines this far apart (m)
+    max_aisle: 10.0
+    min_overlap: 3.0         # ... overlapping along the rows (m)
+    lane_offset: 3.0         # a single row: the lane this far in front of the entrances (m)
+    min_length: 4.0          # shorter navigable pieces are dropped (m)
+    dedupe_distance: 1.5     # pieces this close to a lane already taken are dropped (m)
+    follow_distance: 0.5     # pieces the skeleton already follows (within this, m) ...
+    skip_followed: 0.8       # ... over this share of their length are not needed
+    replace_distance: 3.0    # skeleton edges along a lane (within this, m) ...
+    replace_angle: 30.0      # ... and this angle (deg) ...
+    replace_share: 0.5       # ... over this share of their length are replaced by it
+    max_link: 6.0            # loose lane ends join the nearest edge within this (m)
+    min_fragment: 10.0       # skeleton pieces left apart and shorter than this are dropped (m)
+  traffic:                   # one-way aisles from the floor arrows (nav/traffic.py)
+    arrow_max_distance: 3.5  # an arrow belongs to an aisle edge within this (m) ...
+    arrow_max_angle: 30.0    # ... running along it (deg)
+    center_tolerance: 0.8    # one-way: all arrows within this of the centre line (m) ...
+    min_arrows: 2            # ... at least this many ...
+    opposite_radius: 8.0     # ... and no opposite arrow within this of them (m)
+    max_turn: 35.0           # edges continuing within this turn form one corridor (deg)
+  poi_max_distance: 15.0     # exit / gate / height-limit signs join an aisle within this (m)
+  max_headroom: 8.0          # headroom layer: objects up to this height (m)
+  localization_map_voxel: 0.1  # nav/localization_map.npz: static structure, no vehicles
+  localization_map_parked: false  # keep the vehicles parked throughout the capture (open lots)
+
+localization:                # vehicle localization in the map (cli localize, gr/nav/localization.h)
+  map_voxel: 0.15            # map points used for tracking (m)
+  scan_voxel: 0.25           # sweep downsampling (m)
+  min_range: 1.0
+  max_range: 40.0
+  gates: [1.0, 0.3]          # ICP passes (correspondence gate, m)
+  min_fitness: 0.4           # inliers / sweep points (parked cars are not in the map)
+  max_rmse: 0.12             # m
+  max_jump_t: 0.5            # correction beyond the odometry prediction (m) ...
+  max_jump_r: 3.0            # ... and deg
+  degenerate_ratio: 0.02     # Hessian eigenvalue / largest: keep the prediction along such directions
+  max_failures: 10           # rejected sweeps in a row -> lost, global re-initialization
+  init_distance: 15.0        # global initialization: odometry submap length of the first attempt (m)
+  init_retry: 5.0            # retried every ... m
+  init_max_distance: 60.0    # submap kept (m)
+  placement:                 # global placement (as trip_align)
+    voxel: 0.2
+    max_candidates: 8
+    min_fitness: 0.7           # wrong placements on a regular garage reach ~0.5
+    min_fitness_gap: 0.03
+  level_window: 1.0          # the odometry frame is levelled by the mean accelerometer over this (s)
 
 rules:
   slot_width_range: [2.2, 3.4]

@@ -59,7 +59,7 @@ def test_markings_from_intensity_raster():
     for x in (2.0, 4.5, 7.0):
         inten[10:120, int(x / 0.05) - 1:int(x / 0.05) + 2] = 0.85  # 15 cm wide, 5.5 m long
     rasters = {"intensity": inten, "height_max": np.full((140, 200), np.nan)}
-    segs = extract_markings(rasters, grid, CFG, yaw=0.0, log=lambda *_: None)
+    segs, _ = extract_markings(rasters, grid, CFG, yaw=0.0, log=lambda *_: None)
     assert len(segs) == 3
     for s in segs:
         assert 5.0 < s.length < 5.8

@@ -16,7 +16,8 @@ camera orthophoto where it was observed, else the LiDAR intensity):
   end from the other separators of the row.
 
 The image is sampled bilinearly in world coordinates (1 cm steps), so the
-results are not tied to the raster cells.
+results are not tied to the raster cells. The measurement is C++
+(gr/semantics/vector_fit.h); this module prepares the floor images.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
+from garage_recon import _core
 from garage_recon.recon import bev
 
 
@@ -124,139 +126,33 @@ def floor_images(rasters: dict, grid: bev.BevGrid) -> list[FloorImage]:
     return images
 
 
-def _stripe_center(profile: np.ndarray, seen: np.ndarray,
-                   offsets: np.ndarray,
-                   config: FitConfig) -> tuple[float, float] | None:
-    """(centre, width) of the bright stripe in a profile across a line.
-
-    The stripe must be observed; of the floor band on each side at least
-    half.
-    """
-    inner = np.abs(offsets) < config.floor_band[0]
-    if not seen[inner].all():
-        return None
-    floor_zone = ((np.abs(offsets) >= config.floor_band[0])
-                  & (np.abs(offsets) <= config.floor_band[1]))
-    for side in (offsets < 0, offsets > 0):
-        if seen[floor_zone & side].mean() < 0.5:
-            return None
-    floor = np.median(profile[floor_zone & seen])
-    peak_index = np.flatnonzero(inner)[np.argmax(profile[inner])]
-    paint = profile[peak_index]
-    if paint - floor < config.min_contrast:
-        return None
-    half = 0.5 * (paint + floor)
-    left = peak_index
-    while left > 0 and profile[left - 1] > half:
-        left -= 1
-    right = peak_index
-    while right + 1 < len(profile) and profile[right + 1] > half:
-        right += 1
-    if left == 0 or right == len(profile) - 1:
-        return None
-
-    def crossing(outside: int, inside: int) -> float:
-        a, b = profile[outside], profile[inside]
-        t = (half - a) / (b - a) if b != a else 0.5
-        return offsets[outside] + t * (offsets[inside] - offsets[outside])
-
-    lo = crossing(left - 1, left)
-    hi = crossing(right + 1, right)
-    return 0.5 * (lo + hi), hi - lo
+def line_fit_config(config: FitConfig) -> _core.LineFitConfig:
+    out = _core.LineFitConfig()
+    for key in ("station_step", "sample_step", "half_span", "end_search",
+                "end_floor_width", "min_contrast", "min_valid",
+                "max_end_shift"):
+        setattr(out, key, getattr(config, key))
+    out.floor_band_inner, out.floor_band_outer = config.floor_band
+    out.end_floor_near, out.end_floor_far = config.end_floor
+    return out
 
 
-def _end(image: FloorImage, origin: np.ndarray, direction: np.ndarray,
-         start: float, sign: float, paint: float,
-         config: FitConfig) -> tuple[float, bool]:
-    """Position of one end along the centre line (`sign` +1: beyond p1).
-
-    Returns:
-        (position along the line from `origin`, reliable).
-    """
-    s = start + sign * np.arange(-0.2, config.end_search + 1e-9,
-                                 config.sample_step)
-    xy = origin + s[:, None] * direction
-    profile = image.brightness(xy)
-    beyond = start + sign * np.arange(config.end_floor[0],
-                                      config.end_floor[1] + 1e-9,
-                                      config.sample_step)
-    beyond_xy = origin + beyond[:, None] * direction
-    # The floor around the continuation must be observed: a column or a car
-    # next to the line hides its end even if the axis itself looks free.
-    normal = np.array([-direction[1], direction[0]])
-    patch = np.concatenate([beyond_xy + w * normal for w in
-                            (-config.end_floor_width, 0.0,
-                             config.end_floor_width)])
-    if (image.observed(patch) >= config.min_valid).mean() < config.min_valid:
-        return start, False
-    seen = image.observed(beyond_xy) >= config.min_valid
-    # Lower quartile: robust to paint that reaches into the band.
-    floor = np.percentile(image.brightness(beyond_xy)[seen], 25)
-    if paint - floor < config.min_contrast:
-        return start, False
-    half = 0.5 * (paint + floor)
-    below = np.flatnonzero(profile < half)
-    if not len(below) or below[0] == 0:
-        return start, False
-    k = below[0]
-    a, b = profile[k - 1], profile[k]
-    t = (a - half) / (a - b) if a != b else 0.5
-    position = s[k - 1] + t * (s[k] - s[k - 1])
-    if abs(position - start) > config.max_end_shift:
-        return start, False
-    return float(position), True
+def _image_tuple(image: FloorImage) -> tuple:
+    g = image.grid
+    return (image.name, np.ascontiguousarray(image.image, np.float64),
+            np.ascontiguousarray(image.valid, np.float64), g.x0, g.y0, g.res)
 
 
 def fit_line(p0: np.ndarray, p1: np.ndarray, image: FloorImage,
              config: FitConfig) -> LineFit | None:
-    """Re-measures one painted line; None if too few stations are usable."""
-    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
-    length = float(np.linalg.norm(p1 - p0))
-    if length < 0.3:
+    """Re-measures one painted line (C++ FitLine); None if too few stations
+    are usable."""
+    fit = _core.fit_line(np.asarray(p0, float), np.asarray(p1, float),
+                         _image_tuple(image), line_fit_config(config))
+    if fit is None:
         return None
-    direction = (p1 - p0) / length
-    normal = np.array([-direction[1], direction[0]])
-    offsets = np.arange(-config.half_span, config.half_span + 1e-9,
-                        config.sample_step)
-    stations = np.arange(0.1, length - 0.1 + 1e-9, config.station_step)
-    centers, widths, used = [], [], []
-    for s in stations:
-        xy = p0 + s * direction + offsets[:, None] * normal
-        stripe = _stripe_center(image.brightness(xy),
-                                image.observed(xy) >= config.min_valid,
-                                offsets, config)
-        if stripe is None:
-            continue
-        centers.append(stripe[0])
-        widths.append(stripe[1])
-        used.append(s)
-    if len(used) < 4:
-        return None
-    used, centers = np.asarray(used), np.asarray(centers)
-    keep = np.ones(len(used), bool)
-    for _ in range(3):  # Robust fit: centre offset linear along the line.
-        a, b = np.polyfit(used[keep], centers[keep], 1)
-        residual = centers - (a * used + b)
-        mad = 1.4826 * np.median(np.abs(residual[keep])) + 1e-3
-        keep = np.abs(residual) <= 3.0 * mad
-        if keep.sum() < 4:
-            return None
-    slope, intercept = a, b
-    origin = p0 + intercept * normal
-    axis = direction + slope * normal
-    scale = np.linalg.norm(axis)
-    axis /= scale
-    # Stations are measured along `direction`; on the fitted axis a point at
-    # s lies at s * scale.
-    start0, end0 = 0.0, length * scale
-    paint = float(np.median(image.brightness(
-        origin + np.linspace(0.2, max(end0 - 0.2, 0.2), 20)[:, None] * axis)))
-    s0, ok0 = _end(image, origin, axis, start0, -1.0, paint, config)
-    s1, ok1 = _end(image, origin, axis, end0, 1.0, paint, config)
-    rms = float(np.sqrt(np.mean(residual[keep]**2)))
-    return LineFit(origin + s0 * axis, origin + s1 * axis,
-                   float(np.median(np.asarray(widths)[keep])), (ok0, ok1),
-                   int(keep.sum()), rms)
+    return LineFit(np.asarray(fit["p0"]), np.asarray(fit["p1"]), fit["width"],
+                   tuple(fit["end_ok"]), fit["stations"], fit["rms"])
 
 
 def refine_segments(segments: list, rasters: dict, grid: bev.BevGrid,
@@ -264,28 +160,25 @@ def refine_segments(segments: list, rasters: dict, grid: bev.BevGrid,
     """Re-measures marking segments in place (p0, p1, width, end_ok).
 
     Every segment is measured on the first image of `config.sources` that
-    works. Segments that cannot be measured keep the skeleton geometry with
-    both ends unreliable.
+    works (C++ RefineSegments). Segments that cannot be measured keep the
+    skeleton geometry with both ends unreliable.
 
     Returns:
         The number of refined segments.
     """
     config = config or FitConfig()
     by_name = {image.name: image for image in floor_images(rasters, grid)}
-    images = [by_name[name] for name in config.sources if name in by_name]
-    refined = 0
-    for segment in segments:
-        best = None
-        for image in images:
-            best = fit_line(np.asarray(segment.p0), np.asarray(segment.p1),
-                            image, config)
-            if best is not None:
-                break
-        if best is None:
-            continue
-        segment.p0 = best.p0.tolist()
-        segment.p1 = best.p1.tolist()
-        segment.width = best.width
-        segment.end_ok = [bool(best.end_ok[0]), bool(best.end_ok[1])]
-        refined += 1
-    return refined
+    images = [_image_tuple(by_name[name]) for name in config.sources
+              if name in by_name]
+    if not segments or not images:
+        return 0
+    data = [{"level": s.level, "p0": s.p0, "p1": s.p1, "width": s.width,
+             "cls": s.cls, "confidence": s.confidence,
+             "end_ok": list(s.end_ok)} for s in segments]
+    out, refined = _core.refine_markings(data, images, line_fit_config(config))
+    for segment, d in zip(segments, out):
+        segment.p0 = np.asarray(d["p0"]).tolist()
+        segment.p1 = np.asarray(d["p1"]).tolist()
+        segment.width = float(d["width"])
+        segment.end_ok = [bool(v) for v in d["end_ok"]]
+    return int(refined)

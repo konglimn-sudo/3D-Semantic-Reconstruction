@@ -138,6 +138,8 @@ def main(argv=None) -> int:
                        help="no sensor errors (bias, time offset, extrinsic)")
     synth.add_argument("--no-handheld", action="store_true",
                        help="skip the handheld ground truth")
+    synth.add_argument("--no-arrows", action="store_true",
+                       help="no floor arrows on the aisles")
 
     scan = commands.add_parser(
         "handheld", help="add the synthetic handheld ground truth to a dataset")
@@ -208,6 +210,26 @@ def main(argv=None) -> int:
     view.add_argument("--serve", type=int, default=None, metavar="PORT",
                       help="serve the viewer at http://localhost:PORT")
 
+    locate = commands.add_parser(
+        "localize", help="localize a trip in the navigation map of a "
+        "reconstruction")
+    locate.add_argument("--work", required=True,
+                        help="reconstruction with the nav stage")
+    locate.add_argument("--trip", required=True)
+    locate.add_argument("--out", required=True)
+    locate.add_argument("--config", default=None)
+    locate.add_argument("--prior", choices=["none", "entrance", "reference"],
+                        default="none",
+                        help="none: global initialization; entrance: the "
+                        "trip's entrance pose; reference: the reference "
+                        "trajectory at the start (diagnostic)")
+    locate.add_argument("--reference", default=None,
+                        help="TUM trajectory (world <- vehicle) or a "
+                        "directory with poses.tum, for the errors")
+    locate.add_argument("--stride", type=int, default=1)
+    locate.add_argument("--start", type=float, default=0.0,
+                        help="seconds of the trip skipped")
+
     demo = commands.add_parser(
         "demo", help="synthesise, reconstruct, label and evaluate")
     demo.add_argument("--out", required=True)
@@ -219,7 +241,8 @@ def main(argv=None) -> int:
     start = time.time()
     if args.cmd == "synth":
         synthetic.generate(args.out, args.preset, args.trips, args.seed,
-                           stereo=args.stereo, ideal=args.ideal, log=_log)
+                           stereo=args.stereo, ideal=args.ideal,
+                           arrows=not args.no_arrows, log=_log)
         if not args.no_handheld:
             handheld.simulate_handheld(args.out, args.seed, log=_log)
     elif args.cmd == "handheld":
@@ -270,6 +293,13 @@ def main(argv=None) -> int:
                                    args.max_points, log=_log)
         if args.serve:
             _serve(out, args.serve)
+    elif args.cmd == "localize":
+        # pylint: disable-next=import-outside-toplevel
+        from garage_recon.nav import localize
+        cfg = config_lib.load_config(args.config)
+        localize.run(pathlib.Path(args.work), pathlib.Path(args.trip),
+                     pathlib.Path(args.out), cfg, args.prior, args.reference,
+                     args.stride, args.start, log=_log)
     elif args.cmd == "demo":
         out = pathlib.Path(args.out)
         trips = synthetic.generate(out / "data", args.preset, log=_log)

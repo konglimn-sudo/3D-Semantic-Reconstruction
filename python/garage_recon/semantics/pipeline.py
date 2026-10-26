@@ -38,6 +38,7 @@ import numpy as np
 
 from garage_recon import _core
 from garage_recon import core_config
+from garage_recon import parallel
 from garage_recon import provenance
 from garage_recon.models import registry
 from garage_recon.io import export
@@ -115,6 +116,11 @@ class SemanticsPipeline:
             **{k: v for k, v in m.items() if k != "length"})
                 for m in json.loads((self.out / "markings.json").read_text())]
 
+    def arrows(self) -> list[dict]:
+        """Floor arrows of the markings stage (empty before it ran)."""
+        path = self.out / "arrows.json"
+        return json.loads(path.read_text()) if path.exists() else []
+
     def slots(self) -> list[slots_lib.Slot]:
         """Slots, with the numbers and zones of the numbers stage."""
         slots = [slots_lib.Slot(**s)
@@ -177,11 +183,14 @@ class SemanticsPipeline:
     def stage_markings(self) -> None:
         """Vectorised floor markings from the BEV rasters."""
         segments: list[markings_lib.MarkingSegment] = []
+        arrows: list[dict] = []
         yaw, _, _ = self.structure()
         for path in sorted((self.recon.work / "bev").glob("level_*.npz")):
             grid, rasters = bev.load_bev(path)
-            segments += markings_lib.extract_markings(rasters, grid, self.cfg,
-                                                      yaw=yaw, log=self.log)
+            level_segments, level_arrows = markings_lib.extract_markings(
+                rasters, grid, self.cfg, yaw=yaw, log=self.log)
+            segments += level_segments
+            arrows += level_arrows
         markings_lib.classify_markings(segments, self.paths_by_level(),
                                        self.cfg)
         (self.out / "markings.json").write_text(
@@ -190,6 +199,11 @@ class SemanticsPipeline:
             export.feature("LineString", [s.p0, s.p1],
                            {"level": s.level, "cls": s.cls, "width": s.width})
             for s in segments])
+        (self.out / "arrows.json").write_text(json.dumps(arrows))
+        export.write_geojson(self.out / "arrows.geojson", [
+            export.feature("LineString", [a["tail"], a["tip"]],
+                           {"level": a["level"], "length": a["length"]})
+            for a in arrows])
         self.record("markings", uses_cameras=False)
 
     def stage_slots(self) -> None:
@@ -359,8 +373,7 @@ class SemanticsPipeline:
                                              self.cfg)
         timeline = box_timeline(*self.boxes(), keyframes.stamp, keyframes.trip)
         (self.out / "frames").mkdir(parents=True, exist_ok=True)
-        scores = []
-        count = 0
+        tasks = []
         for t, data in enumerate(recon.datasets):
             rig = pose_set.rig(t)
             for name in rig.cameras:  # Fisheye and pinhole alike.
@@ -373,22 +386,33 @@ class SemanticsPipeline:
                     exposure = pose_set.camera_exposure(t, name, int(ns))
                     center = pose_set.camera_center_pose(t, name, int(ns))
                     mid_time = 0.5 * sum(pose_set.row_times(t, name, int(ns)))
-                    image = data.load_image(name, ns)
-                    record, label_image = frame_labels.label_camera_frame(
-                        labeler, calib, camera, exposure, image, slots,
-                        segments, timeline.at(t, mid_time))
-                    record.update({
-                        "stamp_ns": int(ns), "trip": data.trip_id,
-                        "T_world_cam": np.asarray(exposure).tolist(),
-                        "T_world_cam_center": center.tolist(),
-                        "pose_set_id": pose_set.pose_set_id})
-                    (directory / f"{ns}.json").write_text(json.dumps(record))
-                    if self.cfg.frames.write_label_images:
-                        cv2.imwrite(str(directory / f"{ns}_label.png"),
-                                    label_image)
-                    if record["consistency_score"] is not None:
-                        scores.append(record["consistency_score"])
-                    count += 1
+                    tasks.append((data, calib, camera, directory, int(ns),
+                                  exposure, center,
+                                  timeline.at(t, mid_time)))
+        write_images = bool(self.cfg.frames.write_label_images)
+
+        def label(task):
+            """Labels and writes one frame (in parallel: the C++ labeller
+            and the image codecs release the GIL)."""
+            data, calib, camera, directory, ns, exposure, center, boxes = task
+            image = data.load_image(calib.name, ns)
+            record, label_image = frame_labels.label_camera_frame(
+                labeler, calib, camera, exposure, image, slots, segments,
+                boxes)
+            record.update({
+                "stamp_ns": ns, "trip": data.trip_id,
+                "T_world_cam": np.asarray(exposure).tolist(),
+                "T_world_cam_center": center.tolist(),
+                "pose_set_id": pose_set.pose_set_id})
+            (directory / f"{ns}.json").write_text(json.dumps(record))
+            if write_images:
+                cv2.imwrite(str(directory / f"{ns}_label.png"), label_image)
+            return record["consistency_score"]
+
+        threads = parallel.workers(self.cfg.frames.get("workers"))
+        scores = [s for s in parallel.ordered_map(label, tasks, threads)
+                  if s is not None]
+        count = len(tasks)
         summary = {
             "frames": count,
             "consistency_median": float(np.median(scores)) if scores else None,
@@ -670,10 +694,13 @@ class SemanticsPipeline:
             export.feature("Point", m["xyz"], {
                 k: v for k, v in m.items() if k != "xyz"})
             for m in landmarks])
+        graph = (navmap.load_graph(self)
+                 if (self.out / "nav" / "graph.json").exists() else None)
         export.write_lanelet2_osm(
             directory / "lanelet2_map.osm", slots,
             {i: float(z) for i, z in enumerate(levels.z)}, lots,
-            dict(self.cfg.export.map_origin))
+            dict(self.cfg.export.map_origin), graph,
+            float(self.cfg.export.get("lane_width", 6.0)))
         self.log(f"[export] wrote {directory}")
         self.record("export", uses_cameras=False)
 

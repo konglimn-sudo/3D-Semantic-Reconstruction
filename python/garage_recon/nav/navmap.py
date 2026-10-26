@@ -1,8 +1,10 @@
 """Builds the semantic navigation map of a reconstruction (stage "nav").
 
 Inputs are the semantic results: the point map with labels, levels and
-ramps, slots (with OCR numbers when the numbers stage ran) and the driven
-paths. Outputs go to work/semantics/nav/ (see export.py) with qa.json.
+ramps, slots (with OCR numbers when the numbers stage ran), floor arrows
+(one-way aisles, traffic.py), text landmarks (exits, height-limit signs) and
+the driven paths. Outputs go to work/semantics/nav/ (see export.py) with
+qa.json, including the localization map (localize.py).
 """
 
 from __future__ import annotations
@@ -13,11 +15,14 @@ import json
 import numpy as np
 
 from garage_recon.nav import address
+from garage_recon.nav import attributes
 from garage_recon.nav import export
 from garage_recon.nav import goals as goals_lib
 from garage_recon.nav import graph as graph_lib
 from garage_recon.nav import layers as layers_lib
+from garage_recon.nav import localize
 from garage_recon.nav import qa
+from garage_recon.nav import traffic
 from garage_recon.recon import bev
 
 
@@ -58,22 +63,40 @@ def build(semantics, cfg, log=print) -> dict:
         grid = bev.level_grid(point_map, level, cfg.nav.res, cfg.nav.margin)
         layers_by_level[level] = layers_lib.level_layers(
             point_map, labels, levels, slots, paths.get(level), grid, cfg)
-    graph = graph_lib.build_graph(layers_by_level, levels, cfg, log)
+    graph, lane_reports = graph_lib.build_graph(layers_by_level, levels, cfg,
+                                                log, slots)
+    path = semantics.out / "landmarks.json"
+    landmarks = json.loads(path.read_text()) if path.exists() else []
+    traffic_report = traffic.apply_arrows(graph, semantics.arrows(), cfg, log)
+    poi_distance = float(cfg.nav.get("poi_max_distance", 15.0))
+    height_signs = attributes.apply_height_signs(graph, landmarks,
+                                                 poi_distance)
     origin_xyz, origin_level = _origin(recon, levels, cfg)
     origin = goals_lib.origin_node(graph, layers_by_level, origin_xyz,
                                    origin_level, cfg)
     goals = goals_lib.add_slot_goals(graph, layers_by_level, slots, cfg)
+    pois = attributes.points_of_interest(graph, landmarks, origin,
+                                         poi_distance)
+    # Every edge exists now (connectors included).
+    attributes.annotate_headroom(graph, layers_by_level, cfg)
     names = address.level_names(levels.n, cfg)
-    path = semantics.out / "landmarks.json"
-    landmarks = json.loads(path.read_text()) if path.exists() else []
     address.assign_zones(goals, cfg, landmarks)
     for goal in goals:
         goal["level_name"] = names[goal["level"]]
         goal["address"] = address.address(goal, names)
     goals_lib.add_routes(graph, goals, origin)
+    goals_lib.add_routes(graph, pois, origin)
     report = qa.check(graph, layers_by_level, goals, origin, paths, cfg)
     report["origin"] = {"xyz": np.round(origin_xyz, 3).tolist(),
                         "level": origin_level}
+    report["traffic"] = traffic_report
+    report["lanes"] = {str(k): v for k, v in lane_reports.items()}
+    report["height_signs"] = height_signs
+    report["pois"] = {k: sum(p["kind"] == k for p in pois)
+                      for k in sorted({p["kind"] for p in pois})}
+    limits = [e.height_limit for e in graph.edges
+              if e.kind != "connector" and e.height_limit is not None]
+    report["min_headroom_m"] = round(min(limits), 2) if limits else None
     report["landmarks"] = {k: sum(l["kind"] == k for l in landmarks)
                            for k in sorted({l["kind"] for l in landmarks})}
     report["zones_from_signs"] = sum(g.get("zone_source") == "sign"
@@ -89,6 +112,10 @@ def build(semantics, cfg, log=print) -> dict:
                              graph, goals)
     export.write_graph(out, graph)
     export.write_goals(out, goals, names)
+    export.write_pois(out, pois)
+    report["localization_map_points"] = localize.write_map(
+        out, point_map, labels, cfg.nav.get("localization_map_voxel", 0.1),
+        bool(cfg.nav.get("localization_map_parked", False)))
     # Exits, gates, zone and level signs: landmarks of the navigation map.
     (out / "landmarks.json").write_text(json.dumps(landmarks, indent=1,
                                                    ensure_ascii=False))
@@ -98,7 +125,8 @@ def build(semantics, cfg, log=print) -> dict:
         f"{sum(v['count'] for v in report['edges'].values())} edges; "
         f"{report['reachable']}/{report['slots']} slots reachable, "
         f"{len(report['slots_driven_through'])} driven through "
-        f"(graph gaps {len(report['unreachable_graph_gap'])}, cut off "
+        f"(one-way {len(report['unreachable_one_way'])}, graph gaps "
+        f"{len(report['unreachable_graph_gap'])}, cut off "
         f"{len(report['unreachable_cut_off'])}); routes touching structure "
         f"{len(report['routes_touching_structure'])}, min clearance "
         f"{report['route_min_clearance_m']} m; driven path on graph "
@@ -114,3 +142,13 @@ def load_goals(semantics) -> tuple[list[dict], list[str]]:
 def load_graph(semantics) -> graph_lib.NavGraph:
     return graph_lib.NavGraph.from_json(json.loads(
         (semantics.out / "nav" / "graph.json").read_text()))
+
+
+def load_layers(nav_dir) -> dict:
+    """LevelLayers per level from level_<k>_layers.npz."""
+    out = {}
+    for path in sorted(nav_dir.glob("level_*_layers.npz")):
+        with np.load(path) as z:
+            layers = layers_lib.LevelLayers.from_npz(z)
+        out[layers.grid.level] = layers
+    return out

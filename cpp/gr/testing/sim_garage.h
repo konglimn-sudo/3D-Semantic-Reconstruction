@@ -10,9 +10,9 @@
 #include <random>
 #include <vector>
 
-#include "gr/imu.h"
-#include "gr/pose.h"
-#include "gr/sim.h"
+#include "gr/core/pose.h"
+#include "gr/sensors/imu.h"
+#include "gr/sim/sim.h"
 
 namespace gr::testing {
 

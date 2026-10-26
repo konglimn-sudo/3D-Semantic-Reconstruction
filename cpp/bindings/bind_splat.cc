@@ -6,14 +6,14 @@
 #include <vector>
 
 #include "bind_util.h"
-#include "gr/coverage.h"
-#include "gr/depth_prior.h"
-#include "gr/exposure.h"
-#include "gr/gaussians.h"
-#include "gr/image.h"
-#include "gr/objects.h"
-#include "gr/projector.h"
-#include "gr/raycast.h"
+#include "gr/core/image.h"
+#include "gr/mapping/raycast.h"
+#include "gr/semantics/objects.h"
+#include "gr/semantics/projector.h"
+#include "gr/sensors/exposure.h"
+#include "gr/splat/coverage.h"
+#include "gr/splat/depth_prior.h"
+#include "gr/splat/gaussians.h"
 
 namespace gr::bindings {
 namespace {

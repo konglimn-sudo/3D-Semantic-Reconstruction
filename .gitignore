@@ -4,8 +4,8 @@ __pycache__/
 *.egg-info/
 python/garage_recon/_core*.so
 python/garage_recon/_core*.pyd
-data/
-work/
-out/
+/data/
+/work/
+/out/
 .pytest_cache/
 .DS_Store

@@ -89,8 +89,8 @@
     <label><input type="checkbox" id="showNav" checked> 路网与车位目标点</label>
   </div>
   <div class="section" id="navSection">
-    <div class="subtitle">导航到车位</div>
-    <div class="goto"><input id="goal" list="goalList" placeholder="例如 B1 A区 12号，或车位编号" autocomplete="off"><button id="plan">规划</button></div>
+    <div class="subtitle">导航到车位或地点</div>
+    <div class="goto"><input id="goal" list="goalList" placeholder="例如 B1 A区 12号、5A区、出口，或车位编号" autocomplete="off"><button id="plan">规划</button></div>
     <datalist id="goalList"></datalist>
     <div id="route">从入口出发，沿路网规划到车位（路网与墙、柱保持半车宽以上的间距）。</div>
   </div>
@@ -293,6 +293,21 @@ async function loadDataset(entry) {
   if (nav) {
     const lift = (pts) => pts.map((p) => [p[0], p[1], p[2] + 0.08]);
     lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'aisle').map((e) => lift(e.points)), 0xff4fd8);
+    lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'lane').map((e) => lift(e.points)), 0x9b5cff);
+    // One-way edges: an arrow at the middle, in the direction of travel.
+    for (const e of nav.edges.filter((x) => x.one_way && x.points.length > 1)) {
+      const m = Math.floor((e.points.length - 1) / 2);
+      const p0 = new THREE.Vector3(...e.points[m]), p1 = new THREE.Vector3(...e.points[m + 1]);
+      const dir = p1.clone().sub(p0);
+      if (dir.length() < 1e-6) continue;
+      dir.normalize();
+      const at = p0.clone().add(p1).multiplyScalar(0.5).add(new THREE.Vector3(0, 0, 0.2)).addScaledVector(dir, -1.0);
+      groups.nav.add(new THREE.ArrowHelper(dir, at, 2.0, 0xff3b3b, 0.8, 0.7));
+    }
+    for (const p of nav.pois || []) {
+      const [x, y, z] = p.xyz;
+      lineGroup(groups.nav, [[[x, y, z - 2.5], [x, y, z + 0.5]]], p.kind === 'entrance' ? 0x00e676 : 0x00d1ff);
+    }
     lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'ramp').map((e) => lift(e.points)), 0xff9f1a);
     lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'bridge').map((e) => lift(e.points)), 0x33d6ff);
     lineGroup(groups.nav, nav.edges.filter((e) => e.kind === 'connector').map((e) => lift(e.points)), 0x3ddc84, 0.35);
@@ -303,13 +318,16 @@ async function loadDataset(entry) {
     lineGroup(groups.nav, ticks, 0x9cf0c0, 0.8);
     const list = $('goalList');
     list.innerHTML = '';
+    for (const p of nav.pois || []) {
+      const o = document.createElement('option'); o.value = p.kind === 'entrance' ? '入口' : p.name; list.appendChild(o);
+    }
     for (const g of nav.goals.slice(0, 2000)) {
       const o = document.createElement('option'); o.value = g.address; list.appendChild(o);
     }
   }
   $('navSection').style.display = nav ? '' : 'none';
   $('route').textContent = nav
-    ? `从入口出发，沿路网规划到车位（共 ${nav.goals.length} 个目标点）。`
+    ? `从入口出发，沿路网规划到车位或地点（共 ${nav.goals.length} 个车位、${(nav.pois || []).length} 个地点；单行道按地面箭头的方向通行）。`
     : '';
 
   current = { meta, points, attrs };
@@ -419,16 +437,38 @@ function parseQuery(text, names) {
   }
   return out;
 }
+// Points of interest as in garage_recon.nav.attributes.find_pois.
+function findPois(nav, text) {
+  const key = text.toUpperCase().replace(/\s+/g, '').replace(/^(去|到|导航到|前往)/, '').replace(/^最近的?/, '');
+  const kinds = [];
+  if (/出口|EXIT/.test(key)) kinds.push('exit');
+  if (/门|GATE/.test(key)) kinds.push('gate');
+  if (/入口|ENTRANCE/.test(key)) kinds.push('entrance');
+  const candidates = (nav.pois || []).filter((p) => p.node !== null && (!kinds.length || kinds.includes(p.kind)));
+  const score = (p) => Math.max(0, ...p.texts.map((t) => {
+    t = t.toUpperCase().replace(/\s+/g, '');
+    return t.length > 1 && (key.includes(t) || t.includes(key)) ? Math.min(t.length, key.length) : 0;
+  }));
+  const best = Math.max(0, ...candidates.map(score));
+  if (best > 0) return candidates.filter((p) => score(p) === best);
+  return candidates.filter((p) => kinds.includes(p.kind));
+}
+// Slots: by id / address; by number (with level and zone where given); or
+// every slot of a zone ("5A区").
 function findGoals(nav, text) {
   const key = text.trim().toUpperCase();
   const direct = nav.goals.filter((g) => g.id.toUpperCase() === key || g.address.toUpperCase() === key);
-  if (direct.length) return direct;
+  if (direct.length) return { goals: direct, byNumber: true };
   const q = parseQuery(text, nav.level_names);
-  if (q.number === null) return [];
-  return nav.goals.filter((g) => g.number !== null && g.number !== undefined
-    && parseInt(String(g.number).replace(/\D/g, ''), 10) === parseInt(q.number, 10)
-    && (q.level === null || g.level === q.level)
-    && (q.zone === null || (g.zone || '').toUpperCase() === q.zone));
+  const zoneKey = (z) => String(z || '').toUpperCase().replace(/\s+/g, '').replace(/区$/, '');
+  if (q.number === null && q.zone === null) return { goals: [], byNumber: false };
+  return {
+    byNumber: q.number !== null,
+    goals: nav.goals.filter((g) => (q.number === null || (g.number !== null && g.number !== undefined
+      && parseInt(String(g.number).replace(/\D/g, ''), 10) === parseInt(q.number, 10)))
+      && (q.level === null || g.level === q.level)
+      && (q.zone === null || zoneKey(g.zone) === zoneKey(q.zone))),
+  };
 }
 function shortestPath(nav, source, target) {
   const n = nav.nodes.length;
@@ -453,13 +493,15 @@ function shortestPath(nav, source, target) {
   }
   if (!Number.isFinite(dist[target])) return null;
   const segments = [];  // Edges from the source to the target, oriented.
+  let limit = null;  // Lowest headroom / posted height limit on the way.
   for (let v = target; v !== source; v = prev[v]) {
     const e = nav.edges[prevEdge[v]];
     segments.unshift(e.b === v ? e.points : [...e.points].reverse());
+    if (e.limit !== null && e.limit !== undefined) limit = limit === null ? e.limit : Math.min(limit, e.limit);
   }
   const pts = [];
   segments.forEach((seg, i) => pts.push(...(i ? seg.slice(1) : seg)));
-  return { length: dist[target], points: pts };
+  return { length: dist[target], points: pts, limit };
 }
 function planRoute() {
   const out = $('route');
@@ -470,11 +512,28 @@ function planRoute() {
   const nav = current && current.meta.nav;
   if (!nav) return;
   const text = $('goal').value;
-  const found = findGoals(nav, text);
-  if (!found.length) { out.innerHTML = `没有找到“${text}”对应的车位。`; return; }
-  if (found.length > 1) { out.innerHTML = `“${text}”对应 ${found.length} 个车位，请补充楼层或分区。`; return; }
-  const goal = found[0];
+  const pois = findPois(nav, text);
+  const query = pois.length ? { goals: [], byNumber: false } : findGoals(nav, text);
+  // A point of interest or a zone: the nearest reachable one.
+  const nearest = (list) => list.filter((g) => g.route_length !== null && g.route_length !== undefined)
+    .sort((a, b) => a.route_length - b.route_length)[0];
+  let goal = null;
+  let note = '';
+  if (pois.length) {
+    const p = nearest(pois);
+    if (!p) { out.innerHTML = `“${text}”：${pois.length} 处都不可达。`; return; }
+    goal = { address: p.kind === 'entrance' ? '入口' : p.name, node: p.node, park: null, xyz: p.xyz };
+    if (pois.length > 1) note = `（${pois.length} 处中最近的一处）`;
+  } else {
+    const found = query.goals;
+    if (!found.length) { out.innerHTML = `没有找到“${text}”对应的车位或地点。`; return; }
+    if (found.length > 1 && query.byNumber) { out.innerHTML = `“${text}”对应 ${found.length} 个车位，请补充楼层或分区。`; return; }
+    goal = found.length > 1 ? nearest(found) : found[0];
+    if (!goal) { out.innerHTML = `“${text}”的 ${found.length} 个车位都不可达。`; return; }
+    if (found.length > 1) note = `（该区 ${found.length} 个车位中最近的一个）`;
+  }
   if (nav.origin === null || goal.node === null) { out.innerHTML = `${goal.address}：没有接入路网。`; return; }
+  if (goal.node === nav.origin) { out.innerHTML = `<b>${goal.address}</b>：就是路线的起点（采集进入车库的位置）。`; return; }
   const path = shortestPath(nav, nav.origin, goal.node);
   if (!path) { out.innerHTML = `<b>${goal.address}</b>：从入口不可达。`; return; }
   const curve = new THREE.CurvePath();
@@ -486,17 +545,20 @@ function planRoute() {
     const tube = new THREE.TubeGeometry(curve, Math.max(8, curve.curves.length * 4), 0.18, 6, false);
     groups.route.add(new THREE.Mesh(tube, new THREE.MeshBasicMaterial({ color: 0xffe14d, depthTest: false })));
   }
-  const [x, y, z] = goal.park;
-  const dir = new THREE.Vector3(Math.cos(goal.yaw), Math.sin(goal.yaw), 0);
-  groups.route.add(new THREE.ArrowHelper(dir, new THREE.Vector3(x, y, z + 0.3).addScaledVector(dir, -1.5), 3.0, 0x00e676, 1.0, 0.8));
+  const [x, y, z] = goal.park || goal.xyz || path.points[path.points.length - 1];
+  if (goal.park) {
+    const dir = new THREE.Vector3(Math.cos(goal.yaw), Math.sin(goal.yaw), 0);
+    groups.route.add(new THREE.ArrowHelper(dir, new THREE.Vector3(x, y, z + 0.3).addScaledVector(dir, -1.5), 3.0, 0x00e676, 1.0, 0.8));
+  }
   // The route stays visible through the point cloud.
   groups.route.traverse((o) => {
     o.renderOrder = 10;
     if (o.material) o.material.depthTest = false;
   });
   const occupied = goal.occupied ? '（采集时有车）' : '';
-  out.innerHTML = `<b>${goal.address}</b>${occupied}：路线 <b>${path.length.toFixed(1)} m</b>，` +
-    `${path.points.length} 个路点。绿色箭头为车头进的停车朝向。`;
+  const limit = path.limit !== null ? `，沿途限高 <b>${path.limit.toFixed(2)} m</b>` : '';
+  out.innerHTML = `<b>${goal.address}</b>${note}${occupied}：路线 <b>${path.length.toFixed(1)} m</b>${limit}，` +
+    `${path.points.length} 个路点。` + (goal.park ? '绿色箭头为车头进的停车朝向。' : '');
   // Frame the route from above.
   const box = new THREE.Box3().setFromPoints(lifted.length ? lifted : [new THREE.Vector3(x, y, z)]);
   const c = box.getCenter(new THREE.Vector3());
