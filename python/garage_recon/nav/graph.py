@@ -28,11 +28,15 @@ class Edge:
         a: First node.
         b: Last node.
         points: (M, 3) polyline from node a to node b (world).
-        kind: "aisle", "ramp", "connector" or "bridge" (joins pieces of an
-            aisle graph through tight or slot cells; for review).
+        kind: "aisle", "lane" (from a row of slots, lanes.py), "ramp",
+            "connector" or "bridge" (joins pieces of an aisle graph through
+            tight or slot cells; for review).
         level: Level of the edge (the upper level of a ramp).
         width: Free width along the edge (m): twice the smallest clearance.
-        one_way: Travelled from a to b only.
+        one_way: Travelled from a to b only (floor arrows, traffic.py).
+        headroom: Lowest object above the floor along the edge (m; None
+            for open sky or ramps; attributes.py).
+        posted_height: Posted height limit (m) of a sign along the edge.
     """
 
     a: int
@@ -42,6 +46,8 @@ class Edge:
     level: int
     width: float
     one_way: bool = False
+    headroom: float | None = None
+    posted_height: float | None = None
 
     @property
     def length(self) -> float:
@@ -51,7 +57,16 @@ class Edge:
         return {"a": self.a, "b": self.b, "kind": self.kind,
                 "level": self.level, "width": round(self.width, 3),
                 "one_way": self.one_way, "length": round(self.length, 3),
+                "headroom": self.headroom,
+                "posted_height": self.posted_height,
                 "points": np.round(self.points, 3).tolist()}
+
+    @property
+    def height_limit(self) -> float | None:
+        """The lower of the measured headroom and a posted limit."""
+        values = [v for v in (self.headroom, self.posted_height)
+                  if v is not None]
+        return min(values) if values else None
 
 
 @dataclasses.dataclass
@@ -83,7 +98,7 @@ class NavGraph:
         return len(self.edges) - 1
 
     # ------------------------------------------------------------ queries
-    def nearest(self, xy, level: int, kinds=("aisle", "bridge"),
+    def nearest(self, xy, level: int, kinds=("aisle", "lane", "bridge"),
                 direction=None, max_distance: float = np.inf
                 ) -> list[Attachment]:
         """Projections of `xy` on the edges of a level, nearest first.
@@ -94,7 +109,8 @@ class NavGraph:
         xy = np.asarray(xy, float)[:2]
         out = []
         for index, edge in enumerate(self.edges):
-            if edge.level != level or edge.kind not in kinds:
+            if (edge.level != level or edge.kind not in kinds
+                    or len(edge.points) < 2):
                 continue
             p = edge.points[:, :2]
             seg = np.diff(p, axis=0)
@@ -148,17 +164,22 @@ class NavGraph:
         t = (s - cum[k]) / max(seg_len[k], 1e-12)
         point = p[k] + t * (p[k + 1] - p[k])
         node = self.add_node(point, self.node_level[edge.a])
-        tail = Edge(node, edge.b, np.vstack([point, p[k + 1:]]), edge.kind,
-                    edge.level, edge.width, edge.one_way)
+        tail = dataclasses.replace(edge, a=node,
+                                   points=np.vstack([point, p[k + 1:]]))
         edge.points = np.vstack([p[:k + 1], point])
         edge.b = node
         self.add_edge(tail)
         return node
 
-    def route_graph(self) -> _core.RouteGraph:
+    def route_graph(self, reverse: bool = False,
+                    two_way: bool = False) -> _core.RouteGraph:
+        """C++ route graph; `reverse` turns every one-way edge around
+        (distances *to* a node), `two_way` ignores the one-way edges'
+        direction."""
         graph = _core.RouteGraph(len(self.nodes))
         for edge in self.edges:
-            graph.add_edge(edge.a, edge.b, edge.length, edge.one_way)
+            a, b = (edge.b, edge.a) if reverse else (edge.a, edge.b)
+            graph.add_edge(a, b, edge.length, edge.one_way and not two_way)
         return graph
 
     def path_points(self, nodes: list[int], edges: list[int]) -> np.ndarray:
@@ -190,7 +211,8 @@ class NavGraph:
         for e in data["edges"]:
             graph.add_edge(Edge(e["a"], e["b"], np.asarray(e["points"], float),
                                 e["kind"], e["level"], e["width"],
-                                e["one_way"]))
+                                e["one_way"], e.get("headroom"),
+                                e.get("posted_height")))
         return graph
 
 
@@ -351,7 +373,9 @@ def bridge_components(graph: NavGraph, layers, cfg) -> int:
     cost = np.where(passable, 0.0, -1.0).astype(np.float32)
     cost[passable & (layers.clearance < comfortable)] = nav.bridge_tight_cost
     cost[passable & (layers.slot > 0)] += nav.bridge_slot_cost
-    nodes = [k for k, lv in enumerate(graph.node_level) if lv == level]
+    used = {n for e in graph.edges for n in (e.a, e.b)}
+    nodes = [k for k, lv in enumerate(graph.node_level)
+             if lv == level and k in used]  # Not nodes of dropped edges.
     if len(nodes) < 2:
         return 0
     xy = np.asarray([graph.nodes[k][:2] for k in nodes])
@@ -397,20 +421,33 @@ def bridge_components(graph: NavGraph, layers, cfg) -> int:
                                   grid.y0 + (cells[:, 1] + 0.5) * grid.res,
                                   np.where(np.isfinite(z), z,
                                            graph.nodes[nodes[i]][2])])
+        if len(points) < 2:  # Both nodes in one cell.
+            points = np.vstack([points, points])
         points[0], points[-1] = graph.nodes[nodes[i]], graph.nodes[nodes[j]]
         width = 2.0 * float(layers.clearance[path[:, 1], path[:, 0]].min())
         graph.add_edge(Edge(nodes[i], nodes[j], points, "bridge", level, width))
         bridges += 1
 
 
-def build_graph(layers_by_level: dict, levels, cfg, log=print) -> NavGraph:
-    """Aisle graphs of all levels joined by the ramps."""
+def build_graph(layers_by_level: dict, levels, cfg, log=print,
+                slots=()) -> tuple[NavGraph, dict]:
+    """Aisle graphs of all levels (with the lanes of the slot rows, see
+    lanes.py) joined by the ramps; also the lane report per level."""
+    # pylint: disable-next=import-outside-toplevel
+    from garage_recon.nav import lanes as lanes_lib  # Imports this module.
     nav = cfg.nav
     graph = NavGraph()
+    lane_reports = {}
     for level, layers in sorted(layers_by_level.items()):
         count = add_level_graph(graph, layers, cfg)
+        lanes = lanes_lib.add_level_lanes(graph, layers, slots, cfg)
+        lane_reports[level] = lanes
         bridges = bridge_components(graph, layers, cfg)
-        log(f"[nav] level {level}: {count} aisle edges, {bridges} bridges")
+        log(f"[nav] level {level}: {count} aisle edges, {lanes['lanes']} "
+            f"lanes from {lanes['rows']} slot rows ({lanes['lane_length_m']} "
+            f"m, {lanes['replaced_edges']} skeleton edges replaced, "
+            f"{lanes['links']} links, {lanes.get('pruned_edges', 0)} "
+            f"fragment edges dropped), {bridges} bridges")
     for ramp in levels.ramps:
         try:
             top, bottom, width = ramp_ends(ramp)
@@ -432,4 +469,4 @@ def build_graph(layers_by_level: dict, levels, cfg, log=print) -> NavGraph:
                             ramp.level_from, width))
         log(f"[nav] ramp {ramp.level_from}->{ramp.level_to}: "
             f"{np.linalg.norm(bottom - top):.1f} m, width {width:.1f} m")
-    return graph
+    return graph, lane_reports

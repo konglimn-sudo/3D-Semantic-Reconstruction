@@ -4,7 +4,6 @@ measured ends."""
 import numpy as np
 
 from garage_recon.recon import bev
-from garage_recon.semantics import slots
 from garage_recon.semantics import vector_fit
 
 # pylint: disable=protected-access
@@ -49,21 +48,3 @@ def test_an_end_without_observed_floor_beyond_is_unreliable():
     assert fit is not None
     assert fit.end_ok == (True, False)
     assert abs(fit.p0[1] - 1.0) < 0.005
-
-
-def test_rows_take_their_ends_from_measured_separators():
-    sep = slots._Separator
-    painted = [sep(0.25, 0.04, 5.30, False, False, True),
-               sep(2.75, 0.10, 5.29, False, False, True),
-               sep(5.25, 0.20, 5.31, False, False, True),
-               sep(7.75, 0.30, 4.90, False, False, False)]  # Stops short.
-    a0, a1, ok0, ok1 = slots._row_ends(painted)
-    assert not ok0 and ok1
-    assert abs(a1 - 5.30) < 1e-9  # Median of the measured ends.
-    assert abs(a0 - 0.04) < 1e-9  # Envelope where nothing was measured.
-    # Ends that stop well inside (the middle of back-to-back rows) are not
-    # row ends.
-    long_and_short = [sep(0.25, 11.3, 21.9, False, True, True),
-                      sep(10.25, 11.3, 16.6, False, True, True)]
-    _, a1, _, ok1 = slots._row_ends(long_and_short)
-    assert ok1 and abs(a1 - 21.9) < 1e-9

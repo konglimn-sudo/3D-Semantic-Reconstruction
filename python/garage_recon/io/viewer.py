@@ -109,12 +109,15 @@ def _vectors(work: pathlib.Path, center: np.ndarray) -> dict:
 
 
 def _nav(work: pathlib.Path, center: np.ndarray) -> dict | None:
-    """Route graph and slot goals of the navigation map (local frame)."""
+    """Route graph, slot goals and points of interest of the navigation map
+    (local frame)."""
     nav = work / "semantics" / "nav"
     if not (nav / "graph.json").exists() or not (nav / "goals.json").exists():
         return None
     graph = json.loads((nav / "graph.json").read_text())
     goals = json.loads((nav / "goals.json").read_text())
+    pois = (json.loads((nav / "pois.json").read_text())
+            if (nav / "pois.json").exists() else [])
     qa = (json.loads((nav / "qa.json").read_text())
           if (nav / "qa.json").exists() else {})
 
@@ -127,7 +130,14 @@ def _nav(work: pathlib.Path, center: np.ndarray) -> dict | None:
         "nodes": local([n["xyz"] for n in graph["nodes"]]),
         "edges": [{"a": e["a"], "b": e["b"], "kind": e["kind"],
                    "length": e["length"], "one_way": e["one_way"],
+                   "limit": min([v for v in (e.get("headroom"),
+                                             e.get("posted_height"))
+                                 if v is not None], default=None),
                    "points": local(e["points"])} for e in graph["edges"]],
+        "pois": [{"kind": p["kind"], "name": p["name"],
+                  "texts": p.get("texts", [p["name"]]), "level": p["level"],
+                  "node": p["node"], "xyz": local(p["xyz"]),
+                  "route_length": p.get("route_length")} for p in pois],
         "goals": [{"id": g["slot_id"], "address": g["address"],
                    "level": g["level"], "zone": g.get("zone"),
                    "number": g.get("number"), "node": g["node"],

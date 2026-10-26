@@ -13,18 +13,18 @@
 #include <vector>
 
 #include "bind_util.h"
-#include "gr/backend.h"
-#include "gr/camera.h"
-#include "gr/camera_calibration.h"
-#include "gr/clock_sync.h"
-#include "gr/cloud_compare.h"
-#include "gr/imu.h"
-#include "gr/keyframes.h"
-#include "gr/lidar_ba.h"
-#include "gr/loop_closure.h"
-#include "gr/odometry.h"
-#include "gr/static_map.h"
-#include "gr/trajectory.h"
+#include "gr/backend/backend.h"
+#include "gr/backend/keyframes.h"
+#include "gr/backend/lidar_ba.h"
+#include "gr/backend/loop_closure.h"
+#include "gr/calibration/camera_calibration.h"
+#include "gr/calibration/clock_sync.h"
+#include "gr/mapping/static_map.h"
+#include "gr/odometry/odometry.h"
+#include "gr/odometry/trajectory.h"
+#include "gr/registration/cloud_compare.h"
+#include "gr/sensors/camera.h"
+#include "gr/sensors/imu.h"
 
 namespace gr::bindings {
 namespace {
@@ -276,8 +276,8 @@ void BindOdometryPipeline(py::module_& m) {
           "process",
           [](OdometryPipeline& pipeline, const PointsIn& points,
              const py::object& intensity, const py::object& times, double stamp,
-             bool force_keyframe,
-             const py::object& external_pose) -> py::tuple {
+             bool force_keyframe, const py::object& external_pose,
+             bool fill_sweep) -> py::tuple {
             const Points p = ToPoints(points);
             const std::vector<float> i = ToFloatVector(intensity);
             const std::vector<double> t = ToDoubleVector(times);
@@ -288,21 +288,23 @@ void BindOdometryPipeline(py::module_& m) {
             OdometryFrame frame;
             {
               py::gil_scoped_release release;
-              frame =
-                  pipeline.Process(p, i, t, stamp, force_keyframe, external);
+              frame = pipeline.Process(p, i, t, stamp, force_keyframe,
+                                       external, fill_sweep);
             }
-            if (!frame.is_keyframe) {
+            if (!frame.is_keyframe && !fill_sweep) {
               return py::make_tuple(frame.pose.Matrix(), false, py::none(),
                                     py::none());
             }
-            return py::make_tuple(frame.pose.Matrix(), true,
+            return py::make_tuple(frame.pose.Matrix(), frame.is_keyframe,
                                   ToMatrix(frame.points),
                                   ToArray(frame.intensity));
           },
           "points"_a, "intensity"_a, "times"_a, "stamp"_a,
           "force_keyframe"_a = false, "external_pose"_a = py::none(),
-          "One sweep -> (world<-lidar pose, is_keyframe, keyframe points or "
-          "None, keyframe intensity or None).")
+          "fill_sweep"_a = false,
+          "One sweep -> (world<-lidar pose, is_keyframe, compensated sweep "
+          "(keyframes, or every frame with fill_sweep) or None, its "
+          "intensity or None).")
       .def("poses",
            [](const OdometryPipeline& pipeline) {
              return PosesToArray(pipeline.poses());

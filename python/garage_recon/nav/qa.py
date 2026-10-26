@@ -78,7 +78,19 @@ def check(graph, layers_by_level: dict, goals: list[dict], origin: int | None,
             min_clearance.append(worst)
             if worst < half:
                 tight.append(goal["slot_id"])
+    # One-way aisles can trap a vehicle: the way back out must exist too.
+    back = (graph.route_graph(reverse=True).distances(origin)
+            if origin is not None else np.full(len(graph.nodes), np.inf))
+    no_way_back = [g["slot_id"] for g in goals
+                   if g.get("reachable") and g["node"] is not None
+                   and not np.isfinite(back[g["node"]])]
     unreachable = [g for g in goals if not g.get("reachable")]
+    # Reachable if the one-way aisles could be driven both ways.
+    either_way = (graph.route_graph(two_way=True).distances(origin)
+                  if origin is not None else np.full(len(graph.nodes), np.inf))
+    one_way = [g for g in unreachable if g["node"] is not None
+               and np.isfinite(either_way[g["node"]])]
+    unreachable = [g for g in unreachable if g not in one_way]
     gaps, cut_off = [], []
     origin_xyz = graph.nodes[origin] if origin is not None else None
     origin_level = graph.node_level[origin] if origin is not None else None
@@ -121,8 +133,9 @@ def check(graph, layers_by_level: dict, goals: list[dict], origin: int | None,
                   for k, v in kinds.items()},
         "origin_node": origin,
         "slots": len(goals),
-        "reachable": len(goals) - len(unreachable),
-        "unreachable": [g["slot_id"] for g in unreachable],
+        "reachable": len(goals) - len(unreachable) - len(one_way),
+        "unreachable": [g["slot_id"] for g in unreachable + one_way],
+        "unreachable_one_way": [g["slot_id"] for g in one_way],
         "unreachable_graph_gap": gaps,
         "unreachable_cut_off": cut_off,
         "no_connector": [g["slot_id"] for g in goals if g["node"] is None],
@@ -142,5 +155,9 @@ def check(graph, layers_by_level: dict, goals: list[dict], origin: int | None,
                                   if min_clearance else None),
         "driven_path_on_graph": coverage,
         "numbered_slots": int(sum(1 for g in goals if g.get("number"))),
+        "one_way_edges": sum(e.one_way for e in graph.edges),
+        "one_way_length_m": round(sum(e.length for e in graph.edges
+                                      if e.one_way), 1),
+        "no_way_back_to_origin": no_way_back,
     }
     return report

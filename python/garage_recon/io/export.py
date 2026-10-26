@@ -74,10 +74,30 @@ def _latlon(xy: np.ndarray, origin: dict) -> tuple[float, float]:
     return float(np.degrees(lat)), float(np.degrees(lon))
 
 
-def write_lanelet2_osm(path: Path, slots, levels_z: dict[int, float], lots: dict[int, np.ndarray], origin: dict) -> None:
+def _offset(points: np.ndarray, distance: float) -> np.ndarray:
+    """A polyline (M, 3) shifted `distance` to its left in xy."""
+    xy = points[:, :2]
+    d = np.diff(xy, axis=0)
+    n = np.column_stack([-d[:, 1], d[:, 0]])
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+    vertex = np.vstack([n[:1], n[:-1] + n[1:], n[-1:]])
+    vertex /= np.maximum(np.linalg.norm(vertex, axis=1, keepdims=True), 1e-9)
+    out = points.copy()
+    out[:, :2] = xy + distance * vertex
+    return out
+
+
+def write_lanelet2_osm(path: Path, slots, levels_z: dict[int, float],
+                       lots: dict[int, np.ndarray], origin: dict, graph=None,
+                       lane_width: float = 6.0) -> None:
     """Parking spaces as `parking_space` linestrings (centre line from the
     entrance, with a `width` tag) and one `parking_lot` area per level, as in
-    Autoware's Lanelet2 extension. Elevation and level are kept as tags."""
+    Autoware's Lanelet2 extension. Elevation and level are kept as tags.
+
+    With the navigation graph, every drivable edge (aisle, lane, bridge,
+    ramp) becomes a `lanelet` relation between two virtual bounds, at most
+    `lane_width` wide, with `one_way` (the edge direction for one-way
+    aisles), `level` and the edge's `height_limit` (m) as tags."""
     nodes, ways = [], []
     nid, wid = [0], [100000]
 
@@ -105,5 +125,36 @@ def write_lanelet2_osm(path: Path, slots, levels_z: dict[int, float], lots: dict
         refs = "".join(f'<nd ref="{i}"/>' for i in ids + ids[:1])
         ways.append(f'  <way id="{wid[0]}">{refs}<tag k="type" v="parking_lot"/><tag k="area" v="yes"/>'
                     f'<tag k="level" v="{lv}"/></way>')
+    relations = []
+    for k, edge in enumerate([] if graph is None else graph.edges):
+        if (edge.kind not in ("aisle", "lane", "bridge", "ramp")
+                or len(edge.points) < 2):
+            continue
+        half = 0.5 * min(edge.width, lane_width)
+        bounds = []
+        for side in (half, -half):  # Left, right of the direction a -> b.
+            line = _offset(np.asarray(edge.points, float), side)
+            ids = [node(*p) for p in line]
+            wid[0] += 1
+            refs = "".join(f'<nd ref="{i}"/>' for i in ids)
+            ways.append(f'  <way id="{wid[0]}">{refs}'
+                        '<tag k="type" v="virtual"/></way>')
+            bounds.append(wid[0])
+        wid[0] += 1
+        limit = edge.height_limit
+        one_way = "yes" if edge.one_way else "no"
+        relations.append(
+            f'  <relation id="{wid[0]}">'
+            f'<member type="way" role="left" ref="{bounds[0]}"/>'
+            f'<member type="way" role="right" ref="{bounds[1]}"/>'
+            '<tag k="type" v="lanelet"/><tag k="subtype" v="road"/>'
+            '<tag k="location" v="private"/>'
+            f'<tag k="one_way" v="{one_way}"/>'
+            f'<tag k="level" v="{edge.level}"/>'
+            f'<tag k="nav_edge" v="{k}"/><tag k="nav_kind" v="{edge.kind}"/>'
+            + (f'<tag k="height_limit" v="{limit:.2f}"/>'
+               if limit is not None else "")
+            + "</relation>")
     xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<osm version="0.6" generator="garage_recon">']
-    path.write_text("\n".join(xml + nodes + ways + ["</osm>"]) + "\n")
+    path.write_text(
+        "\n".join(xml + nodes + ways + relations + ["</osm>"]) + "\n")

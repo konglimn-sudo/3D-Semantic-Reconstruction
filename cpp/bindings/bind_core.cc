@@ -10,20 +10,20 @@
 #include <vector>
 
 #include "bind_util.h"
-#include "gr/camera.h"
-#include "gr/geometry.h"
-#include "gr/image.h"
-#include "gr/occupancy.h"
-#include "gr/odometry.h"
-#include "gr/pose_graph.h"
-#include "gr/projector.h"
-#include "gr/raster.h"
-#include "gr/raycast.h"
-#include "gr/registration.h"
-#include "gr/scan_context.h"
-#include "gr/sim.h"
-#include "gr/visibility.h"
-#include "gr/voxel.h"
+#include "gr/backend/pose_graph.h"
+#include "gr/backend/scan_context.h"
+#include "gr/core/geometry.h"
+#include "gr/core/image.h"
+#include "gr/core/voxel.h"
+#include "gr/mapping/raster.h"
+#include "gr/mapping/raycast.h"
+#include "gr/mapping/visibility.h"
+#include "gr/odometry/odometry.h"
+#include "gr/registration/registration.h"
+#include "gr/semantics/occupancy.h"
+#include "gr/semantics/projector.h"
+#include "gr/sensors/camera.h"
+#include "gr/sim/sim.h"
 
 namespace gr::bindings {
 namespace {
@@ -718,6 +718,25 @@ void BindRasters(py::module_& m) {
           "min_cos"_a = 0.2,
           "Adds an image; the occlusion depth is rendered from the occluder "
           "points near the camera.")
+      .def_static(
+          "occlusion_depth",
+          [](const CameraModel& camera, const py::object& camera_from_world,
+             const PointCloudIndex& occluders, double point_spacing,
+             double max_range) {
+            const CameraExposure exposure =
+                ExposureFrom(camera_from_world, camera.height(), true);
+            std::vector<float> depth;
+            {
+              py::gil_scoped_release release;
+              depth = FloorTextureFuser::OcclusionDepth(
+                  camera, exposure, occluders, point_spacing, max_range);
+            }
+            return ToImage(depth, camera.height(), camera.width());
+          },
+          "camera"_a, "T_cam_world"_a, "occluders"_a,
+          "point_spacing"_a = 0.05, "max_range"_a = 8.0,
+          "The occlusion depth add_frame_occluded renders ((H, W) float32), "
+          "for add_frame; thread-safe.")
       .def("result", [](const FloorTextureFuser& fuser) {
         const FloorTextureFuser::Texture texture = fuser.ComputeTexture();
         const int height = fuser.grid().height;

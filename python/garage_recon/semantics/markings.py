@@ -2,8 +2,10 @@
 
 Markings are paint, not geometry, so they are extracted in 2D on the floor
 orthophoto (fisheye texture) and the LiDAR intensity raster, then vectorised:
-fill sparse samples -> white top-hat -> threshold -> skeleton -> junction
-split -> line fit -> collinear merge.
+fill sparse samples -> white top-hat -> threshold -> floor arrows (C++,
+gr/nav/arrows.h) taken out -> skeleton -> junction split -> line fit ->
+collinear merge. The raster steps use OpenCV; from the skeleton on the
+algorithm is C++ (gr/semantics/markings.h, vector_fit.h).
 
 `MarkingSegmenter` is the slot for a learned model (SegFormer / Mask2Former
 fine-tuned on garage BEV tiles, or SAM 3 prompted with "parking line"); the
@@ -20,6 +22,7 @@ import numpy as np
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
+from .. import _core, core_config
 from ..recon.bev import BevGrid
 from . import vector_fit
 
@@ -137,139 +140,127 @@ def elongated(mask: np.ndarray, res: float, yaw: float, cfg) -> np.ndarray:
     return out.astype(bool)
 
 
-def classical_mask(rasters: dict, res: float, yaw: float, cfg) -> np.ndarray:
+def paint_mask(rasters: dict, res: float, cfg) -> np.ndarray:
+    """Painted cells of all available layers, before the line filter."""
     mask = None
     for _, img, valid in marking_layers(rasters):
         m = layer_mask(img, valid, res, cfg)
         mask = m if mask is None else (mask | m)
-    return elongated(mask, res, yaw, cfg)
+    return mask
 
 
-def grid_aligned(seg: MarkingSegment, yaw: float, max_angle_deg: float) -> bool:
-    """Parking and lane lines follow the column grid; slanted fragments are
-    skeleton artefacts (angled bays would need this filter relaxed)."""
-    d = np.subtract(seg.p1, seg.p0)
-    a = (np.arctan2(d[1], d[0]) - yaw) % (np.pi / 2)
-    return min(a, np.pi / 2 - a) <= np.radians(max_angle_deg)
+def classical_mask(rasters: dict, res: float, yaw: float, cfg) -> np.ndarray:
+    return elongated(paint_mask(rasters, res, cfg), res, yaw, cfg)
 
 
-def both_sides_observed(seg: MarkingSegment, valid: np.ndarray, grid: BevGrid, offset: float = 0.2,
-                        min_fraction: float = 0.5) -> bool:
-    """Paint lies on the floor: both sides of a line must be observed floor.
-    Rejects bright rims at the floor boundary (wall bases, raster edges)."""
-    p0, p1 = np.asarray(seg.p0), np.asarray(seg.p1)
-    d = (p1 - p0) / max(np.linalg.norm(p1 - p0), 1e-9)
-    n = np.array([-d[1], d[0]]) * (seg.width / 2 + offset)
-    t = np.linspace(0.1, 0.9, 20)[:, None]
-    line = p0 + t * (p1 - p0)
-    for side in (line + n, line - n):
-        cr = np.floor(grid.world_to_px(side)).astype(int)
-        ok = (cr[:, 0] >= 0) & (cr[:, 1] >= 0) & (cr[:, 0] < valid.shape[1]) & (cr[:, 1] < valid.shape[0])
-        frac = valid[cr[ok, 1], cr[ok, 0]].mean() if ok.any() else 0.0
-        if frac < min_fraction:
-            return False
-    return True
+def detect_arrows(mask: np.ndarray, grid: BevGrid,
+                  cfg) -> tuple[list[dict], np.ndarray]:
+    """Floor arrows in a paint mask (C++ DetectArrows).
+
+    Arrow shafts are straight paint pieces like parking lines; parallel
+    shafts of the two lanes of an aisle would pass for slot separators, so
+    the arrows are found first and their paint is kept out of the lines.
+
+    Args:
+        mask: Painted cells (height, width).
+        grid: The level's grid.
+        cfg: Configuration (markings.arrows: ArrowConfig fields).
+
+    Returns:
+        The arrows (level, center, direction, tail, tip, length, widths,
+        area; metres) and the mask of their paint, slightly dilated.
+    """
+    # Bridge the gaps between LiDAR rings inside an arrow.
+    closed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                        (3, 3)))
+    config = core_config.fill(_core.ArrowConfig(),
+                              cfg.markings.get("arrows"))
+    found = _core.detect_arrows(closed, grid.res, grid.x0, grid.y0, config)
+    paint = np.zeros(mask.shape, bool)
+    arrows = []
+    for arrow in found:
+        paint.flat[arrow["cells"]] = True
+        arrows.append({
+            "level": grid.level,
+            **{k: np.round(np.asarray(arrow[k], float), 3).tolist()
+               for k in ("center", "direction", "tail", "tip")},
+            **{k: round(float(arrow[k]), 3)
+               for k in ("length", "shaft_width", "head_width", "area")}})
+    return arrows, ndimage.binary_dilation(paint, iterations=2)
 
 
-def vectorize(mask: np.ndarray, grid: BevGrid, cfg, level: int) -> list[MarkingSegment]:
-    mc = cfg.markings
-    res = grid.res
-    skel = skeletonize(mask)
-    nb = ndimage.convolve(skel.astype(int), np.ones((3, 3), int), mode="constant") - 1
-    junction = skel & (nb >= 3)
-    branches = skel & ~ndimage.binary_dilation(junction, iterations=1)
-    dist = ndimage.distance_transform_edt(mask)
-    lab, n = ndimage.label(branches, structure=np.ones((3, 3)))
-    segs: list[MarkingSegment] = []
-    for c in range(1, n + 1):
-        jj, ii = np.where(lab == c)
-        if len(jj) * res < mc.min_length * 0.5:
-            continue
-        pts = np.stack([ii + 0.5, jj + 0.5], axis=1)
-        mean = pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(pts - mean, full_matrices=False)
-        d = vt[0]
-        t = (pts - mean) @ d
-        resid = np.abs((pts - mean) @ np.array([-d[1], d[0]]))
-        if resid.mean() > 2.0:  # curved branch (arrow heads, text)
-            continue
-        p0, p1 = grid.px_to_world(np.array([mean + t.min() * d, mean + t.max() * d]))
-        width = float(2.0 * np.mean(dist[jj, ii]) * res)
-        segs.append(MarkingSegment(level, p0.tolist(), p1.tolist(), width, "parking_line", 1.0))
-    segs = merge_collinear(segs, cfg)
-    return [s for s in segs if s.length >= mc.min_length and mc.min_width <= s.width <= mc.max_width]
+def _to_dict(seg: MarkingSegment) -> dict:
+    return {"level": seg.level, "p0": seg.p0, "p1": seg.p1,
+            "width": seg.width, "cls": seg.cls, "confidence": seg.confidence,
+            "end_ok": list(seg.end_ok)}
 
 
-def classify_markings(segs: list[MarkingSegment], paths_xy: dict[int, np.ndarray], cfg) -> None:
+def _from_dict(d: dict) -> MarkingSegment:
+    return MarkingSegment(int(d["level"]), np.asarray(d["p0"]).tolist(),
+                          np.asarray(d["p1"]).tolist(), float(d["width"]),
+                          d["cls"], float(d["confidence"]),
+                          end_ok=[bool(v) for v in d["end_ok"]])
+
+
+def marking_config(cfg) -> _core.MarkingConfig:
+    return core_config.fill(_core.MarkingConfig(), cfg.markings)
+
+
+def vectorize(mask: np.ndarray, grid: BevGrid, cfg,
+              level: int) -> list[MarkingSegment]:
+    """Line segments of a paint mask (C++ VectorizeMarkings: skeleton
+    branches fitted, collinear pieces merged, length / width filters)."""
+    # The skeleton stays scikit-image's: its thinning differs from plain
+    # Zhang-Suen at diagonal steps, and the slot assembly downstream is
+    # sensitive to how lines split.
+    skeleton = skeletonize(np.asarray(mask, bool))
+    out = _core.vectorize_markings(
+        np.ascontiguousarray(mask, np.uint8), grid.x0, grid.y0, grid.res,
+        marking_config(cfg), level, np.ascontiguousarray(skeleton, np.uint8))
+    return [_from_dict(d) for d in out]
+
+
+def classify_markings(segs: list[MarkingSegment],
+                      paths_xy: dict[int, np.ndarray], cfg) -> None:
     """Long lines running along the driven aisle are lane markings; the
-    rest are parking-slot lines."""
-    mc = cfg.markings
-    for s in segs:
-        s.cls = "parking_line"
-        path = paths_xy.get(s.level)
-        if path is None or len(path) < 3 or s.length < mc.lane_min_length:
-            continue
-        mid = (np.asarray(s.p0) + np.asarray(s.p1)) / 2
-        k = int(np.argmin(np.linalg.norm(path - mid, axis=1)))
-        a, b = path[max(0, k - 5)], path[min(len(path) - 1, k + 5)]
-        t = b - a
-        d = np.subtract(s.p1, s.p0)
-        if np.linalg.norm(t) > 0.5 and abs(t @ d) / (np.linalg.norm(t) * np.linalg.norm(d)) > np.cos(np.radians(10)):
-            s.cls = "lane_marking"
-
-
-def merge_collinear(segs: list[MarkingSegment], cfg) -> list[MarkingSegment]:
-    mc = cfg.markings
-    segs = list(segs)
-    changed = True
-    while changed:
-        changed = False
-        for a in range(len(segs)):
-            for b in range(a + 1, len(segs)):
-                A, B = segs[a], segs[b]
-                pa0, pa1, pb0, pb1 = map(np.asarray, (A.p0, A.p1, B.p0, B.p1))
-                da = (pa1 - pa0) / max(np.linalg.norm(pa1 - pa0), 1e-9)
-                db = (pb1 - pb0) / max(np.linalg.norm(pb1 - pb0), 1e-9)
-                if np.degrees(np.arccos(min(1.0, abs(da @ db)))) > mc.merge_angle:
-                    continue
-                nrm = np.array([-da[1], da[0]])
-                if max(abs((pb0 - pa0) @ nrm), abs((pb1 - pa0) @ nrm)) > mc.merge_offset:
-                    continue
-                ta = sorted([0.0, (pa1 - pa0) @ da])
-                tb = sorted([(pb0 - pa0) @ da, (pb1 - pa0) @ da])
-                gap = max(tb[0] - ta[1], ta[0] - tb[1])
-                if gap > mc.merge_gap:
-                    continue
-                t0, t1 = min(ta[0], tb[0]), max(ta[1], tb[1])
-                la, lb = A.length, B.length
-                w = (A.width * la + B.width * lb) / max(la + lb, 1e-9)
-                segs[a] = MarkingSegment(A.level, (pa0 + t0 * da).tolist(), (pa0 + t1 * da).tolist(), w, A.cls,
-                                         min(1.0, (A.confidence * la + B.confidence * lb) / max(la + lb, 1e-9)))
-                segs.pop(b)
-                changed = True
-                break
-            if changed:
-                break
-    return segs
+    rest are parking-slot lines (C++ ClassifyMarkings)."""
+    paths = {int(k): np.column_stack([np.asarray(v)[:, :2], np.zeros(len(v))])
+             for k, v in paths_xy.items() if len(v)}
+    out = _core.classify_markings([_to_dict(s) for s in segs], paths,
+                                  marking_config(cfg))
+    for seg, d in zip(segs, out):
+        seg.cls = d["cls"]
 
 
 def extract_markings(rasters: dict, grid: BevGrid, cfg, yaw: float = 0.0, segmenter: MarkingSegmenter | None = None,
-                     log=print) -> list[MarkingSegment]:
+                     log=print) -> tuple[list[MarkingSegment], list[dict]]:
+    """Line segments and floor arrows of one level."""
     if segmenter is not None:
         layers = marking_layers(rasters)
         img = np.max([l[1] * l[2] for l in layers], axis=0)
         valid = np.any([l[2] for l in layers], axis=0)
-        mask = segmenter.segment(img, valid)
+        paint = segmenter.segment(img, valid)
     else:
-        mask = classical_mask(rasters, grid.res, yaw, cfg)
+        paint = paint_mask(rasters, grid.res, cfg)
+    arrows, arrow_paint = detect_arrows(paint, grid, cfg)
+    paint = paint & ~arrow_paint
+    mask = (paint if segmenter is not None
+            else elongated(paint, grid.res, yaw, cfg))
     observed = np.any([l[2] for l in marking_layers(rasters)], axis=0)
     covered = np.nan_to_num(rasters["height_max"]) > 0.3 if "height_max" in rasters else np.zeros_like(observed)
     floor = ndimage.binary_closing(observed | covered, iterations=2)  # cars do not end the floor
-    segs = [s for s in vectorize(mask, grid, cfg, grid.level)
-            if both_sides_observed(s, floor, grid) and grid_aligned(s, yaw, cfg.markings.max_axis_angle)]
+    # Paint lies on observed floor (both sides) and follows the grid.
+    kept = _core.filter_markings(
+        [_to_dict(s) for s in vectorize(mask, grid, cfg, grid.level)],
+        np.ascontiguousarray(floor, np.uint8), grid.x0, grid.y0, grid.res, yaw,
+        float(cfg.markings.max_axis_angle))
+    segs = [_from_dict(d) for d in kept]
     refined = 0
     if cfg.markings.get("subpixel", True):
         refined = vector_fit.refine_segments(segs, rasters, grid)
-    log(f"[markings] level {grid.level}: {len(segs)} segments, {refined} measured on the orthophoto "
-        f"({sum(sum(s.end_ok) for s in segs)} reliable ends)")
-    return segs
+    ends = sum(sum(s.end_ok) for s in segs)
+    log(f"[markings] level {grid.level}: {len(segs)} segments, {refined} "
+        f"measured on the orthophoto ({ends} reliable ends), "
+        f"{len(arrows)} arrows")
+    return segs, arrows

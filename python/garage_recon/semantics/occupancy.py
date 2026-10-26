@@ -18,6 +18,6 @@ from ..data.schema import Rig
 
 
 def occupancy_generator(static_xyz: np.ndarray, static_labels: np.ndarray, rig: Rig, cfg) -> _core.OccupancyGenerator:
-    cams = [(rig.cameras[c].make_model(), rig.cameras[c].T_vehicle_cam) for c in rig.fisheye_cameras]
+    cams = [(rig.cameras[c].make_model(), rig.cameras[c].T_vehicle_cam) for c in rig.cameras]  # Fisheye and pinhole.
     return _core.OccupancyGenerator(static_xyz, static_labels.astype(np.int32), occupancy_config(cfg),
                                     rig.primary_lidar.T_vehicle_lidar, cams)

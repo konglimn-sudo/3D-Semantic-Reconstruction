@@ -7,16 +7,30 @@ slot of that level votes for its text (the slot whose entrance is nearest).
 A slot takes its most voted text; each row's numbers are then repaired with
 the consecutive-numbering rule (rules.fix_slot_numbers). "C-105" or "C105"
 splits into zone C and number 105.
+
+The floor is the level's floor grid, not one height per level (a level may
+rise along an aisle). Every text is also placed in 3D where the LiDAR map
+surface is at its pixel (signs hang on walls and columns, not on the floor);
+readings of one text within `landmark_radius` merge into a landmark (exit,
+gate, zone, level or other text) for the navigation map (README 5.2 / 6).
+The OCR reads a sign's arrows as glyphs ("出口个", "《中央区", "5A》"), so
+they are stripped first; landmarks of one kind on one sign (within the
+radius) then merge when they are exits ("EXIT" and "出口" side by side) or
+their texts are similar (a misreading, "中区" beside "中央区"), keeping
+the best text and the others in `texts`.
 """
 
 from __future__ import annotations
 
 import collections
+import difflib
 import re
 
+import cv2
 import numpy as np
 import shapely
 
+from garage_recon import _core, geometry
 from garage_recon.models import interfaces
 from garage_recon.semantics import rules
 from garage_recon.semantics import slots as slots_lib
@@ -33,23 +47,124 @@ def split_text(text: str) -> tuple[str | None, str | None]:
 
 
 def floor_hits(camera, world_from_camera: np.ndarray, uv: np.ndarray,
-               floor_z: list[float], max_range: float
+               levels, max_range: float, step: float = 0.05
                ) -> list[tuple[int, np.ndarray]]:
-    """(level, xyz) where the ray through pixel `uv` meets each level's
-    floor plane within `max_range`."""
+    """(level, xyz) where the ray through pixel `uv` first goes below each
+    level's floor grid (LevelModel.floor_z) within `max_range`."""
     rays, valid = camera.unproject(np.asarray(uv, float).reshape(1, 2))
     if not valid[0]:
         return []
     direction = world_from_camera[:3, :3] @ rays[0]
     origin = world_from_camera[:3, 3]
+    if direction[2] >= -1e-6:  # Not looking down: no floor ahead.
+        return []
+    s = np.arange(step, max_range + step / 2, step)
+    points = origin + s[:, None] * direction
     hits = []
-    if abs(direction[2]) < 1e-6:
-        return hits
-    for level, z in enumerate(floor_z):
-        s = (z - origin[2]) / direction[2]
-        if 0.0 < s <= max_range:
-            hits.append((level, origin + s * direction))
+    for level in range(levels.n):
+        above = points[:, 2] - levels.floor_z(points[:, :2], level)
+        below = np.nonzero(above <= 0.0)[0]
+        if len(below) == 0 or below[0] == 0:
+            continue
+        k = below[0]  # Linear between the last sample above and this one.
+        f = above[k - 1] / (above[k - 1] - above[k])
+        hits.append((level, points[k - 1] + f * (points[k] - points[k - 1])))
     return hits
+
+
+def text_kind(text: str) -> str:
+    """exit | gate | level | zone | text."""
+    t = re.sub(r"\s+", "", text.upper())
+    if re.search(r"EXIT|出口", t):
+        return "exit"
+    if re.search(r"\d+号门|GATE", t):
+        return "gate"
+    if re.fullmatch(r"(B|L|F)\d{1,2}|负?[一二三四五六七八九十]+层", t):
+        return "level"
+    if re.fullmatch(r"\d{0,2}[A-Z]{1,2}\d{0,2}", t) or t.endswith("区"):
+        return "zone"
+    return "text"
+
+
+# Arrow glyphs and their usual misreadings at either end of a sign text.
+_ARROWS = r"^[《》<>→←↑↓↗↖↘↙^个十]+|[《》<>→←↑↓↗↖↘↙^个十]+$"
+
+
+def normalize_text(text: str) -> str:
+    """Upper case, no spaces, no arrow glyphs at either end."""
+    return re.sub(_ARROWS, "", re.sub(r"\s+", "", text.strip().upper()))
+
+
+def merge_signs(marks: list[dict], radius: float,
+                similarity: float = 0.6) -> list[dict]:
+    """Landmarks of one kind within `radius` of a better one merged into it
+    when both are exits or their texts are `similarity` alike; the merged
+    landmark keeps the better text and position, adds the views and scores,
+    and lists every text in `texts`."""
+    out = []
+    for mark in sorted(marks, key=lambda m: -m["score"]):
+        xyz = np.asarray(mark["xyz"])
+        for sign in out:
+            if (sign["kind"] == mark["kind"]
+                    and np.linalg.norm(np.asarray(sign["xyz"]) - xyz) <= radius
+                    and (mark["kind"] == "exit" or difflib.SequenceMatcher(
+                        None, sign["text"], mark["text"]).ratio() >= similarity)):
+                sign["views"] += mark["views"]
+                sign["score"] = round(sign["score"] + mark["score"], 2)
+                if mark["text"] not in sign["texts"]:
+                    sign["texts"].append(mark["text"])
+                break
+        else:
+            out.append({**mark, "texts": [mark["text"]]})
+    return out
+
+
+def text_landmarks(observations: list[tuple[str, np.ndarray, float]],
+                   radius: float, min_views: int, min_score: float,
+                   similarity: float = 0.6) -> list[dict]:
+    """Readings (text, xyz, score) of one text within `radius` merged into
+    landmarks (best readings first); kept with `min_views` readings and a
+    summed score of `min_score`; then one landmark per sign (merge_signs)."""
+    groups = collections.defaultdict(list)
+    for text, xyz, score in observations:
+        key = normalize_text(text)
+        if len(key) >= 2:  # Single characters are mostly misreadings.
+            groups[key].append((np.asarray(xyz, float), float(score)))
+    out = []
+    for key, readings in groups.items():
+        clusters = []  # [points, scores]
+        for xyz, score in sorted(readings, key=lambda r: -r[1]):
+            for c in clusters:
+                if np.linalg.norm(np.median(c[0], axis=0) - xyz) <= radius:
+                    c[0].append(xyz)
+                    c[1].append(score)
+                    break
+            else:
+                clusters.append([[xyz], [score]])
+        for points, scores in clusters:
+            if len(points) >= min_views and sum(scores) >= min_score:
+                out.append({"text": key, "kind": text_kind(key),
+                            "xyz": np.median(points, axis=0).round(3).tolist(),
+                            "views": len(points),
+                            "score": round(float(sum(scores)), 2)})
+    return sorted(merge_signs(out, radius, similarity),
+                  key=lambda l: -l["score"])
+
+
+def _range_image(camera, camera_from_world, local, cfg) -> np.ndarray:
+    """LiDAR-map range of every pixel (z-buffer of the static points)."""
+    rng, _, _ = _core.render_points(
+        camera, camera_from_world, local, None,
+        float(cfg.map.voxel), 1, 6, 0.3, float(cfg.numbers.text_max_range))
+    return rng
+
+
+def _surface_range(rng: np.ndarray, polygon) -> float:
+    """Median map range inside a text polygon (NaN if none)."""
+    mask = np.zeros(rng.shape, np.uint8)
+    cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 1)
+    values = rng[(mask > 0) & (rng > 0)]
+    return float(np.median(values)) if len(values) else float("nan")
 
 
 def _row_order(slots: list[slots_lib.Slot]) -> list[int]:
@@ -61,8 +176,13 @@ def _row_order(slots: list[slots_lib.Slot]) -> list[int]:
     return list(np.argsort(centers @ vt[0]))
 
 
-def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print) -> dict:
+def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
+                 cache=None) -> dict:
     """Sets `number`, `zone` and `text_votes` of the slots in place.
+
+    `cache`: a JSON file of the raw OCR results per frame, read if present
+    and written after (OCR is the slow part; delete it after changing the
+    OCR model).
 
     Returns:
         Summary: frames read, texts, slots with a number before and after the
@@ -70,17 +190,28 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print) -> dict:
     """
     section = cfg.numbers
     ocr = recon.models.ocr
-    if ocr is None or not slots:
-        log("[numbers] no OCR model or no slots")
-        return {"frames": 0}
+    if ocr is None:
+        log("[numbers] no OCR model")
+        return {"frames": 0, "landmark_list": []}
     pose_set = recon.pose_set()
-    floor_z = list(np.asarray(recon.levels().z, float))
+    levels = recon.levels()
+    point_map = recon.point_map()
+    static = np.ascontiguousarray(
+        point_map.xyz if point_map.dynamic is None
+        else point_map.xyz[~point_map.dynamic], dtype=np.float64)
+    index = _core.PointCloudIndex(static)
+    observations = []  # (text, xyz, score) of every reading on a surface.
     polygons = [shapely.Polygon(s.corners).buffer(section.max_distance)
                 for s in slots]
     entrances = [np.mean(np.asarray(s.corners)[:2], axis=0) for s in slots]
     votes = [collections.Counter() for _ in slots]  # Text -> summed score.
     readings = [0] * len(slots)
     needs_images = getattr(ocr, "needs_images", True)
+    import json
+    import pathlib
+    cache = pathlib.Path(cache) if cache else None
+    cached = json.loads(cache.read_text()) if cache and cache.exists() else {}
+    fresh = {}
     frames = texts = 0
     for t, data in enumerate(recon.datasets):
         rig = pose_set.rig(t)
@@ -88,17 +219,44 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print) -> dict:
             camera = calib.make_model()
             stamps = data.camera_stamps_ns(name)[::int(section.frame_stride)]
             for ns in stamps:
-                image = data.load_image(name, int(ns)) if needs_images else None
-                found = ocr.read(interfaces.Frame(data.trip_id, name, int(ns),
-                                                  image))
+                key = f"{data.trip_id}/{name}/{int(ns)}"
+                if key in cached:
+                    found = [interfaces.TextResult(t, np.asarray(p, np.float32), s)
+                             for t, p, s in cached[key]]
+                else:
+                    image = (data.load_image(name, int(ns)) if needs_images
+                             else None)
+                    found = ocr.read(interfaces.Frame(data.trip_id, name,
+                                                      int(ns), image))
+                fresh[key] = [[r.text, np.asarray(r.polygon).round(1).tolist(),
+                               round(float(r.score), 3)] for r in found]
                 frames += 1
+                if cache is not None and frames % 100 == 0:  # Kept if stopped.
+                    cache.write_text(json.dumps({**cached, **fresh},
+                                                ensure_ascii=False))
                 if not found:
                     continue
                 pose = pose_set.camera_center_pose(t, name, int(ns))
+                exposure = pose_set.camera_exposure(t, name, int(ns))
+                camera_from_world = (
+                    geometry.inv(exposure) if exposure.ndim == 2
+                    else np.stack([geometry.inv(e) for e in exposure]))
+                local = np.ascontiguousarray(static[index.radius_search(
+                    pose[:3, 3], float(section.text_max_range))])
+                # One z-buffer per frame, shared by its texts.
+                rng = (_range_image(camera, camera_from_world, local, cfg)
+                       if len(local) else None)
                 for result in found:
                     texts += 1
                     uv = np.asarray(result.polygon, float).mean(axis=0)
-                    for level, xyz in floor_hits(camera, pose, uv, floor_z,
+                    rays, ok = camera.unproject(uv.reshape(1, 2))
+                    distance = (_surface_range(rng, result.polygon)
+                                if ok[0] and rng is not None else float("nan"))
+                    if np.isfinite(distance):
+                        observations.append((
+                            result.text, pose[:3, 3] + distance * (
+                                pose[:3, :3] @ rays[0]), result.score))
+                    for level, xyz in floor_hits(camera, pose, uv, levels,
                                                  section.max_range):
                         point = shapely.Point(xyz[0], xyz[1])
                         best, best_d = -1, np.inf
@@ -135,9 +293,23 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print) -> dict:
             slots[k].number = number
             if zone and slots[k].number is not None:
                 slots[k].zone = zone
+    if cache is not None:
+        cache.write_text(json.dumps({**cached, **fresh}, ensure_ascii=False))
+    landmarks = text_landmarks(observations, float(section.landmark_radius),
+                               int(section.landmark_min_views),
+                               float(section.landmark_min_score),
+                               float(section.get("landmark_similarity", 0.6)))
+    if landmarks:
+        level, height, _ = levels.assign(np.array([l["xyz"] for l in landmarks]))
+        for l, lv, h in zip(landmarks, level, height):
+            l["level"], l["height"] = int(lv), round(float(h), 2)
+    kinds = collections.Counter(l["kind"] for l in landmarks)
     summary = {"frames": frames, "texts": texts, "slots": len(slots),
                "read": read,
-               "numbered": int(sum(s.number is not None for s in slots))}
+               "numbered": int(sum(s.number is not None for s in slots)),
+               "landmarks": dict(kinds)}
     log(f"[numbers] {frames} frames, {texts} texts; {read} of {len(slots)} "
-        f"slots read, {summary['numbered']} numbered after the row repair")
+        f"slots read, {summary['numbered']} numbered after the row repair; "
+        f"{len(landmarks)} text landmarks {dict(kinds)}")
+    summary["landmark_list"] = landmarks
     return summary

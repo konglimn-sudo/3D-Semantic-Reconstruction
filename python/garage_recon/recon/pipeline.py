@@ -323,10 +323,10 @@ class ReconPipeline:
         self.record("ortho", uses_cameras=True)
 
     def stage_texture(self) -> None:
-        """Floor orthophoto from the fisheye images."""
+        """Floor orthophoto from the camera images (fisheye and pinhole)."""
         if not self.cfg.floor_texture.enabled or not any(
-                d.rig.fisheye_cameras for d in self.datasets):
-            self.log("[texture] skipped (disabled or no fisheye cameras)")
+                d.rig.cameras for d in self.datasets):
+            self.log("[texture] skipped (disabled or no cameras)")
             return
         point_map, levels = self.point_map(), self.levels()
         for lv in range(levels.n):

@@ -50,52 +50,72 @@ endif()
 
 # ------------------------------------------------------------------- gr_core
 # C++ sources follow the Google C++ style guide: headers and sources live side
-# by side under cpp/gr and are included as "gr/<name>.h".
+# by side under cpp/gr/<folder> (one folder per function) and are included as
+# "gr/<folder>/<name>.h"; tests sit next to them as <name>_test.cc.
 set(GR_CORE_SOURCES
-  cpp/gr/types.cc
-  cpp/gr/pose.cc
-  cpp/gr/voxel.cc
-  cpp/gr/numeric.cc
-  cpp/gr/logging.cc
-  cpp/gr/camera.cc
-  cpp/gr/camera_calibration.cc
-  cpp/gr/clock_sync.cc
-  cpp/gr/cloud_compare.cc
-  cpp/gr/exposure.cc
-  cpp/gr/geometry.cc
-  # Section 4: registration, odometry, loops, back-end, map.
-  cpp/gr/registration.cc
-  cpp/gr/imu.cc
-  cpp/gr/imu_preintegration.cc
-  cpp/gr/odometry.cc
-  cpp/gr/lio.cc
-  cpp/gr/keyframes.cc
-  cpp/gr/lidar_ba.cc
-  cpp/gr/scan_context.cc
-  cpp/gr/loop_closure.cc
-  cpp/gr/plane_factor.cc
-  cpp/gr/pose_graph.cc
-  cpp/gr/backend.cc
-  cpp/gr/trajectory.cc
-  cpp/gr/visibility.cc
-  cpp/gr/static_map.cc
-  cpp/gr/raycast.cc
-  cpp/gr/raster.cc
-  # Section 5: objects, occupancy, projection.
-  cpp/gr/objects.cc
-  cpp/gr/occupancy.cc
-  cpp/gr/projector.cc
-  cpp/gr/labeling.cc
-  cpp/gr/identity.cc
-  # 3DGS: LiDAR-anchored Gaussians, camera coverage, training masks,
-  # the depth prior aligned to the LiDAR.
-  cpp/gr/gaussians.cc
-  cpp/gr/depth_prior.cc
-  cpp/gr/coverage.cc
-  # Navigation map: drivable layers, aisle route graph, planning.
-  cpp/gr/nav_map.cc
-  # Synthetic scenes.
-  cpp/gr/sim.cc
+  # core/: Base types, SE(3), voxels, numerics, logging, checks, local geometry.
+  cpp/gr/core/geometry.cc
+  cpp/gr/core/kdtree.cc
+  cpp/gr/core/morphology.cc
+  cpp/gr/core/logging.cc
+  cpp/gr/core/numeric.cc
+  cpp/gr/core/pose.cc
+  cpp/gr/core/types.cc
+  cpp/gr/core/voxel.cc
+  # sensors/: Camera models, exposure (rolling shutter), IMU, preintegration.
+  cpp/gr/sensors/camera.cc
+  cpp/gr/sensors/exposure.cc
+  cpp/gr/sensors/imu.cc
+  cpp/gr/sensors/imu_preintegration.cc
+  # calibration/: Camera time offset / extrinsics, clock sync between sensors.
+  cpp/gr/calibration/camera_calibration.cc
+  cpp/gr/calibration/clock_sync.cc
+  # registration/: Voxel-hash ICP, coarse alignment, placement, cloud comparison.
+  cpp/gr/registration/cloud_compare.cc
+  cpp/gr/registration/registration.cc
+  # odometry/: LiDAR / LiDAR-inertial odometry, continuous-time trajectory.
+  cpp/gr/odometry/lio.cc
+  cpp/gr/odometry/odometry.cc
+  cpp/gr/odometry/trajectory.cc
+  # backend/: Keyframes, loops, pose graph, LiDAR bundle adjustment.
+  cpp/gr/backend/backend.cc
+  cpp/gr/backend/keyframes.cc
+  cpp/gr/backend/lidar_ba.cc
+  cpp/gr/backend/loop_closure.cc
+  cpp/gr/backend/plane_factor.cc
+  cpp/gr/backend/pose_graph.cc
+  cpp/gr/backend/scan_context.cc
+  # mapping/: Survey map, dynamic points, free space, BEV rasters.
+  cpp/gr/mapping/levels.cc
+  cpp/gr/mapping/raster.cc
+  cpp/gr/mapping/raycast.cc
+  cpp/gr/mapping/static_map.cc
+  cpp/gr/mapping/visibility.cc
+  # semantics/: Object timelines, occupancy, projection, labels, identities.
+  cpp/gr/semantics/identity.cc
+  cpp/gr/semantics/labeling.cc
+  cpp/gr/semantics/markings.cc
+  cpp/gr/semantics/objects.cc
+  cpp/gr/semantics/occupancy.cc
+  cpp/gr/semantics/projector.cc
+  cpp/gr/semantics/slots.cc
+  cpp/gr/semantics/structure.cc
+  cpp/gr/semantics/vector_fit.cc
+  # splat/: 3DGS support: anchored Gaussians, coverage, depth prior.
+  cpp/gr/splat/coverage.cc
+  cpp/gr/splat/depth_prior.cc
+  cpp/gr/splat/gaussians.cc
+  # nav/: Navigation map, floor arrows, traffic, lanes, localization in
+  # the map (per sweep and per trip), position on the route graph.
+  cpp/gr/nav/arrows.cc
+  cpp/gr/nav/lanes.cc
+  cpp/gr/nav/localization.cc
+  cpp/gr/nav/nav_map.cc
+  cpp/gr/nav/position.cc
+  cpp/gr/nav/traffic.cc
+  cpp/gr/nav/trip_localizer.cc
+  # sim/: Box-scene ray caster of the synthetic garage.
+  cpp/gr/sim/sim.cc
 )
 add_library(gr_core STATIC ${GR_CORE_SOURCES})
 target_include_directories(gr_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
@@ -104,6 +124,37 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   # The library does not use exceptions (preconditions are checked with
   # GR_CHECK); -fno-exceptions enforces it.
   target_compile_options(gr_core PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-exceptions)
+endif()
+
+# --------------------------------------------------------------------- gr_io
+# cpp/gr/io: the file formats of the pipeline (YAML / JSON, npy / npz, CSV,
+# TUM, trip directories, navigation map files, configuration sections) for
+# programs that run without Python. Malformed files are reported as
+# std::runtime_error from deep inside the parsers, so gr_io is built with
+# exceptions, as the bindings are; gr_core stays without.
+find_package(ZLIB REQUIRED)
+add_library(gr_io STATIC
+  cpp/gr/io/config.cc
+  cpp/gr/io/nav_files.cc
+  cpp/gr/io/npy.cc
+  cpp/gr/io/tables.cc
+  cpp/gr/io/trip.cc
+  cpp/gr/io/value.cc
+)
+target_link_libraries(gr_io PUBLIC gr_core ZLIB::ZLIB)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(gr_io PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+# ------------------------------------------------------------------ programs
+# cpp/apps: command-line programs on gr_core + gr_io.
+option(GR_BUILD_APPS "Build the command-line programs (gr_localize)" ON)
+if(GR_BUILD_APPS)
+  add_executable(gr_localize cpp/apps/gr_localize.cc)
+  target_link_libraries(gr_localize PRIVATE gr_io)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(gr_localize PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
 endif()
 
 # ------------------------------------------------------------ Python module
@@ -128,6 +179,9 @@ if(GR_BUILD_PYTHON)
     cpp/bindings/bind_labels.cc
     cpp/bindings/bind_splat.cc
     cpp/bindings/bind_nav.cc
+    cpp/bindings/bind_localization.cc
+    cpp/bindings/bind_mapping.cc
+    cpp/bindings/bind_semantics.cc
   )
   target_link_libraries(_core PRIVATE gr_core)
   if(GR_INPLACE)
@@ -143,46 +197,61 @@ if(GR_BUILD_TESTS)
     cpp/gr/testing/test.cc
     cpp/gr/testing/test_main.cc
     cpp/gr/testing/sim_garage.cc
-    cpp/gr/pose_test.cc
-    cpp/gr/voxel_test.cc
-    cpp/gr/numeric_test.cc
-    cpp/gr/geometry_test.cc
-    cpp/gr/camera_test.cc
-    cpp/gr/camera_calibration_test.cc
-    cpp/gr/clock_sync_test.cc
-    cpp/gr/cloud_compare_test.cc
-    cpp/gr/exposure_test.cc
-    cpp/gr/registration_test.cc
-    cpp/gr/odometry_test.cc
-    cpp/gr/lio_test.cc
-    cpp/gr/imu_test.cc
-    cpp/gr/imu_preintegration_test.cc
-    cpp/gr/scan_context_test.cc
-    cpp/gr/plane_factor_test.cc
-    cpp/gr/pose_graph_test.cc
-    cpp/gr/keyframes_test.cc
-    cpp/gr/lidar_ba_test.cc
-    cpp/gr/loop_closure_test.cc
-    cpp/gr/backend_test.cc
-    cpp/gr/trajectory_test.cc
-    cpp/gr/raycast_test.cc
-    cpp/gr/visibility_test.cc
-    cpp/gr/static_map_test.cc
-    cpp/gr/projector_test.cc
-    cpp/gr/raster_test.cc
-    cpp/gr/objects_test.cc
-    cpp/gr/occupancy_test.cc
-    cpp/gr/labeling_test.cc
-    cpp/gr/identity_test.cc
-    cpp/gr/gaussians_test.cc
-    cpp/gr/depth_prior_test.cc
-    cpp/gr/coverage_test.cc
-    cpp/gr/nav_map_test.cc
-    cpp/gr/e2e_test.cc
+    cpp/gr/core/geometry_test.cc
+    cpp/gr/core/kdtree_test.cc
+    cpp/gr/core/numeric_test.cc
+    cpp/gr/core/pose_test.cc
+    cpp/gr/core/voxel_test.cc
+    cpp/gr/sensors/camera_test.cc
+    cpp/gr/sensors/exposure_test.cc
+    cpp/gr/sensors/imu_preintegration_test.cc
+    cpp/gr/sensors/imu_test.cc
+    cpp/gr/calibration/camera_calibration_test.cc
+    cpp/gr/calibration/clock_sync_test.cc
+    cpp/gr/registration/cloud_compare_test.cc
+    cpp/gr/registration/registration_test.cc
+    cpp/gr/odometry/lio_test.cc
+    cpp/gr/odometry/odometry_test.cc
+    cpp/gr/odometry/trajectory_test.cc
+    cpp/gr/backend/backend_test.cc
+    cpp/gr/backend/keyframes_test.cc
+    cpp/gr/backend/lidar_ba_test.cc
+    cpp/gr/backend/loop_closure_test.cc
+    cpp/gr/backend/plane_factor_test.cc
+    cpp/gr/backend/pose_graph_test.cc
+    cpp/gr/backend/scan_context_test.cc
+    cpp/gr/mapping/levels_test.cc
+    cpp/gr/mapping/raster_test.cc
+    cpp/gr/mapping/raycast_test.cc
+    cpp/gr/mapping/static_map_test.cc
+    cpp/gr/mapping/visibility_test.cc
+    cpp/gr/semantics/identity_test.cc
+    cpp/gr/semantics/labeling_test.cc
+    cpp/gr/semantics/markings_test.cc
+    cpp/gr/semantics/objects_test.cc
+    cpp/gr/semantics/occupancy_test.cc
+    cpp/gr/semantics/projector_test.cc
+    cpp/gr/semantics/slots_test.cc
+    cpp/gr/semantics/structure_test.cc
+    cpp/gr/splat/coverage_test.cc
+    cpp/gr/splat/depth_prior_test.cc
+    cpp/gr/splat/gaussians_test.cc
+    cpp/gr/nav/arrows_test.cc
+    cpp/gr/nav/lanes_test.cc
+    cpp/gr/nav/localization_test.cc
+    cpp/gr/nav/nav_map_test.cc
+    cpp/gr/nav/position_test.cc
+    cpp/gr/nav/traffic_test.cc
+    cpp/gr/io/trip_test.cc
+    cpp/gr/io/value_test.cc
+    cpp/gr/testing/e2e_test.cc
   )
-  target_link_libraries(gr_tests PRIVATE gr_core)
+  target_link_libraries(gr_tests PRIVATE gr_io)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(gr_tests PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-exceptions)
+    # The gr_io tests check its exceptions.
+    set_source_files_properties(cpp/gr/io/trip_test.cc cpp/gr/io/value_test.cc
+                                PROPERTIES COMPILE_OPTIONS -fexceptions)
   endif()
   add_test(NAME gr_tests COMMAND gr_tests)
 endif()

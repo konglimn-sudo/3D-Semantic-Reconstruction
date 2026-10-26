@@ -23,4 +23,7 @@ PYBIND11_MODULE(_core, m) {
   gr::bindings::BindLabels(m);
   gr::bindings::BindSplat(m);
   gr::bindings::BindNav(m);
+  gr::bindings::BindLocalization(m);
+  gr::bindings::BindMapping(m);
+  gr::bindings::BindSemantics(m);
 }

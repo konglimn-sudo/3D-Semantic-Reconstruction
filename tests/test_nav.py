@@ -88,6 +88,26 @@ def test_parse_query_forms():
     assert address.parse_query("C105", names) == {
         "level": None, "zone": "C", "number": "105"}
     assert address.parse_query("B3 A 1", names)["level"] == -1
+    assert address.parse_query("5A区", names) == {"level": None, "zone": "5A", "number": None}
+    assert address.parse_query("B1 中央区", names) == {"level": 0, "zone": "中央", "number": None}
+    assert address.parse_query("去B2 C区105号", names) == {"level": 1, "zone": "C", "number": "105"}
+    assert address.parse_query("导航到1B区", names)["zone"] == "1B"
+
+
+def test_zone_queries_without_slot_numbers():
+    names = ["B1"]
+    goals = [{"slot_id": "L0-R03-001", "level": 0, "zone": "5A"},
+             {"slot_id": "L0-R03-002", "level": 0, "zone": "5A"},
+             {"slot_id": "L0-R12-001", "level": 0, "zone": "中央区"},
+             {"slot_id": "L0-R18-001", "level": 0}]
+    for g in goals:
+        g["address"] = address.address(g, names)
+    assert [g["address"] for g in goals] == ["B1-5A-R03-001", "B1-5A-R03-002",
+                                             "B1-中央区-R12-001", "B1-R18-001"]
+    assert [g["slot_id"] for g in address.find(goals, "5a区", names)] == ["L0-R03-001", "L0-R03-002"]
+    assert [g["slot_id"] for g in address.find(goals, "B1 中央区", names)] == ["L0-R12-001"]
+    assert [g["slot_id"] for g in address.find(goals, "b1-5a-r03-002", names)] == ["L0-R03-002"]
+    assert address.find(goals, "B1", names) == []
 
 
 def test_split_text():

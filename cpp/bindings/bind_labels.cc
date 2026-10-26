@@ -10,12 +10,12 @@
 #include <vector>
 
 #include "bind_util.h"
-#include "gr/exposure.h"
-#include "gr/identity.h"
-#include "gr/image.h"
-#include "gr/labeling.h"
-#include "gr/objects.h"
-#include "gr/occupancy.h"
+#include "gr/core/image.h"
+#include "gr/semantics/identity.h"
+#include "gr/semantics/labeling.h"
+#include "gr/semantics/objects.h"
+#include "gr/semantics/occupancy.h"
+#include "gr/sensors/exposure.h"
 
 namespace gr::bindings {
 namespace {

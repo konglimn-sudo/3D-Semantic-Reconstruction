@@ -47,6 +47,9 @@ class LevelLayers:
         ramp: Inside a ramp outline that touches this level.
         floor_z: Floor height (m).
         clearance: Distance to the nearest obstacle or unknown cell (m).
+        headroom: Height above the floor of the lowest static object
+            (vehicles and low objects excluded; inf where none, e.g. open
+            sky).
     """
 
     grid: bev.BevGrid
@@ -60,6 +63,7 @@ class LevelLayers:
     ramp: np.ndarray
     floor_z: np.ndarray
     clearance: np.ndarray
+    headroom: np.ndarray | None = None
 
     @property
     def known(self) -> np.ndarray:
@@ -89,9 +93,20 @@ class LevelLayers:
         values = getattr(self, name)[row, col]
         return np.where(inside, values, outside)
 
+    @classmethod
+    def from_npz(cls, data) -> "LevelLayers":
+        """Inverse of to_npz (an open npz file or a dict)."""
+        g = np.asarray(data["grid"])
+        grid = bev.BevGrid(int(g[5]), float(g[0]), float(g[1]), float(g[2]),
+                           int(g[3]), int(g[4]))
+        return cls(grid=grid, **{f.name: np.asarray(data[f.name])
+                                 for f in dataclasses.fields(cls)
+                                 if f.name != "grid" and f.name in data})
+
     def to_npz(self) -> dict:
         out = {f.name: getattr(self, f.name)
-               for f in dataclasses.fields(self) if f.name != "grid"}
+               for f in dataclasses.fields(self)
+               if f.name != "grid" and getattr(self, f.name) is not None}
         out["grid"] = np.asarray([self.grid.x0, self.grid.y0, self.grid.res,
                                   self.grid.width, self.grid.height,
                                   self.grid.level])
@@ -183,6 +198,23 @@ def level_layers(point_map, labels: np.ndarray, levels, slots, path_xy,
         & (height > 0.5)) >= min_points)
     parked = (count(band & vehicles) >= min_points) & ~structure
     low = count(low_points) >= min_points
+    # Headroom: what hangs over the band the vehicle occupies (lower
+    # objects are obstacles already), unclassified points filtered by their
+    # observations as above.
+    above = (selected & (height >= top)
+             & (height < nav.get("max_headroom", 8.0)) & ~vehicles)
+    above_unclassified = above & (labels == taxonomy.UNLABELED)
+
+    def lowest(mask: np.ndarray) -> np.ndarray:
+        return _core.rasterize(xy[mask], height[mask].astype(np.float64),
+                               *args, "min", np.inf)
+
+    headroom = lowest(above & ~above_unclassified)
+    seen = _core.rasterize(
+        xy[above_unclassified], observations[above_unclassified], *args,
+        "sum", 0.0) >= nav.min_cell_observations
+    headroom = np.where(seen, np.minimum(headroom, lowest(above_unclassified)),
+                        headroom).astype(np.float32)
 
     k = int(nav.floor_closing)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1,) * 2)
@@ -214,4 +246,4 @@ def level_layers(point_map, labels: np.ndarray, levels, slots, path_xy,
     return LevelLayers(grid, known & ~(driven | ramp), driven, structure,
                        overhead, parked, low, slot, ramp,
                        bev.floor_height_raster(levels, grid),
-                       clearance.astype(np.float32))
+                       clearance.astype(np.float32), headroom)

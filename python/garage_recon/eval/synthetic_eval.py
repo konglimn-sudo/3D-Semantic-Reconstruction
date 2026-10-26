@@ -196,6 +196,35 @@ def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
             "inferred": int(sum(p.get("inferred", False) for p in pred))}
 
 
+# --------------------------------------------------------------- arrows
+def eval_arrows(pred: list[dict], gt: list[dict], gate: float = 1.0) -> dict:
+    """Arrows matched by centre (within `gate` m, same level); direction
+    correct when within 10 deg of the painted one."""
+    tp, direction_ok, centre_errors = 0, 0, []
+    used = set()
+    for g in gt:
+        centre = (np.asarray(g["tail"]) + np.asarray(g["tip"])) / 2
+        best, best_index = gate, -1
+        for i, p in enumerate(pred):
+            if i in used or p["level"] != g["level"]:
+                continue
+            d = float(np.linalg.norm(np.asarray(p["center"]) - centre))
+            if d < best:
+                best, best_index = d, i
+        if best_index < 0:
+            continue
+        used.add(best_index)
+        tp += 1
+        centre_errors.append(best)
+        direction_ok += float(np.dot(pred[best_index]["direction"],
+                                     g["direction"])) > np.cos(np.radians(10))
+    return {"gt": len(gt), "pred": len(pred), "tp": tp,
+            **_precision_recall(tp, len(pred), len(gt)),
+            "direction_correct": direction_ok / tp if tp else None,
+            "centre_err_median": (float(np.median(centre_errors))
+                                  if centre_errors else None)}
+
+
 # -------------------------------------------------------------- objects
 def eval_static_vehicles(tracks: list[dict], parked: list[dict],
                          gate: float = 1.5) -> dict:
@@ -313,6 +342,10 @@ def evaluate(work_dir: str | pathlib.Path, gt_dir: str | pathlib.Path,
         report["markings"] = eval_markings(
             json.loads((semantics / "markings.json").read_text()),
             scene["lines"])
+    if (semantics / "arrows.json").exists() and scene.get("arrows"):
+        report["arrows"] = eval_arrows(
+            json.loads((semantics / "arrows.json").read_text()),
+            scene["arrows"])
     if (semantics / "slots.json").exists():
         report["slots"] = eval_slots(
             json.loads((semantics / "slots.json").read_text()), scene["slots"])
