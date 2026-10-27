@@ -10,14 +10,13 @@ The semantic classes then split the obstacles into layers: permanent
 structure (walls, columns, barriers, unclassified objects), hanging structure
 inside the vehicle's height band (pipes, beams, signs), parked vehicles at
 capture time, and low objects the vehicle may cross (speed bumps, wheel
-stoppers). The rasterisation and distance transform are C++.
+stoppers). The layers are computed in C++ (gr/nav/layers.h).
 """
 
 from __future__ import annotations
 
 import dataclasses
 
-import cv2
 import numpy as np
 
 from garage_recon import _core
@@ -120,12 +119,13 @@ def _ids(names) -> list[int]:
 def fill_polygon(shape: tuple[int, int], grid: bev.BevGrid, polygon,
                  image: np.ndarray | None = None, value: int = 1
                  ) -> np.ndarray:
-    """Rasterises a world polygon (cells whose centre is inside)."""
+    """Rasterises a world polygon into `image` (int32, filled in place) as
+    cv2.fillPoly does with its cell coordinates (C++)."""
     image = np.zeros(shape, np.int32) if image is None else image
-    pixels = (np.asarray(polygon, float)[:, :2] - [grid.x0, grid.y0]) / (
-        grid.res) - 0.5
-    cv2.fillPoly(image, [np.round(pixels * 16).astype(np.int32)], int(value),
-                 lineType=cv2.LINE_8, shift=4)
+    if image.dtype != np.int32 or not image.flags.c_contiguous:
+        raise ValueError("fill_polygon fills a C-contiguous int32 image")
+    _core.fill_polygon(image, np.asarray(polygon, float)[:, :2], grid.x0,
+                       grid.y0, grid.res, int(value))
     return image
 
 
@@ -134,21 +134,30 @@ def fill_holes(known: np.ndarray, obstacles: np.ndarray, grid: bev.BevGrid,
     """`known` with enclosed unobserved patches smaller than `max_area` (m2)
     added: floor hidden behind parked cars or between sparse scan lines. An
     obstacle there would have left points in the height band; larger or
-    open unknown areas stay unknown."""
-    unknown = (~(known | obstacles)).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(unknown, 8)
-    h, w = known.shape
-    small = np.zeros(count, bool)
-    for k in range(1, count):
-        x, y, bw, bh, area = stats[k]
-        touches = x == 0 or y == 0 or x + bw == w or y + bh == h
-        small[k] = not touches and area * grid.res ** 2 < max_area
-    return known | small[labels]
+    open unknown areas stay unknown (C++)."""
+    return _core.fill_holes(known, obstacles, grid.res, max_area)
+
+
+def layer_config(cfg) -> _core.LayerConfig:
+    """The `nav` settings of the layers."""
+    nav, vehicle = cfg.nav, cfg.nav.vehicle
+    config = _core.LayerConfig()
+    config.floor_tolerance = float(nav.floor_tolerance)
+    config.obstacle_min_height = float(nav.obstacle_min_height)
+    config.obstacle_min_points = int(nav.obstacle_min_points)
+    config.min_cell_observations = float(nav.min_cell_observations)
+    config.max_headroom = float(nav.get("max_headroom", 8.0))
+    config.floor_closing = int(nav.floor_closing)
+    config.max_hole_area = float(nav.max_hole_area)
+    config.vehicle_height = float(vehicle.height)
+    config.vehicle_top_margin = float(vehicle.top_margin)
+    config.vehicle_width = float(vehicle.width)
+    return config
 
 
 def level_layers(point_map, labels: np.ndarray, levels, slots, path_xy,
                  grid: bev.BevGrid, cfg) -> LevelLayers:
-    """Layers of one level.
+    """Layers of one level (C++ ComputeLevelLayers).
 
     Args:
         point_map: Point map with height, level, dynamic and normals.
@@ -159,91 +168,18 @@ def level_layers(point_map, labels: np.ndarray, levels, slots, path_xy,
         grid: The level grid.
         cfg: Configuration (`nav` section).
     """
-    nav = cfg.nav
-    vehicle = nav.vehicle
-    shape = (grid.height, grid.width)
-    args = (grid.x0, grid.y0, grid.res, grid.width, grid.height)
-    xy = np.ascontiguousarray(point_map.xyz[:, :2])
-
-    def count(mask: np.ndarray) -> np.ndarray:
-        return _core.rasterize(xy[mask], np.ones(int(mask.sum())), *args,
-                               "count", 0.0)
-
-    selected = (point_map.level == grid.level) & ~np.asarray(
-        point_map.dynamic, bool)
-    height = np.nan_to_num(point_map.height, nan=-10.0)
-    nz = (np.abs(point_map.normals[:, 2]) if point_map.normals is not None
-          else np.ones(len(height)))
-    floor_points = (selected & (np.abs(height) < nav.floor_tolerance)
-                    & (nz > 0.7))
-    top = vehicle.height + vehicle.top_margin
-    band = selected & (height > nav.obstacle_min_height) & (height < top)
-    vehicles = np.isin(labels, _ids(VEHICLE_CLASSES))
-    low_points = selected & np.isin(labels, _ids(LOW_CLASSES))
-    structure_points = band & ~vehicles & ~low_points
-    min_points = int(nav.obstacle_min_points)
-    unclassified = structure_points & (labels == taxonomy.UNLABELED)
-    structure = count(structure_points & ~unclassified) >= min_points
-    # Unclassified points must add up to `min_cell_observations` fused
-    # observations per cell: a static object is seen in many sweeps,
-    # remnants of moving objects and noise in one or two.
-    observations = (np.asarray(point_map.observations, float)
-                    if point_map.observations is not None
-                    else np.full(len(labels), float(nav.min_cell_observations)))
-    structure |= _core.rasterize(
-        xy[unclassified], observations[unclassified], *args, "sum",
-        0.0) >= nav.min_cell_observations
-    overhead = structure & (count(
-        structure_points & np.isin(labels, _ids(OVERHEAD_CLASSES))
-        & (height > 0.5)) >= min_points)
-    parked = (count(band & vehicles) >= min_points) & ~structure
-    low = count(low_points) >= min_points
-    # Headroom: what hangs over the band the vehicle occupies (lower
-    # objects are obstacles already), unclassified points filtered by their
-    # observations as above.
-    above = (selected & (height >= top)
-             & (height < nav.get("max_headroom", 8.0)) & ~vehicles)
-    above_unclassified = above & (labels == taxonomy.UNLABELED)
-
-    def lowest(mask: np.ndarray) -> np.ndarray:
-        return _core.rasterize(xy[mask], height[mask].astype(np.float64),
-                               *args, "min", np.inf)
-
-    headroom = lowest(above & ~above_unclassified)
-    seen = _core.rasterize(
-        xy[above_unclassified], observations[above_unclassified], *args,
-        "sum", 0.0) >= nav.min_cell_observations
-    headroom = np.where(seen, np.minimum(headroom, lowest(above_unclassified)),
-                        headroom).astype(np.float32)
-
-    k = int(nav.floor_closing)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1,) * 2)
-    floor = cv2.morphologyEx((count(floor_points) > 0).astype(np.uint8),
-                             cv2.MORPH_CLOSE, kernel) > 0
-
-    driven = np.zeros(shape, bool)
-    if path_xy is not None and len(path_xy):
-        hits = _core.rasterize(np.ascontiguousarray(path_xy[:, :2]),
-                               np.ones(len(path_xy)), *args, "count", 0.0) > 0
-        r = max(1, int(np.ceil(0.5 * vehicle.width / grid.res)))
-        disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)
-        driven = cv2.dilate(hits.astype(np.uint8), disc) > 0
-
-    slot = np.zeros(shape, np.int32)
-    for index, s in enumerate(slots):
-        if s.level == grid.level:
-            fill_polygon(shape, grid, s.corners, slot, index + 1)
-    ramp = np.zeros(shape, np.int32)
-    for r in levels.ramps:
-        if grid.level in (r.level_from, r.level_to):
-            fill_polygon(shape, grid, r.polygon, ramp)
-    ramp = ramp > 0
-
-    known = fill_holes(floor | driven | ramp, structure | parked, grid,
-                       nav.max_hole_area)
-    blocked = structure | parked | ~known
-    clearance = _core.distance_transform(blocked.astype(np.uint8)) * grid.res
-    return LevelLayers(grid, known & ~(driven | ramp), driven, structure,
-                       overhead, parked, low, slot, ramp,
-                       bev.floor_height_raster(levels, grid),
-                       clearance.astype(np.float32), headroom)
+    level_slots = [(index, np.asarray(s.corners, float))
+                   for index, s in enumerate(slots) if s.level == grid.level]
+    path = (None if path_xy is None or not len(path_xy)
+            else np.asarray(path_xy, float)[:, :2])
+    out = _core.level_layers(
+        point_map.xyz, point_map.level, point_map.dynamic, point_map.height,
+        point_map.normals, np.asarray(labels, np.uint8),
+        point_map.observations, _ids(VEHICLE_CLASSES), _ids(LOW_CLASSES),
+        _ids(OVERHEAD_CLASSES), taxonomy.UNLABELED, *levels.core_parts(),
+        grid.level, level_slots, path, grid.x0, grid.y0, grid.res,
+        grid.width, grid.height, layer_config(cfg))
+    return LevelLayers(grid, out["floor"], out["driven"], out["structure"],
+                       out["overhead"], out["parked"], out["low"],
+                       out["slot"], out["ramp"], out["floor_z"],
+                       out["clearance"], out["headroom"])

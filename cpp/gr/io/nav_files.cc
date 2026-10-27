@@ -82,6 +82,84 @@ std::vector<NavSlot> ReadNavSlots(const std::string& goals_json) {
   return out;
 }
 
+std::vector<SlotGeometry> ReadSlotGeometry(const std::string& goals_json) {
+  const Value goals = ReadJsonFile(goals_json);
+  std::vector<SlotGeometry> out;
+  for (const Value& g : goals["goals"].items()) {
+    if (g.Find("corners") == nullptr || g["corners"].size() != 4) continue;
+    SlotGeometry slot;
+    slot.slot_id = g["slot_id"].AsString();
+    slot.level = g["level"].AsInt();
+    const std::vector<Vec2> corners = PointsXy(g["corners"]);
+    std::copy(corners.begin(), corners.end(), slot.corners.begin());
+    slot.z = g["park"]["xyz"][2].AsDouble();
+    out.push_back(slot);
+  }
+  return out;
+}
+
+Value ChangesValue(const std::vector<MapChange>& changes, int sweeps) {
+  const auto vec = [](const Vec3& v) {
+    Value out = Value::List();
+    for (int k = 0; k < 3; ++k) out.Append(Value::Number(Round(v[k], 2)));
+    return out;
+  };
+  Value list = Value::List();
+  int added = 0;
+  int blocking = 0;
+  for (const MapChange& c : changes) {
+    added += c.cluster.added;
+    blocking += c.cluster.added && !c.edges.empty();
+    Value item = Value::Map();
+    item.Set("kind", Value::String(c.cluster.added ? "added" : "removed"));
+    item.Set("level", c.level ? Value::Integer(*c.level) : Value());
+    item.Set("center", vec(c.cluster.center));
+    item.Set("min", vec(c.cluster.min));
+    item.Set("max", vec(c.cluster.max));
+    item.Set("voxels", Value::Integer(c.cluster.voxels));
+    Value edges = Value::List();
+    for (int e : c.edges) edges.Append(Value::Integer(e));
+    item.Set("edges", edges);
+    list.Append(item);
+  }
+  Value summary = Value::Map();
+  summary.Set("sweeps", Value::Integer(sweeps));
+  summary.Set("added", Value::Integer(added));
+  summary.Set("removed",
+              Value::Integer(static_cast<long long>(changes.size()) - added));
+  summary.Set("added_on_routes", Value::Integer(blocking));
+  Value out = Value::Map();
+  out.Set("summary", summary);
+  out.Set("changes", list);
+  return out;
+}
+
+Value SlotStatesValue(const std::vector<SlotGeometry>& slots,
+                      const SlotStateTracker& tracker) {
+  static const char* const kState[] = {"unknown", "free", "occupied"};
+  Value list = Value::List();
+  int counts[3] = {0, 0, 0};
+  for (size_t k = 0; k < slots.size(); ++k) {
+    const SlotStateTracker::Entry& e = tracker.entries()[k];
+    ++counts[static_cast<int>(e.state)];
+    Value slot = Value::Map();
+    slot.Set("slot_id", Value::String(slots[k].slot_id));
+    slot.Set("level", Value::Integer(slots[k].level));
+    slot.Set("state", Value::String(kState[static_cast<int>(e.state)]));
+    slot.Set("stamp", e.state == SlotState::kUnknown
+                          ? Value()
+                          : Value::Number(Round(e.stamp, 3)));
+    slot.Set("observations", Value::Integer(e.observations));
+    list.Append(slot);
+  }
+  Value summary = Value::Map();
+  for (int s = 0; s < 3; ++s) summary.Set(kState[s], Value::Integer(counts[s]));
+  Value out = Value::Map();
+  out.Set("summary", summary);
+  out.Set("slots", list);
+  return out;
+}
+
 std::vector<FloorHeights> ReadFloorHeights(const std::string& nav_dir) {
   static const std::regex kName("level_.*_layers\\.npz");
   std::vector<std::string> paths;

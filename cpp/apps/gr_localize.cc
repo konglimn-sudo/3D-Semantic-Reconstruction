@@ -4,7 +4,7 @@
 //   gr_localize --nav <work>/semantics/nav --trip <trip> --out <dir>
 //               [--config a.yaml [--config b.yaml ...]]
 //               [--prior none|entrance|reference [--reference poses.tum]]
-//               [--stride N] [--start S]
+//               [--stride N] [--start S] [--changes]
 //
 // Priors: none (global initialization), entrance (the trip's INS pose at the
 // entrance) or reference (a TUM trajectory, map <- vehicle, at the first
@@ -14,13 +14,18 @@
 // default_config.yaml first. Without --config the reconstruction's
 // <work>/config.used.yaml is used. Writes poses.tum, sweeps.csv and
 // localization.json as nav/localize.py does (without the errors against a
-// reference, which the Python evaluation adds).
+// reference, which the Python evaluation adds), and slot_states.json: the
+// live occupancy of the slots the vehicle saw (gr/nav/slot_state.h). With
+// --changes also changes.json: the structural changes against the map and
+// the route edges they reach (gr/mapping/change_detection.h,
+// gr/nav/map_update.h).
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,7 +34,10 @@
 #include "gr/io/nav_files.h"
 #include "gr/io/tables.h"
 #include "gr/io/trip.h"
+#include "gr/mapping/change_detection.h"
+#include "gr/nav/map_update.h"
 #include "gr/nav/position.h"
+#include "gr/nav/slot_state.h"
 #include "gr/nav/trip_localizer.h"
 
 namespace {
@@ -45,13 +53,14 @@ struct Args {
   std::string reference;
   int stride = 1;
   double start = 0.0;
+  bool changes = false;
 };
 
 [[noreturn]] void Usage(const std::string& error) {
   std::fprintf(stderr,
                "%s\nusage: gr_localize --nav DIR --trip DIR --out DIR "
                "[--config FILE ...] [--prior none|entrance|reference] "
-               "[--reference TUM] [--stride N] [--start S]\n",
+               "[--reference TUM] [--stride N] [--start S] [--changes]\n",
                error.c_str());
   std::exit(2);
 }
@@ -60,6 +69,10 @@ Args Parse(int argc, char** argv) {
   Args args;
   for (int k = 1; k < argc; ++k) {
     const std::string flag = argv[k];
+    if (flag == "--changes") {
+      args.changes = true;
+      continue;
+    }
     if (k + 1 >= argc) Usage("missing value of " + flag);
     const std::string value = argv[++k];
     if (flag == "--nav") {
@@ -145,12 +158,37 @@ int Run(const Args& args) {
       LevelledStart(trip.ImuSamplesInVehicle(), trip.lidar_stamp(first),
                     trip_config.level_window),
       std::move(prior), map_from_vehicle, Log);
+  // Live slot occupancy from the localized sweeps.
+  const fs::path goals = fs::path(args.nav) / "goals.json";
+  const std::vector<SlotGeometry> slots =
+      fs::exists(goals) ? ReadSlotGeometry(goals.string())
+                        : std::vector<SlotGeometry>();
+  const SlotStateConfig slot_config =
+      SlotStateConfigFrom(config);
+  SlotStateTracker slot_states(slots.size(), slot_config);
+  std::optional<ChangeDetector> changes;
+  if (args.changes) changes.emplace(map, ChangeConfigFrom(config));
   const size_t n = stamps_ns.size();
   for (size_t k = first; k < n; ++k) {
     const LidarSweep sweep = trip.LoadLidar(k);
-    localizer.Process(sweep.points, sweep.intensity, sweep.time, sweep.stamp,
-                      static_cast<int>(k), k == n - 1,
-                      (k - first) % static_cast<size_t>(args.stride) == 0);
+    const std::optional<SweepLocalization> s = localizer.Process(
+        sweep.points, sweep.intensity, sweep.time, sweep.stamp,
+        static_cast<int>(k), k == n - 1,
+        (k - first) % static_cast<size_t>(args.stride) == 0);
+    if (!s || !s->result.registered ||
+        s->result.status != LocalizationStatus::kTracking) {
+      continue;
+    }
+    const Points in_map =
+        TransformPoints(localizer.last_sweep(), s->result.pose);
+    if (!slots.empty()) {
+      slot_states.Update(s->stamp,
+                         ObserveSlots(in_map, s->result.pose.translation,
+                                      slots, slot_config));
+    }
+    if (changes) {
+      changes->AddSweep(in_map, s->result.pose.translation, s->stamp);
+    }
   }
   const TripLocalizationSummary summary = localizer.Summary();
   Value report = Value::Map();
@@ -175,6 +213,28 @@ int Run(const Args& args) {
                    ReadNavEdges((nav / "graph.json").string()),
                    ReadNavSlots((nav / "goals.json").string()),
                    ReadFloorHeights(args.nav))));
+  }
+  if (changes) {
+    const fs::path nav(args.nav);
+    const Value found = ChangesValue(
+        AssessChanges(changes->Clusters(),
+                      ReadNavEdges((nav / "graph.json").string()),
+                      ReadNavSlots((nav / "goals.json").string()),
+                      ReadFloorHeights(args.nav), CorridorHalfWidth(config)),
+        changes->sweeps());
+    report.Set("changes", found["summary"]);
+    fs::create_directories(args.out);
+    std::ofstream file(fs::path(args.out) / "changes.json");
+    file << ToJson(found, 1);
+    if (!file) throw std::runtime_error("cannot write changes.json");
+  }
+  if (!slots.empty()) {
+    const Value states = SlotStatesValue(slots, slot_states);
+    report.Set("slot_states", states["summary"]);
+    fs::create_directories(args.out);
+    std::ofstream file(fs::path(args.out) / "slot_states.json");
+    file << ToJson(states, 1);
+    if (!file) throw std::runtime_error("cannot write slot_states.json");
   }
   WriteLocalizationResult(args.out, sweeps, report);
   Log(StringPrintf(

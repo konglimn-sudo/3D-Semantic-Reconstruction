@@ -21,6 +21,7 @@
 #include "gr/core/logging.h"
 #include "gr/core/pose.h"
 #include "gr/core/types.h"
+#include "gr/mapping/levels.h"
 #include "gr/sensors/exposure.h"
 
 namespace gr::bindings {
@@ -77,6 +78,24 @@ pybind11::array_t<double> PosesToArray(const std::vector<Pose>& poses);
 // world_from_camera, or camera_from_world when `camera_from_world` is set.
 CameraExposure ExposureFrom(const pybind11::object& poses, int height,
                             bool camera_from_world);
+
+// The level model from the Python LevelModel's parts (levels.py): floor
+// heights, (x0, y0, res, z (H, W)) grids (z as float32) and (level_from,
+// level_to, plane, polygon, slope) ramps.
+LevelModel LevelModelFrom(const std::vector<double>& z,
+                          const pybind11::list& grids,
+                          const pybind11::list& ramps);
+
+// A 1-D numpy array (any real dtype, None -> empty) as std::vector<T>.
+template <typename T>
+std::vector<T> VectorOf(const pybind11::object& values) {
+  if (values.is_none()) return {};
+  const auto array =
+      pybind11::array_t<T, pybind11::array::c_style |
+                               pybind11::array::forcecast>::ensure(values);
+  Require(static_cast<bool>(array), "a numeric array expected");
+  return std::vector<T>(array.data(), array.data() + array.size());
+}
 
 // Adapts a Python callable (or None) to a gr::Logger. Each call takes the GIL,
 // so stages may run with the GIL released. Python exceptions are kept out of

@@ -8,7 +8,11 @@ parallel to its entrance line:
 
     facing rows   rows of the same level whose entrances face each other
                   `min_aisle`..`max_aisle` apart: the lane runs midway;
-    single row    `lane_offset` in front of the entrance line.
+    single row    `lane_offset` in front of the entrance line;
+    walls         in open areas (free ground `wall_open_width` beyond the
+                  lane), `wall_offset` from long walls' faces;
+    drives        long straight stretches of the survey drives (an open lot
+                  without walls).
 
 Lane pieces must keep the clearance of the aisle graph (drivable, outside
 slots and ramps, half the vehicle width plus the margin from obstacles).
@@ -38,9 +42,15 @@ def lane_config(cfg) -> _core.LaneConfig:
 
 
 def _navigable(layers, cfg) -> np.ndarray:
+    """Cells a lane may use: drivable with the vehicle's clearance, off the
+    ramps, and outside slots unless the survey vehicle drove there (a slot
+    detected on an aisle, or an empty slot crossed)."""
     nav = cfg.nav
     half = 0.5 * nav.vehicle.width + nav.vehicle.margin
-    return (layers.drivable & (layers.slot == 0) & ~layers.ramp
+    off_slots = layers.slot == 0
+    if layers.driven is not None:
+        off_slots = off_slots | layers.driven
+    return (layers.drivable & off_slots & ~layers.ramp
             & (layers.clearance >= half))
 
 
@@ -57,15 +67,20 @@ def _merge(graph: graph_lib.NavGraph, keep: int, drop: int) -> None:
             edge.points[-1] = graph.nodes[keep]
 
 
-def add_level_lanes(graph: graph_lib.NavGraph, layers, slots, cfg) -> dict:
-    """Lanes of one level's slot rows into its graph (lane geometry: C++
-    PlanLanes / CoveredByLanes); returns a report."""
+def add_level_lanes(graph: graph_lib.NavGraph, layers, slots, cfg,
+                    walls=(), drives=()) -> dict:
+    """Lanes of one level's slot rows and of its walls in open areas into
+    its graph (lane geometry: C++ PlanLanes / CoveredByLanes); returns a
+    report."""
     lanes_cfg = cfg.nav.lanes
     level = layers.grid.level
-    report = {"rows": 0, "lanes": 0, "lane_length_m": 0.0,
-              "replaced_edges": 0, "links": 0}
+    report = {"rows": 0, "walls": 0, "drives": 0, "lanes": 0,
+              "lane_length_m": 0.0, "replaced_edges": 0, "links": 0}
     slots = [s for s in slots if s.level == level]
-    if not lanes_cfg.get("enabled", True) or not slots:
+    walls = [w for w in walls if w.level == level]
+    drives = [np.ascontiguousarray(xy[:, :2], float)
+              for lv, xy in drives if lv == level and len(xy) >= 2]
+    if not lanes_cfg.get("enabled", True) or not (slots or walls or drives):
         return report
     config = lane_config(cfg)
     skeleton = [np.ascontiguousarray(e.points[:, :2], float)
@@ -75,8 +90,12 @@ def add_level_lanes(graph: graph_lib.NavGraph, layers, slots, cfg) -> dict:
         [(s.row, np.asarray(s.corners, float), float(s.z), float(s.width))
          for s in slots],
         np.ascontiguousarray(_navigable(layers, cfg), np.uint8),
-        layers.grid.x0, layers.grid.y0, layers.grid.res, skeleton, config)
+        layers.grid.x0, layers.grid.y0, layers.grid.res, skeleton, config,
+        [(np.asarray(w.p0, float)[:2], np.asarray(w.p1, float)[:2],
+          float(w.thickness)) for w in walls], drives)
     report["rows"] = plan["rows"]
+    report["walls"] = plan["walls"]
+    report["drives"] = plan["drives"]
     if plan["followed"]:
         report["followed"] = plan["followed"]
     lanes = [np.asarray(l, float) for l in plan["lanes"]]

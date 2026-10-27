@@ -11,15 +11,30 @@
 #include <utility>
 #include <vector>
 
+#include "gr/backend/backend.h"
+#include "gr/calibration/lidar_imu.h"
 #include "gr/io/value.h"
+#include "gr/mapping/change_detection.h"
+#include "gr/mapping/levels.h"
+#include "gr/mapping/static_map.h"
+#include "gr/nav/slot_state.h"
 #include "gr/nav/trip_localizer.h"
 
 namespace gr {
 
-// The files deep-merged in order (later ones override).
+// The files deep-merged in order (later ones override); the first is the
+// defaults, the others the user's files (for ApplyImuGrade).
 Value LoadConfig(const std::vector<std::string>& paths);
 
-// Field name -> member of a config struct.
+// The settings of the IMU grade (`imu_grades[imu_grade]`) where `user` does
+// not set them; marks the result `imu_grade_applied` so that a saved,
+// resolved configuration is not changed again (config.apply_imu_grade).
+Value ApplyImuGrade(const Value& config, const Value& user);
+
+// Field name -> member of a config struct. The tables of the config structs
+// (config_tables.inc) are generated from the pybind11 bindings by
+// tools/gen_config_tables.py, so a section fills a struct here exactly as
+// core_config.fill does in Python.
 template <typename T>
 class FieldTable {
  public:
@@ -69,6 +84,20 @@ OdometryConfig OdometryConfigFrom(const Value& config);
 KeyframeConfig KeyframeConfigFrom(const Value& config);
 LocalizerConfig LocalizerConfigFrom(const Value& config);
 TripLocalizerConfig TripLocalizerConfigFrom(const Value& config);
+// nav.slot_states.
+SlotStateConfig SlotStateConfigFrom(const Value& config);
+// nav.changes.
+ChangeConfig ChangeConfigFrom(const Value& config);
+// core_config.graph_config: loops (+ loops.appearance), backend,
+// trip_align, ba, refine.
+GraphStageConfig GraphStageConfigFrom(const Value& config);
+// map.fusion, map.dynamic, levels, calibration.lidar_imu.
+MapFusionConfig MapFusionConfigFrom(const Value& config);
+DynamicConfig DynamicConfigFrom(const Value& config);
+LevelConfig LevelConfigFrom(const Value& config);
+LidarImuConfig LidarImuConfigFrom(const Value& config);
+// Half the width of the vehicle's corridor: nav.vehicle width / 2 + margin.
+double CorridorHalfWidth(const Value& config);
 
 }  // namespace gr
 

@@ -43,46 +43,34 @@ class BevGrid:
 
 
 def level_grid(pm: PointMap, level: int, res: float, margin: float) -> BevGrid:
-    sel = pm.level == level
-    if pm.dynamic is not None:
-        sel &= ~pm.dynamic
-    xy = pm.xyz[sel, :2]
-    lo, hi = xy.min(axis=0) - margin, xy.max(axis=0) + margin
-    return BevGrid(level, float(lo[0]), float(lo[1]), res, int(np.ceil((hi[0] - lo[0]) / res)),
-                   int(np.ceil((hi[1] - lo[1]) / res)))
+    """Bounds of the static points of `level` plus `margin` (C++)."""
+    x0, y0, width, height = _core.level_grid(pm.xyz, pm.level, pm.dynamic,
+                                             level, res, margin)
+    return BevGrid(level, x0, y0, res, width, height)
 
 
 def floor_height_raster(levels: LevelModel, grid: BevGrid) -> np.ndarray:
-    c = grid.centers()
-    z = levels.floor_z(c, grid.level)
-    for r in levels.ramps:
-        if r.level_from != grid.level:
-            continue
-        inside = r.contains(c)
-        z[inside] = r.z_at(c[inside])
-    return z.reshape(grid.height, grid.width)
+    """(H, W) floor height: the level's floor grid, ramps leaving it
+    downwards by their plane (C++)."""
+    return _core.floor_height_raster(*levels.core_parts(), grid.level, grid.x0,
+                                     grid.y0, grid.res, grid.width,
+                                     grid.height)
 
 
 def level_rasters(pm: PointMap, levels: LevelModel, grid: BevGrid, cfg) -> dict[str, np.ndarray]:
+    """Floor intensity / observations, highest object on the floor and the
+    floor height of a level (C++ LevelRasters). Objects stand between the
+    floor tolerance and `object_max_height`: the ceiling and the services
+    below it must not count, or every floor cell under an observed ceiling
+    looks covered."""
     bc = cfg.bev
-    sel = pm.level == grid.level
-    if pm.dynamic is not None:
-        sel &= ~pm.dynamic
-    xy, h = pm.xyz[sel, :2], pm.height[sel]
-    nz = pm.normals[sel, 2] if pm.normals is not None else np.ones(sel.sum())
-    args = (grid.x0, grid.y0, grid.res, grid.width, grid.height)
-    floor = (np.abs(h) < bc.floor_tolerance) & (nz > 0.7)
-    # Objects standing on the floor (cars, columns, walls): the ceiling and
-    # the services below it must not count, or every floor cell under an
-    # observed ceiling looks covered.
-    objects = (h > bc.floor_tolerance) & (h < bc.get("object_max_height", 2.2))
-    out = {
-        "intensity": _core.rasterize(xy[floor], pm.intensity[sel][floor].astype(float), *args, "mean", np.nan),
-        "floor_count": _core.rasterize(xy[floor], np.ones(floor.sum()), *args, "count", 0.0),
-        "height_max": _core.rasterize(xy[objects], h[objects].astype(float), *args, "max", np.nan),
-        "floor_z": floor_height_raster(levels, grid),
-    }
-    return out
+    out = _core.bev_rasters(
+        pm.xyz, pm.intensity, pm.level, pm.dynamic, pm.height, pm.normals,
+        *levels.core_parts(), grid.level, grid.x0, grid.y0, grid.res,
+        grid.width, grid.height, float(bc.floor_tolerance),
+        float(bc.get("object_max_height", 2.2)))
+    return {k: out[k] for k in ("intensity", "floor_count", "height_max",
+                                 "floor_z")}
 
 
 def save_bev(path: Path, grid: BevGrid, rasters: dict[str, np.ndarray]) -> None:

@@ -45,6 +45,23 @@ def _origin(recon, levels, cfg) -> tuple[np.ndarray, int]:
     return xyz, level
 
 
+def _drives(recon, levels) -> list[tuple[int, np.ndarray]]:
+    """The survey drives as (level, (N, 2) xy) pieces in time order, split
+    where a trip changes level."""
+    out = []
+    for data in recon.datasets:
+        path = recon.vehicle_poses(data)[1][:, :3, 3]
+        level, _, _ = levels.assign(path + np.array([0.0, 0.0, 0.1]))
+        start = 0
+        for k in range(1, len(level) + 1):
+            if k < len(level) and level[k] == level[start]:
+                continue
+            if level[start] >= 0 and k - start >= 2:
+                out.append((int(level[start]), path[start:k, :2]))
+            start = k
+    return out
+
+
 def build(semantics, cfg, log=print) -> dict:
     """Writes the navigation map and returns the QA report."""
     recon = semantics.recon
@@ -63,11 +80,15 @@ def build(semantics, cfg, log=print) -> dict:
         grid = bev.level_grid(point_map, level, cfg.nav.res, cfg.nav.margin)
         layers_by_level[level] = layers_lib.level_layers(
             point_map, labels, levels, slots, paths.get(level), grid, cfg)
+    walls = (semantics.structure()[2]
+             if (semantics.out / "structure.json").exists() else [])
+    drives = _drives(recon, levels)
     graph, lane_reports = graph_lib.build_graph(layers_by_level, levels, cfg,
-                                                log, slots)
+                                                log, slots, walls, drives)
     path = semantics.out / "landmarks.json"
     landmarks = json.loads(path.read_text()) if path.exists() else []
-    traffic_report = traffic.apply_arrows(graph, semantics.arrows(), cfg, log)
+    traffic_report = traffic.apply_arrows(graph, semantics.arrows(), cfg, log,
+                                          drives, landmarks)
     poi_distance = float(cfg.nav.get("poi_max_distance", 15.0))
     height_signs = attributes.apply_height_signs(graph, landmarks,
                                                  poi_distance)
@@ -77,9 +98,15 @@ def build(semantics, cfg, log=print) -> dict:
     goals = goals_lib.add_slot_goals(graph, layers_by_level, slots, cfg)
     pois = attributes.points_of_interest(graph, landmarks, origin,
                                          poi_distance)
+    names = address.level_names(levels.n, cfg)
+    pois += attributes.ramp_pois(graph, names)
+    feature_pois, features_report = attributes.road_features(
+        graph, point_map, labels, cfg)
+    pois += feature_pois
     # Every edge exists now (connectors included).
     attributes.annotate_headroom(graph, layers_by_level, cfg)
-    names = address.level_names(levels.n, cfg)
+    sign_attributes = attributes.attach_sign_attributes(
+        goals, landmarks, float(cfg.nav.get("attribute_sign_distance", 3.0)))
     address.assign_zones(goals, cfg, landmarks)
     for goal in goals:
         goal["level_name"] = names[goal["level"]]
@@ -94,6 +121,10 @@ def build(semantics, cfg, log=print) -> dict:
     report["height_signs"] = height_signs
     report["pois"] = {k: sum(p["kind"] == k for p in pois)
                       for k in sorted({p["kind"] for p in pois})}
+    report["road_features"] = features_report
+    report["slot_attributes"] = dict(collections.Counter(
+        a for g in goals for a in g.get("attributes", [])))
+    report["slot_attributes_from_signs"] = sign_attributes
     limits = [e.height_limit for e in graph.edges
               if e.kind != "connector" and e.height_limit is not None]
     report["min_headroom_m"] = round(min(limits), 2) if limits else None

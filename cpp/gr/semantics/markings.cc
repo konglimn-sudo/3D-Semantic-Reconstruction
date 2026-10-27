@@ -87,7 +87,7 @@ std::vector<MarkingSegment> VectorizeMarkings(
   GR_CHECK(given_skeleton.empty() || given_skeleton.size() == mask.size());
   const double res = frame.res;
   const Mask skeleton = given_skeleton.empty()
-                            ? ThinMask(mask, width, height)
+                            ? Skeletonize(mask, width, height)
                             : given_skeleton;
   // Junctions: skeleton cells with three or more skeleton neighbours; the
   // branches are what is left away from them.

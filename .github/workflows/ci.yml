@@ -1,0 +1,92 @@
+# Build, tests and packaging on every push and pull request.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (GCC, C++ and Python tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev zlib1g-dev ninja-build
+      - name: Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy pyyaml opencv-python-headless shapely \
+            pytest pybind11
+      - name: Generated config tables are current
+        run: python tools/gen_config_tables.py --check
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja -DPython_EXECUTABLE="$(which python)"
+          cmake --build build
+      - name: C++ tests
+        run: ./build/gr_tests
+      - name: Python tests
+        run: pytest -q
+      - name: Package the programs
+        run: cd build && cpack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: garage-recon-linux
+          path: |
+            build/garage-recon-*.tar.gz
+            build/garage-recon-*.deb
+
+  macos:
+    name: macOS (Apple clang, C++ tests)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Homebrew packages
+        run: brew install eigen libomp ninja
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja -DGR_BUILD_PYTHON=OFF
+          cmake --build build
+      - name: C++ tests
+        run: ./build/gr_tests
+
+  wheel:
+    name: Python wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y libeigen3-dev
+      - name: Build the wheel
+        run: pip wheel . --no-deps -w dist
+      - name: Install and import it
+        run: |
+          pip install dist/*.whl
+          cd /tmp
+          python -c "import garage_recon._core as c; print(c.__file__)"
+          garage-recon --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: garage-recon-wheel
+          path: dist/*.whl
+
+  docker:
+    name: Docker image (gr_localize, gr_recon)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -f docker/Dockerfile -t garage-recon .
+      - name: Smoke test
+        run: |
+          docker run --rm garage-recon gr_recon 2>&1 | grep -q usage
+          docker run --rm garage-recon gr_localize 2>&1 | grep -q usage

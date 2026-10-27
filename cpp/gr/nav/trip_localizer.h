@@ -80,6 +80,9 @@ class TripLocalizer {
 
   const std::vector<SweepLocalization>& sweeps() const { return sweeps_; }
   const Localizer& localizer() const { return localizer_; }
+  // The motion-compensated sweep of the last localized sweep (sensor frame,
+  // cropped and downsampled by the odometry).
+  const Points& last_sweep() const { return last_sweep_; }
   TripLocalizationSummary Summary() const;
 
  private:
@@ -90,6 +93,7 @@ class TripLocalizer {
   Logger log_;
   int attempts_ = 0;
   std::vector<SweepLocalization> sweeps_;
+  Points last_sweep_;
 };
 
 }  // namespace gr

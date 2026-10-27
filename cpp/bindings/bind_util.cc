@@ -179,4 +179,45 @@ void RethrowIfSet(const std::exception_ptr& error) {
   if (error) std::rethrow_exception(error);
 }
 
+// The level model from the Python LevelModel's parts.
+LevelModel LevelModelFrom(const std::vector<double>& z,
+                          const py::list& grids, const py::list& ramps) {
+  LevelModel model;
+  model.z = z;
+  for (const py::handle& item : grids) {
+    const py::tuple t = item.cast<py::tuple>();
+    Require(t.size() == 4, "grids are (x0, y0, res, z) tuples");
+    FloorGrid grid;
+    grid.x0 = t[0].cast<double>();
+    grid.y0 = t[1].cast<double>();
+    grid.res = t[2].cast<double>();
+    const auto values =
+        py::array_t<float, py::array::c_style |
+                               py::array::forcecast>::ensure(t[3]);
+    Require(values && values.ndim() == 2, "a grid is an (H, W) array");
+    Require(grid.res > 0.0, "grid res must be positive");
+    grid.height = static_cast<int>(values.shape(0));
+    grid.width = static_cast<int>(values.shape(1));
+    grid.z.assign(values.data(), values.data() + values.size());
+    model.grids.push_back(std::move(grid));
+  }
+  for (const py::handle& item : ramps) {
+    const py::tuple t = item.cast<py::tuple>();
+    Require(t.size() == 5,
+            "ramps are (level_from, level_to, plane, polygon, slope) tuples");
+    Ramp ramp;
+    ramp.level_from = t[0].cast<int>();
+    ramp.level_to = t[1].cast<int>();
+    ramp.plane = t[2].cast<Vec3>();
+    const RowMatX2d polygon = t[3].cast<RowMatX2d>();
+    for (Eigen::Index k = 0; k < polygon.rows(); ++k) {
+      ramp.polygon.push_back(polygon.row(k).transpose());
+    }
+    ramp.slope = t[4].cast<double>();
+    model.ramps.push_back(std::move(ramp));
+  }
+  return model;
+}
+
+
 }  // namespace gr::bindings

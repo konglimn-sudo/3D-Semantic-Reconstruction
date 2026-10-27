@@ -7,6 +7,7 @@
 #include <tuple>
 
 #include "gr/core/numeric.h"
+#include "gr/nav/nav_map.h"
 
 namespace gr {
 namespace {
@@ -129,13 +130,56 @@ LanePlan PlanLanes(const std::vector<LaneSlot>& slots,
                    const std::vector<uint8_t>& navigable,
                    const RasterFrame& frame,
                    const std::vector<std::vector<Vec2>>& skeleton,
-                   const LaneConfig& config) {
+                   const LaneConfig& config,
+                   const std::vector<LaneWall>& walls,
+                   const std::vector<std::vector<Vec2>>& drives) {
   LanePlan plan;
-  if (slots.empty()) return plan;
-  const std::vector<LaneRow> rows = SlotRows(slots);
-  plan.rows = static_cast<int>(rows.size());
   const double step = frame.res;
-  for (const auto& line : LaneLines(rows, config)) {
+  const auto navigable_at = [&](const Vec2& p) {
+    const int col = static_cast<int>(std::floor((p.x() - frame.x0) / step));
+    const int row = static_cast<int>(std::floor((p.y() - frame.y0) / step));
+    return col >= 0 && row >= 0 && col < frame.width && row < frame.height &&
+           navigable[static_cast<size_t>(row) * frame.width + col] != 0;
+  };
+  // Proposals: slot-row lanes, wall lanes (with the direction away from
+  // their wall), drive stretches.
+  struct Proposal {
+    std::array<Vec2, 2> line;
+    uint8_t source = 0;
+    Vec2 open = Vec2::Zero();
+  };
+  std::vector<Proposal> proposals;
+  if (!slots.empty()) {
+    const std::vector<LaneRow> rows = SlotRows(slots);
+    plan.rows = static_cast<int>(rows.size());
+    for (const auto& line : LaneLines(rows, config)) {
+      proposals.push_back({line, 0, Vec2::Zero()});
+    }
+  }
+  for (const LaneWall& wall : walls) {
+    const Vec2 d = wall.p1 - wall.p0;
+    if (d.norm() < config.min_wall_length) continue;
+    const Vec2 n = Vec2(-d.y(), d.x()) / d.norm();
+    const double offset = 0.5 * wall.thickness + config.wall_offset;
+    for (double side : {1.0, -1.0}) {
+      proposals.push_back({{wall.p0 + side * offset * n,
+                            wall.p1 + side * offset * n},
+                           1, side * n});
+    }
+  }
+  for (const std::vector<Vec2>& drive : drives) {
+    if (drive.size() < 2) continue;
+    const std::vector<Vec2> simple =
+        SimplifyPolyline(drive, config.drive_tolerance);
+    for (size_t k = 0; k + 1 < simple.size(); ++k) {
+      if ((simple[k + 1] - simple[k]).norm() >= config.drive_min_length) {
+        proposals.push_back({{simple[k], simple[k + 1]}, 2, Vec2::Zero()});
+      }
+    }
+  }
+  for (const Proposal& proposal : proposals) {
+    const std::array<Vec2, 2>& line = proposal.line;
+    const bool from_wall = proposal.source == 1;
     const double length = (line[1] - line[0]).norm();
     const int n = std::max(2, static_cast<int>(std::ceil(length / step)) + 1);
     std::vector<Vec2> xy(static_cast<size_t>(n));
@@ -144,12 +188,12 @@ LanePlan PlanLanes(const std::vector<LaneSlot>& slots,
       xy[static_cast<size_t>(k)] =
           line[0] + (line[1] - line[0]) * (static_cast<double>(k) / (n - 1));
       const Vec2& p = xy[static_cast<size_t>(k)];
-      const int col = static_cast<int>(std::floor((p.x() - frame.x0) / step));
-      const int row = static_cast<int>(std::floor((p.y() - frame.y0) / step));
-      const bool inside =
-          col >= 0 && row >= 0 && col < frame.width && row < frame.height;
-      bool keep = inside &&
-                  navigable[static_cast<size_t>(row) * frame.width + col];
+      bool keep = navigable_at(p);
+      // A wall lane needs open ground beyond it.
+      for (double d = 2.0; keep && from_wall && d <= config.wall_open_width;
+           d += 2.0) {
+        keep = navigable_at(p + d * proposal.open);
+      }
       for (const auto& taken : plan.lanes) {
         if (!keep) break;
         keep = SegmentDistance(p, taken[0], taken[1]) >
@@ -171,6 +215,7 @@ LanePlan PlanLanes(const std::vector<LaneSlot>& slots,
       }
       k = end + 1;
     }
+    bool used = false;
     for (const auto& piece : pieces) {
       // The skeleton already runs along it: not needed.
       int near = 0;
@@ -188,7 +233,11 @@ LanePlan PlanLanes(const std::vector<LaneSlot>& slots,
         continue;
       }
       plan.lanes.push_back(piece);
+      plan.source.push_back(proposal.source);
+      used = true;
     }
+    plan.walls += proposal.source == 1 && used;
+    plan.drives += proposal.source == 2 && used;
   }
   return plan;
 }

@@ -13,7 +13,6 @@ dependencies = [
   "scipy>=1.8",
   "pyyaml>=6",
   "opencv-python>=4.6",
-  "scikit-image>=0.20",
   "shapely>=2.0",
 ]
 
@@ -31,6 +30,7 @@ cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
 GR_BUILD_TESTS = "OFF"
+GR_BUILD_APPS = "OFF"
 GR_INPLACE = "OFF"
 
 [tool.pytest.ini_options]

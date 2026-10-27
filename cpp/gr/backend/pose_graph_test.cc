@@ -367,12 +367,14 @@ GR_TEST(PoseGraphTest, DenseAndSparseSolversAgreeWithInertialStates) {
     biases.emplace_back();
     for (int k = 0; k < n; ++k) biases.back().push_back(graph.Bias(k));
   }
+  // Both stop at the Levenberg-Marquardt tolerance: within micrometres
+  // (GCC and clang round differently).
   for (int k = 0; k < n; ++k) {
     const size_t kk = static_cast<size_t>(k);
     GR_EXPECT_LT(
         (solutions[0][kk].translation - solutions[1][kk].translation).norm(),
-        1e-6);
-    GR_EXPECT_LT((biases[0][kk] - biases[1][kk]).norm(), 1e-6);
+        1e-5);
+    GR_EXPECT_LT((biases[0][kk] - biases[1][kk]).norm(), 1e-5);
     // The floor fixes height, roll and pitch.
     GR_EXPECT_NEAR(solutions[0][kk].translation.z(), truth[kk].translation.z(),
                    2e-3);

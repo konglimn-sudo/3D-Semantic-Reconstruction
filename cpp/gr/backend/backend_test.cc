@@ -103,6 +103,23 @@ GR_TEST(BackendTest, AnchorsUseInsPoseGnssLeverArmOrAWeakPrior) {
   GR_EXPECT_NEAR(anchors[2].sigma_t, 50.0, 1e-12);
   GR_EXPECT_TRUE(!anchors[0].weak && !anchors[1].weak && anchors[2].weak);
   GR_EXPECT_EQ(lines.size(), 1u);
+
+  // A control point: the target 2 m ahead of the LiDAR (its x axis, yaw
+  // 90 deg: world +y) at t = 11.6, surveyed at (1.6, 2, 0): anchored at the
+  // keyframe of t = 12 with the target in that keyframe's frame.
+  trips[2].control_points.resize(1, 8);
+  trips[2].control_points << 11.6, 2.0, 0.0, 0.0, 1.6, 2.0, 0.0, 0.004;
+  const std::vector<Anchor> with_control =
+      MakeAnchors(keyframes, trips, BackendConfig(), {});
+  GR_ASSERT_TRUE(with_control.size() == 3);
+  const Anchor& control = with_control[2];
+  GR_EXPECT_TRUE(control.type == Anchor::Type::kPosition && !control.weak);
+  GR_EXPECT_EQ(control.keyframe, 8);
+  GR_EXPECT_NEAR(control.sigma, 0.004, 1e-12);
+  // In the keyframe frame (at x = 2) the target is 2 m ahead, 0.4 m back.
+  GR_EXPECT_LT((keyframes[8].odom * control.lever - Vec3(1.6, 2.0, 0.0))
+                   .norm(),
+               1e-9);
 }
 
 // Two sessions around the test garage loop without any anchor; the second

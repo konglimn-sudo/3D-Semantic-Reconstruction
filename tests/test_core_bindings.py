@@ -178,3 +178,30 @@ def test_map_dynamic_occupancy_and_labeler_bindings():
     rec, img = labeler.label(cam, T_wc, [], np.full((240, 320, 3), 80, np.uint8))
     assert img.shape == (240, 320) and (img == 1).sum() > 1000
     assert rec["slots"] and rec["slots"][0]["index"] == 0 and rec["consistency_score"] is None
+
+
+def test_lidar_imu_calibration_binding():
+    # A rig turning about all axes, the IMU rotated 5 deg about z.
+    t = np.arange(0.0, 60.0, 0.1)
+    poses = np.zeros((len(t), 4, 4))
+    for k, s in enumerate(t):
+        poses[k, :3, :3] = _core.so3_exp(np.array(
+            [0.3 * np.sin(0.9 * s), 0.25 * np.sin(0.6 * s + 1.0), 0.4 * s]))
+        poses[k, :3, 3] = [3 * np.sin(0.3 * s) + 0.5 * s, 2 * np.sin(0.5 * s),
+                           0.4 * np.sin(0.7 * s)]
+        poses[k, 3, 3] = 1.0
+    R = _core.so3_exp(np.array([0.0, 0.0, np.radians(5.0)]))
+    ti = np.arange(0.2, 59.8, 0.005)
+    dense = _core.interpolate_poses(t, poses, ti)
+    gyro = np.array([_core.so3_log(a[:3, :3].T @ b[:3, :3]) / 0.005
+                     for a, b in zip(dense[:-1], dense[1:])])
+    rows = np.column_stack([ti[:-1] + 0.0025, gyro @ R.T,
+                            np.zeros((len(gyro), 3))])
+    imu = _core.ImuSamples(rows, np.eye(3))
+    config = _core.LidarImuConfig()
+    config.estimate_time_offset = False
+    r = _core.calibrate_lidar_imu(t, poses, imu, np.eye(4), config)
+    assert r["samples"] > 100
+    # The gyro alone fixes the rotation of a rig turning about all axes.
+    change = np.degrees(np.linalg.norm(_core.so3_log(r["R_imu_lidar"].T @ R)))
+    assert change < 0.5

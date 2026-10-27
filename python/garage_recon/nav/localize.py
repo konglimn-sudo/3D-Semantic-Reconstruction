@@ -104,9 +104,58 @@ def levelled_start(dataset, stamp: float, window: float) -> np.ndarray:
     return _core.levelled_start(samples, stamp, window)
 
 
+def slot_state_config(cfg) -> _core.SlotStateConfig:
+    return core_config.fill(_core.SlotStateConfig(),
+                            cfg.nav.get("slot_states"))
+
+
+def change_config(cfg) -> _core.ChangeConfig:
+    return core_config.fill(_core.ChangeConfig(), cfg.nav.get("changes"))
+
+
+def _nav_inputs(graph, goals: list[dict], layers_by_level: dict):
+    """(edges, slots, floors) as nav_position / ChangeDetector.assess take
+    them (the order of graph.json, goals.json and the layer files)."""
+    edges = [(int(e.level), e.kind, np.asarray(e.points, float)[:, :2])
+             for e in graph.edges]
+    slots = [(int(g["level"]), g["slot_id"],
+              np.asarray(g["corners"], float))
+             for g in goals if "corners" in g]
+    floors = [(int(level), float(layers.grid.x0), float(layers.grid.y0),
+               float(layers.grid.res), np.asarray(layers.floor_z, float))
+              for level, layers in layers_by_level.items()]
+    return edges, slots, floors
+
+
+def changes_value(changes: list[dict], sweeps: int) -> dict:
+    """changes.json (as gr/io/nav_files.cc ChangesValue)."""
+    def vec(v):
+        return [round(float(x), 2) for x in v]
+    listed = [{"kind": "added" if c["added"] else "removed",
+               "level": c["level"], "center": vec(c["center"]),
+               "min": vec(c["min"]), "max": vec(c["max"]),
+               "voxels": c["voxels"], "edges": list(c["edges"])}
+              for c in changes]
+    added = sum(c["added"] for c in changes)
+    return {"summary": {"sweeps": sweeps, "added": added,
+                        "removed": len(changes) - added,
+                        "added_on_routes": sum(c["added"] and bool(c["edges"])
+                                               for c in changes)},
+            "changes": listed}
+
+
+def slot_geometry(goals: list[dict]) -> list[tuple]:
+    """(slot_id, level, corners, floor z) of the goals with an outline."""
+    return [(g["slot_id"], int(g["level"]), np.asarray(g["corners"], float),
+             float(g["park"]["xyz"][2]))
+            for g in goals if len(g.get("corners", [])) == 4]
+
+
 def localize_trip(dataset, map_xyz: np.ndarray, cfg,
                   prior: np.ndarray | None = None, stride: int = 1,
-                  start: float = 0.0, log=print) -> dict:
+                  start: float = 0.0, log=print,
+                  slots: list[tuple] | None = None,
+                  changes: bool = False) -> dict:
     """Localizes every `stride`-th sweep of a trip in the map (C++
     TripLocalizer, the loop gr_localize runs).
 
@@ -118,11 +167,15 @@ def localize_trip(dataset, map_xyz: np.ndarray, cfg,
         stride: Sweeps localized (the odometry sees all of them).
         start: Seconds of the trip skipped (a vehicle switched on anywhere).
         log: Logger.
+        slots: slot_geometry() of the map: their live occupancy is tracked
+            from the localized sweeps (C++ ObserveSlots / SlotStateTracker).
+        changes: Also collect the structural changes against the map (C++
+            ChangeDetector, returned as "change_detector").
 
     Returns:
         Dict of per-sweep arrays (stamp, T, odom, status, registered,
-        fitness, rmse, degenerate_t, sigma_t, sigma_yaw_deg, ms) and a
-        summary.
+        fitness, rmse, degenerate_t, sigma_t, sigma_yaw_deg, ms), a
+        summary and, with slots, their states.
     """
     T_vl = dataset.rig.primary_lidar.T_vehicle_lidar
     n = len(dataset.lidar_stamps)
@@ -134,14 +187,42 @@ def localize_trip(dataset, map_xyz: np.ndarray, cfg,
         levelled_start(dataset, dataset.lidar_stamps[first],
                        config.level_window),
         odometry_lib.motion_prior(dataset), prior, log)
+    slot_config = slot_state_config(cfg)
+    tracker = _core.SlotStateTracker(slots, slot_config) if slots else None
+    detector = (_core.ChangeDetector(map_xyz, change_config(cfg)) if changes
+                else None)
     rows = []
     for k in range(first, n):
         sweep = dataset.load_lidar(k)
         r = trip.process(sweep.points, sweep.intensity, sweep.time,
                          sweep.stamp, k, k == n - 1, (k - first) % stride == 0)
-        if r is not None:
-            rows.append(r)
-    return _arrays(rows, trip.summary())
+        if r is None:
+            continue
+        rows.append(r)
+        if not r["registered"] or r["status"] != "tracking":
+            continue
+        if tracker is not None:
+            tracker.observe(slots, r["stamp"], trip.last_sweep, r["T"],
+                            slot_config)
+        if detector is not None:
+            detector.add_sweep(trip.last_sweep, r["T"], r["stamp"])
+    out = _arrays(rows, trip.summary())
+    if detector is not None:
+        out["change_detector"] = detector
+    if tracker is not None:
+        out["slot_states"] = slot_states(slots, tracker.states())
+    return out
+
+
+def slot_states(slots: list[tuple], states: list[dict]) -> dict:
+    """slot_states.json (as gr/io/nav_files.cc SlotStatesValue)."""
+    listed = [{"slot_id": slot[0], "level": slot[1], "state": s["state"],
+               "stamp": None if s["stamp"] is None else round(s["stamp"], 3),
+               "observations": s["observations"]}
+              for slot, s in zip(slots, states)]
+    summary = {k: sum(s["state"] == k for s in listed)
+               for k in ("unknown", "free", "occupied")}
+    return {"summary": summary, "slots": listed}
 
 
 def _arrays(rows: list[dict], summary: dict) -> dict:
@@ -254,14 +335,7 @@ def where(T_map_vehicle: np.ndarray, graph, goals: list[dict],
         along it, lateral offset, heading relative to the edge direction),
         and the slot whose footprint contains the vehicle (None if none).
     """
-    edges = [(int(e.level), e.kind, np.asarray(e.points, float)[:, :2])
-             for e in graph.edges]
-    slots = [(int(g["level"]), g["slot_id"],
-              np.asarray(g["corners"], float))
-             for g in goals if "corners" in g]
-    floors = [(int(level), float(layers.grid.x0), float(layers.grid.y0),
-               float(layers.grid.res), np.asarray(layers.floor_z, float))
-              for level, layers in layers_by_level.items()]
+    edges, slots, floors = _nav_inputs(graph, goals, layers_by_level)
     p = _core.nav_position(np.asarray(T_map_vehicle, float), edges, slots,
                            floors)
     edge = None
@@ -279,7 +353,8 @@ def where(T_map_vehicle: np.ndarray, graph, goals: list[dict],
 
 def run(work: pathlib.Path, trip: pathlib.Path, out: pathlib.Path, cfg,
         prior: str = "none", reference: pathlib.Path | None = None,
-        stride: int = 1, start: float = 0.0, log=print) -> dict:
+        stride: int = 1, start: float = 0.0, log=print,
+        changes: bool = False) -> dict:
     """Localizes a trip in the navigation map of `work` (command localize).
 
     Args:
@@ -297,6 +372,8 @@ def run(work: pathlib.Path, trip: pathlib.Path, out: pathlib.Path, cfg,
         start: Seconds of the trip skipped (the entrance prior then does
             not apply).
         log: Logger.
+        changes: Also write changes.json, the structural changes against
+            the map and the route edges they reach.
 
     Returns:
         The report written to localization.json.
@@ -330,7 +407,11 @@ def run(work: pathlib.Path, trip: pathlib.Path, out: pathlib.Path, cfg,
             data.lidar_stamps, data.lidar_stamps[0] + start))]
         T_prior = _core.interpolate_poses(stamps, poses,
                                           np.array([first]))[0]
-    result = localize_trip(data, map_xyz, cfg, T_prior, stride, start, log)
+    goals_path = nav_dir / "goals.json"
+    slots = (slot_geometry(json.loads(goals_path.read_text())["goals"])
+             if goals_path.exists() else None)
+    result = localize_trip(data, map_xyz, cfg, T_prior, stride, start, log,
+                           slots, changes)
     report = {"trip": data.trip_id, "prior": prior, "start_s": start,
               "map_points": int(len(map_xyz)), **result["summary"]}
     if reference_path is not None:
@@ -343,6 +424,26 @@ def run(work: pathlib.Path, trip: pathlib.Path, out: pathlib.Path, cfg,
             (nav_dir / "graph.json").read_text()))
         report["last_position"] = where(result["T"][tracking[-1]], graph,
                                         goals, navmap.load_layers(nav_dir))
+    if "change_detector" in result:
+        detector = result["change_detector"]
+        graph = graph_lib.NavGraph.from_json(json.loads(
+            (nav_dir / "graph.json").read_text()))
+        goals = json.loads((nav_dir / "goals.json").read_text())["goals"]
+        vehicle = cfg.nav.vehicle
+        found = changes_value(detector.assess(
+            *_nav_inputs(graph, goals, navmap.load_layers(nav_dir)),
+            0.5 * float(vehicle.width) + float(vehicle.margin)),
+            detector.sweeps)
+        report["changes"] = found["summary"]
+        pathlib.Path(out).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(out) / "changes.json").write_text(
+            json.dumps(found, indent=1, ensure_ascii=False))
+        log(f"[localize] changes against the map: {found['summary']}")
+    if "slot_states" in result:
+        report["slot_states"] = result["slot_states"]["summary"]
+        pathlib.Path(out).mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(out) / "slot_states.json").write_text(json.dumps(
+            result["slot_states"], indent=1, ensure_ascii=False))
     write_result(pathlib.Path(out), result, report)
     errors = report.get("errors", {})
     log(f"[localize] {data.trip_id}: tracked {report['tracked']}/"

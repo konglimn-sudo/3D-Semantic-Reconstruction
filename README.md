@@ -20,13 +20,13 @@
 
 | 部分 | 状态 |
 |---|---|
-| 位姿骨架 | 已实现：激光里程计、回环、IMU 预积分位姿图、无入口位姿趟次的整趟粗对齐、平面约束的 LiDAR BA、连续时间轨迹与重新去畸变、相机时间偏差 / 卷帘快门 / 外参标定、带版本号的位姿集合 |
+| 位姿骨架 | 已实现：激光里程计、回环、IMU 预积分位姿图、无入口位姿趟次的整趟粗对齐、平面约束的 LiDAR BA（超过 2000 个关键帧时分层，4.1）、连续时间轨迹与重新去畸变、相机时间偏差 / 卷帘快门 / 外参标定、带版本号的位姿集合；控制点锚定、OCR 文字回环候选、按 IMU 等级的噪声与零偏先验、LiDAR–IMU 外参检查（4.4） |
 | 测量点云与验收 | 已实现：多次观测融合且每点带 σ 的测量点云、正射影像上的亚像素矢量拟合、手持真值验收（导入、控制点 / 检查点、报告） |
 | 语义：规则路线 | 已实现：结构、标线、车位、停放 / 移动目标、占据、逐帧标签、车位号（OCR 接口）、审核队列、导出 |
 | 语义：语言路线 | 链路已实现，用合成真值验证：模型接口、跨视角身份关联、身份级语言特征。语义载体暂用 LiDAR 点；真实模型（SAM 2、SigLIP 2、OCR）的适配器还没有写（见 2 的 D） |
-| 导航地图 | 已实现（第 6 章）：分层栅格（含净空高度）、路网（骨架 + 按车位排生成的车道线）、地面箭头定出的单行道、车位目标点、地点（入口、出口、门）、限高（实测净空 + 限高牌）、地址查询、QA、nav2 / GeoJSON / Lanelet2（车位与车道）导出、查看器里的路线规划 |
-| 车端定位 | 已实现（6.2）：在导航地图的固定结构上用 LiDAR 定位；有入口先验时直接跟踪，没有时把里程计子图放到地图上（全局初始化）；退化方向保留里程计。合成车库误差 p95 1.8 cm（相对地图 0.9 cm），10 个随机起点全部正确初始化；露天停车场几何约束不足（9.8） |
-| 工程 | C++ 按功能分文件夹（10.2）；语义与导航几何已迁到 C++；文件格式库 `gr_io` 与纯 C++ 车端定位程序 `gr_localize`（与 Python 入口输出一致）；逐帧标签和地面纹理按帧并行（约 5 倍）。离线重建仍由 Python 编排 |
+| 导航地图 | 已实现（第 6 章）：分层栅格（含净空高度）、路网（骨架 + 按车位排、长墙和采集行驶路线生成的车道线）、单行道（地面箭头、采集行驶方向、禁行 / 单行标志）、车位目标点与属性（充电、无障碍、专用）、地点（入口、出口、门、坡道口）、道闸与减速带、限高（实测净空 + 限高牌）、地址查询、QA、nav2 / GeoJSON / Lanelet2（车位与车道）导出、查看器里的路线规划；实时车位占用、变化检测与路网更新（6.3） |
+| 车端定位 | 已实现（6.2）：在导航地图的固定结构上用 LiDAR 定位；有入口先验时直接跟踪，没有时把里程计子图放到地图上（全局初始化）；退化方向保留里程计；同时给出看到的车位的实时占用和相对地图的结构变化（6.3）。合成车库误差 p95 1.8 cm（相对地图 0.9 cm），10 个随机起点全部正确初始化；露天停车场几何约束不足（9.8） |
+| 工程 | C++ 按功能分文件夹（10.2）；语义与导航几何已迁到 C++（含标线涂料掩膜与骨架、导航分层、BEV 栅格）；文件格式库 `gr_io`；纯 C++ 程序 `gr_localize`（车端定位）和 `gr_recon`（离线重建的几何阶段：里程计 → 图优化 → 位姿集合 → 测量点云、楼层、动态点），输出与 Python 入口逐字节一致（9.9）；C++ 配置表由绑定自动生成；GitHub Actions CI、`cmake --install` / CPack 打包、Docker 镜像（3.1）；逐帧标签和地面纹理按帧并行（约 5 倍） |
 | 3DGS / DA3 / DINO | 已实现并在 GPU 上实测（第 8 章）：DA3 位姿条件深度与 LiDAR 对齐、gsplat 3DGUT 鱼眼训练（LiDAR 锚定、冻结、剪枝、分块）、留出扫描核验与正射影像、RoMa 相机标定、DINOv2 外观回环。待做：TSDF 网格、逐帧深度渲染、沿 LiDAR 射线的训练损失、SAM 掩膜 |
 | 真实数据 | ROS bag 转换（含 LiDAR 时钟同步）、Mandeye 原始记录转换、扫描仪导出导入；已试跑 FusionPortableV2 两个场景、Skierniewice 地下车库（Mandeye）、Oxford Spires Keble College、Hilti 2021 Parking Deck。当前精度见 9.0 |
 
@@ -88,7 +88,7 @@
 ### 3.1 构建
 
 依赖：
-- 必需：CMake ≥ 3.18、C++17 编译器、Eigen3、zlib（`gr_io` 读写 npz）、Python ≥ 3.9（numpy、scipy、pyyaml、opencv、scikit-image、shapely）；
+- 必需：CMake ≥ 3.18、C++17 编译器（clang、GCC 均可）、Eigen3、zlib（`gr_io` 读写 npz）、Python ≥ 3.9（numpy、scipy、pyyaml、opencv、shapely）；
 - 可选：libomp（OpenMP）、laspy + lazrs（LAS / LAZ 读写，Mandeye 转换）、rosbags（ROS bag 转换）。
 
 ```bash
@@ -98,7 +98,15 @@ cmake -S . -B build -DPython_EXECUTABLE=$PWD/.venv/bin/python && cmake --build b
 PYTHONPATH=python .venv/bin/python -m pytest -q   # Python 测试（含一次 tiny 端到端，约 40 秒）
 ```
 
-构建产物：静态库 `gr_core`（算法）和 `gr_io`（文件格式），测试 `gr_tests`，车端定位程序 `gr_localize`（不依赖 Python，见 6.2），Python 扩展 `_core`。`-DGR_BUILD_PYTHON=OFF` 只构建 C++ 部分，适合车端部署。
+构建产物：静态库 `gr_core`（算法）、`gr_io`（文件格式）和 `gr_pipeline`（重建阶段编排），测试 `gr_tests`，两个不依赖 Python 的程序：车端定位 `gr_localize`（6.2）和离线重建 `gr_recon`（4.1），Python 扩展 `_core`。`-DGR_BUILD_PYTHON=OFF` 只构建 C++ 部分，适合车端部署。
+
+**安装、打包与 CI**
+- `cmake --install build --prefix /opt/garage_recon`：装 `bin/gr_localize`、`bin/gr_recon` 和默认配置 `share/garage_recon/default_config.yaml`（新配置以它为第一个 `--config`）；
+- `cd build && cpack`：程序的 tar.gz，Linux 上另出 deb（依赖 libgomp1、zlib1g）；
+- Docker：`docker build -f docker/Dockerfile -t garage-recon .`，构建阶段跑一遍 `gr_tests`，运行镜像只有两个程序（Ubuntu 24.04 + libgomp）。例：`docker run --rm -v $PWD/work:/work -v $PWD/data:/data garage-recon gr_localize --nav /work/semantics/nav --trip /data/trip_03 --out /work/loc`；
+- Python 包：`pip install .`（scikit-build-core，只编扩展，不编程序和测试）；
+- CI（`.github/workflows/ci.yml`）：Linux GCC 编译 + C++ / Python 测试 + 配置表是否过期 + cpack；macOS Apple clang 编译 + C++ 测试；wheel 构建与安装后导入；Docker 镜像构建与冒烟测试。本机验证过 Apple clang 和 GCC 15（Homebrew）两种编译器，Docker 与 Linux 上的 Eigen 3.4 只在 CI 里跑。
+- C++ 配置表（`cpp/gr/io/config_tables.inc`）由 `tools/gen_config_tables.py` 从 pybind11 绑定的字段列表生成，C++ 程序读 YAML 的方式因此与 Python 的 `core_config.fill` 完全相同；改了绑定的字段后重新生成，`--check` 检查是否过期。
 
 开发模式下，扩展模块直接生成到 `python/garage_recon/`。也可以用 `pip install .`（scikit-build-core）安装成包，安装前先删掉源码目录里的 `_core*.so`。
 
@@ -297,6 +305,23 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
 3. **求解**：平面因子与上表的全部因子联合 LM 优化。位姿块稠密求解（先消去惯性状态），"重新提取平面 + 优化"共 2 轮。
 4. **作用**：BA 取代了"扫描到地图精修"。精修仍保留为可选项（`refine`，BA 关闭时用）。
 
+**分层 BA**（`HierarchicalLidarBa`，关键帧超过 `ba.hierarchical_above`（2000）时自动启用）：稠密位姿块只装得下约 2500 个关键帧。
+1. 每趟切成 `ba.window`（100）个连续关键帧的窗口，各窗口单独做平面 BA（首帧固定，并行）；末尾不足半窗的并入前一窗；
+2. 每个窗口合成一个刚体"超级关键帧"，回环、锚点和重力因子换算到窗口上，超级关键帧之间再做平面 BA。超级关键帧之间没有 IMU 因子，所以每个窗口加一个重力因子，取图优化给它各关键帧的上方向的平均（0.02°，`ba.window_gravity_sigma_deg`）。只取首帧的上方向不行：单个关键帧的倾角误差可达 0.2°，整窗会跟着倾斜；
+3. 全部关键帧再做一次带 IMU 因子的位姿图，每帧贴近它所在窗口放置后的位置（2 mm），抹平窗口边界。
+
+合成 large（5 趟、2290 个关键帧）上与稠密 BA 精度相当，图优化阶段快 8 倍（9.9）。
+
+**纯 C++ 的重建链**（`gr_recon`，`gr/pipeline/recon_pipeline.h`）：odometry、graph、trajectory、map 四个阶段不经 Python，读写与 `recon/pipeline.py` 相同的工作目录（`gr/io/recon_files.h`：关键帧 float32 / float16、位姿集合与其内容哈希、`provenance.json`），两边可以互相接着跑。需要模型的阶段（外观 / 文字回环的候选、相机标定、语义）留在 Python，回环候选可以用 `--loop-pairs` 传入。
+
+```bash
+./build/gr_recon --trips data/x/trip_00 data/x/trip_01 --work work/x \
+    --config python/garage_recon/default_config.yaml      # 默认四个阶段；--stages graph map 续跑
+PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work work/x --stages bev texture   # Python 接着做
+```
+
+单线程下与 Python 入口的全部产物逐字节一致（9.9）；多线程时和 Python 一样有 OpenMP 归约顺序带来的约 1e-5 m 差别。
+
 ### 4.2 位姿集合：一套位姿的工程保证
 
 - **内容**：以下参数作为一个整体，带版本号 `pose_set_id`：
@@ -373,6 +398,13 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
 - **单程直线采集时，加计零偏与倾斜分不开**（真实数据）：消费级零偏先验（0.2 m/s²）下，零偏被估成 0.5 m/s²，整条路线倾斜 3%。战术级 IMU 要用相应的先验（0.03 m/s²）。
 - **没有入口位姿的多趟数据要先粗对齐**（真实数据，9.6）：回环候选按当前估计位置门控，两趟各自以起点为原点、朝向差 76° 时，找不到跨趟回环。整趟粗对齐（`trip_align`）之后，两趟重复精度中位 4.8 cm，与用真值设入口位姿时相同。
 - **布局重复的楼层要逐个检验候选**（合成数据，9.6）：粗搜索的最优高程可能差一层，ICP 吻合度也会饱和（错开一个柱距仍有 95% 的点对得上）。所以每个航向、高程候选都用 ICP 检验，要求最优解比任何不同的解至少多对上 3% 的点，分不清就不放置。
+
+### 4.4 位姿与标定的补充
+
+- **IMU 等级**：`imu_grade`（consumer / industrial / tactical / navigation）给出后端的零偏先验和 LIO 的初始零偏方差（`imu_grades` 表）。只填用户没写的项，写进 `config.used.yaml` 后带 `imu_grade_applied` 标记，不会被重复套用。Python 与 C++（`gr/io/config.h` `ApplyImuGrade`）解析出的配置相同。FusionPortableV2 的重建配置取 tactical。
+- **控制点**（`control_points.csv`：时间、靶标在 LiDAR 系的位置、世界坐标、σ）：靶标挂到 `backend.control_max_dt`（5 s）内最近的关键帧，作为位置锚点（杠杆臂 = 靶标点在关键帧系下的位置）。长走廊没有回环时，用它约束航向。
+- **OCR 文字回环**（`loops.text`，默认关闭，需要 OCR 模型）：两个关键帧的图像读到同一段文字（至少 3 个字符）时提为候选，和外观候选一样经 ICP 验证、PCM 筛选。只保留几何门控提不出的候选，每段文字最多 2 对：不加限制时文字重复的车库（同一编号在各层出现）会把合成地图拉偏 15 cm。
+- **LiDAR–IMU 外参检查**（`calibrate-lidar-imu`，C++ `CalibrateLidarImu`）：在最终轨迹上，以 LiDAR 时间戳为窗口中心，用轨迹的精确二阶差分（帽形加权平均加速度）对照 IMU：比力和角速度。估计旋转、时间偏差（按偏差重新取样）、杆臂（弱先验 1 m）、重力倾角，可选各轴加计标度；Huber LM，给出协方差。结果写 `lidar_imu.json`，只用于检查 rig.yaml，不自动改标定。真实数据上加计标度不可观（姿态变化不够），默认不估。
 
 ## 5. 语义标注
 
@@ -546,7 +578,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
 - 规划不穿墙、按单行方向、不超限高的全局路径；
 - 车在地图里定位（6.2）。
 
-几何算法在 C++：`nav_map`（距离变换、骨架、路网提取、最短路、栅格 A*）、`arrows`（地面箭头）、`localization`（定位）。编排在 `python/garage_recon/nav/`。
+几何算法在 C++：`layers`（分层，多边形填充与 OpenCV 逐格一致）、`nav_map`（距离变换、骨架、路网提取、最短路、栅格 A*）、`arrows`（地面箭头）、`traffic`（单行）、`lanes`（车道线）、`features`（道闸、减速带）、`slot_state`（实时占用）、`map_update`（变化评估）、`localization`（定位）。编排在 `python/garage_recon/nav/`。
 
 ### 6.1 地图与路网
 
@@ -579,11 +611,22 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
   - 车道同样要满足"半车宽 + 0.3 m"的间距，不满足的地方断开；
   - 骨架已经沿着车道走的（80% 的长度在 0.5 m 内）保留骨架，所以规整的车库里基本不变；
   - 沿车道（3 m 内、夹角 30° 内、过半长度）的骨架边由车道替代；它们挂着的分支、车道的两端和交叉处都接回路网，替换后剩下的不到 10 m 的骨架碎段去掉。
+  - **开阔场地**：车位排提不出车道的地方，依次再用两种来源：长墙（≥ 12 m）墙面前 3.5 m、且车道外侧 8 m 内仍可通行的线；采集行驶轨迹简化（Douglas-Peucker 0.5 m）后 ≥ 15 m 的直段。采集车开过的格子算可通行，即使落在检出的车位里（露天停车场的车常压着车位开）。
 - **单行**（`nav/traffic.py`）：地面箭头（标线阶段）挂到最近、方向一致的车道边上；不经路口相连的车道边组成一条"通道"。
   - 一条通道上的箭头两个方向都有：双向；
   - 至少 2 个同向箭头、都画在中线附近（0.8 m 内），并且 8 m 内没有反向箭头：单行，边的方向改成行车方向；
   - 箭头偏在一侧（只看到一条车道的箭头）、只有 1 个箭头、或没有箭头：按双向。骨架在路口处会弯，单个车道的箭头可能恰好落在弯的骨架上，所以要求至少 2 个、并排除附近有反向箭头的情况。
+  - **采集行驶方向**：每趟采集轨迹沿边走过的"一次通过"（覆盖边长的 60% 或 10 m 以上）计入顺向或逆向。只有 1 个居中箭头时，至少 2 次顺向通过、没有逆向通过才判为单行（`kOneWayDriven`）；
+  - **标志**：OCR 读到的"禁止驶入""单行"标志（文字地标，带拍到它的相机位置，从而知道标志朝哪面）。通道端头 8 m 内、面向来车的禁行标志单独就能定方向；单行标志可以在通道的任意位置，补全只有 1 个箭头的情况（`kOneWaySign`）；
+  - 证据互相矛盾（箭头和行驶方向相反等）判为 `kConflict`，按双向并列进 QA。
 - **限高**（`nav/attributes.py`）：每条边取沿线、车身半宽内的最小净空；OCR 读到的限高牌（"限高2.2m""HEIGHT 2.1M"）记到最近的边上（`posted_height`）。每个车位记录从入口出发的路线上的最低限高（`route_height_limit`），较高的车可以据此判断能不能去。
+
+**道路要素**（`nav/attributes.py`、C++ `features`）：2D 检测出的道闸（`barrier`）、减速带（`speed_bump`）按 8 连通格聚成脚印，挂到 1.5 m 内的可行驶边上（`Edge.features`）；坡道两端作为地点（坡道口）。道闸默认可通行，检测或更新为关闭时边标 `blocked`，规划时绕开。
+
+**车位属性**（`充电`、`无障碍`、`专用`）：
+- 正射影像上车位内缩 0.25 m 的区域里，观测到的格子至少 10 个、其中至少一半是绿色（色相 75–165°，饱和度 ≥ 0.25）：充电车位（C++ `MeasureSlotPaint`；停着车、地面看不到时不判）；
+- 车位自身文字的 OCR 关键词（"充电""EV""无障碍""专用"等），以及 3 m 内的属性标志牌（挂到最近的车位）；
+- 地址查询可带属性（"B1 充电车位""最近的无障碍车位"），导出到 `goals.json` 与 GeoJSON。
 
 **车位目标点（`goals.json`）**
 - **停车位姿**：车位中心，车头进与倒车进两个朝向。
@@ -650,6 +693,21 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
   - 修正量以传感器为中心计算；海森矩阵的平移或旋转块中，特征值小于最大值 2% 的方向视为退化（例如无特征的长走廊沿走廊方向），这些方向保留预测，协方差按里程计给（1 m、5°）；
   - 吻合度低于 0.4、RMSE 超过 12 cm、修正超过 0.5 m 或 3° 时拒绝这一帧；连续 10 帧被拒判为丢失，重新全局初始化。
 - **输出**：每帧位姿（map ← vehicle）、配准是否被接受、吻合度、退化方向数、协方差（`poses.tum`、`sweeps.csv`、`localization.json`）；C++ `Where`（`gr/nav/position.h`）把位姿换成导航用的位置：楼层、在哪条边上（沿边距离、横向偏差、相对航向）、是否在某个车位里。
+
+### 6.3 实时状态与地图更新
+
+**车位实时占用**（`localize` 每次都输出 `slot_states.json`，C++ `SlotStateTracker`）：定位后的每帧点云按车位统计：
+- 15 m 内、车位内缩 0.3 m 的区域里，离地 0.3–2.2 m 的车身回波 ≥ 25 个：占用；
+- 车身回波 ≤ 3 个，且车位里至少 1/4 的 0.25 m 格子有地面回波：空闲；
+- 其余为未知（看不见）。状态连续 2 次观测一致才翻转（`nav.slot_states.confirm`）。
+
+**结构变化**（`localize --changes` 输出 `changes.json`，C++ `ChangeDetector` + `AssessChanges`）：
+- **新增**：0.2 m 体素在至少 3 帧、跨 5 s 以上被打到（不是路过的车），并且地图在 26 邻域内没有点；
+- **消失**：地图体素被至少 3 条射线穿过（射线在回波前 0.4 m 停下），从没被打到，周围也没有被打到的体素；
+- 按连通块聚类，少于 12 个体素的是噪声；薄于 0.25 m 的新增块是第一次看到的表面；车大小的块和落在车位里的块属于占用变化，不算结构变化；
+- 每个变化块对照路网边的通行走廊（半车宽 + 余量），列出受影响的边。
+
+**路网更新**（`update-map`，`nav/update.py`）：把新增块烧进障碍层、消失块清掉，对受影响的边重新判定：边两端吸附到最近的空闲格，用栅格 A* 找"最宽通路"（对净空阈值二分），通不过的边标 `blocked`，变窄的边更新宽度；写出新版本的 `graph.json` 和 QA。
 
 ## 7. 测量级：定义与验收
 
@@ -1291,6 +1349,13 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
   - 室外停车场没有跑 OCR，地址是车位编号。
   - 地下车库 OCR 读到了分区和出口标志，但没有车位号。11 个车位按 30 m 内最近的分区标志牌得到分区：5A ×2、5B ×1、1B ×2、中央区 ×5、装卸区 ×1。地址形如 `L0-5A-R03-001`，可以按"5A区"查询（6）。
 
+- **导航补充（2026-10-27）**：
+  - **室外停车场车道**：用采集行驶轨迹补车道线（墙在这里提不出来）、并把开过的格子算作可通行后，采集轨迹落在路网上的比例 0.23 → 0.77，97 个车位仍全部可达，路线最小间距 1.12 → 1.25 m；
+  - **合成 small**：结果不变（59/59 可达），新增两个坡道口地点；
+  - **车位属性**（合成 tiny，场景里画了绿色充电车位并放了属性文字）：4 个属性全部检出，无误检；
+  - **实时占用**：前两趟建图、trip_02 定位时，59 个车位的占用全部判对（停放车辆与建图时不同）；
+  - **变化检测**：trip_03 在车道上加了一段围挡、拆了一段风管，检出的正好是这两处（围挡落在 3 条边的走廊里），重复运行结果相同；没有变化的 trip_02 只有几个小块，都不在走廊里。早期版本的误报（地面被当成"消失"、路过的车、只看到一部分的停放车、零星噪声）分别用"消失要求周围无命中"、跨 5 s、车位内不算、最少 12 个体素去掉。
+
 ### 9.5 Skierniewice 地下车库（Mandeye 手持，2026-10-16）
 
 **数据**
@@ -1489,6 +1554,36 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - **结论**：开阔场地只靠几何定位，水平方向约束不足；定位器能识别并保留里程计，但要达到厘米级需要 GNSS 先验，或用地面标线的反射强度做匹配（12）。车库里有墙、柱、顶板，约束充分。
 - **耗时**：Ouster 128 线、露天点多，每帧 150–240 ms，比合成车库（32 线，约 21 ms）慢一个量级，实时运行前要优化。
 
+### 9.9 分层 BA、纯 C++ 重建链与位姿检查（2026-10-27）
+
+**分层 BA**：合成 large（三层、8 组车位排，5 趟各 892 帧 / 535 m，共 2290 个关键帧，1019 条回环），从同一份里程计出发只跑 graph 阶段（本机 8 核）：
+
+| | 图优化阶段 | ATE（未对齐） | 刚体对齐后 | 倾角误差均值 | 平面 RMS 中位 |
+|---|---|---|---|---|---|
+| 稠密 BA | 462 s | 2.5 cm | 4.2–4.6 mm | 0.008–0.011° | 0.37 cm |
+| 分层 BA（25 个窗口） | 60 s | 1.8–2.2 cm | 3.9–5.2 mm | 0.005–0.013° | 0.27 cm |
+| 分层 BA，窗口不加重力因子 | 58 s | 6.1 cm | 3.7–5.2 mm | 0.088° | 0.36 cm |
+| 不做 BA | 46 s | 3.2 cm | 20 mm | 0.017–0.020° | — |
+
+- 第一版（不加重力因子）形状对、整体歪：窗口之间没有 IMU 因子，倾角只靠入口锚点约束，整个地图倾斜 0.09°、高程偏 4.6 cm。只用每个窗口首帧的倾角也不够（还剩 0.025°，单帧倾角误差可达 0.2°），取全窗平均后与稠密 BA 相当。
+
+**纯 C++ 重建链 `gr_recon`**（odometry → graph → trajectory → map，单线程与 Python 入口比较全部产物）：
+
+| 数据 | 文件 | 逐字节 / 逐值一致 | 耗时 C++ / Python |
+|---|---|---|---|
+| 合成 tiny，两趟、一层 | 319 | 319 | 12.4 / 13.1 s |
+| 合成 small，两趟、两层 + 坡道 | 1091 | 1091 | 195 / 255 s |
+
+- 一致的包括位姿集合的内容哈希 `pose_set_id` / `trajectory_id`（C++ 复现了 Python 的 SHA-256 与 `json.dumps` 格式）、关键帧点云（float32 / float16，float16 按最近偶数舍入）、测量点云、楼层栅格、`config.used.yaml`（PyYAML 读回相同）。Python 的 `bev` 和 `eval` 直接在 C++ 的工作目录上接着跑。
+- 导航分层和 BEV 栅格迁到 C++ 后，在 small 的两层上 34 个栅格全部与原 Python 实现逐值一致；`cv2.fillPoly`（LINE_8、4 位小数）的移植在 6000 个随机多边形（自交、部分出界、旋转矩形、凸包）上与 OpenCV 4.9 逐格一致。
+- 编译器：Apple clang 和 GCC 15 都通过 150 个 C++ 测试（GCC 下稠密 / 稀疏求解器的一致性从 < 1 µm 变成约 2 µm，测试门限放到 10 µm）。
+
+**LiDAR–IMU 外参检查**（4.4）：
+- FusionPortableV2 无人车：两趟估出的横滚 / 俯仰一致；航向和加计标度不可观（车基本只在平面上开）；
+- FusionPortableV2 手持：与 rig.yaml 相差 1.7°（σ 0.09°），没有独立参照，无法判断哪个对，rig.yaml 保持不变。
+
+**OCR 文字回环**：不加筛选时合成地图变差 15 cm（各层重复的文字给出错误候选）；只保留几何门控提不出的候选、每段文字最多 2 对之后，精度与不用文字回环相同。
+
 ## 10. 代码结构
 
 ### 10.1 C++ / Python 分工
@@ -1498,16 +1593,20 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - 把 YAML 配置映射成 C++ 配置结构（`core_config.py`；C++ 程序用 `gr/io/config.h` 做同样的映射）；
 - 按阶段调用、并行调度逐帧任务（`parallel.py`）。
 
+离线重建的几何阶段也有纯 C++ 的编排（`gr_pipeline`、程序 `gr_recon`，4.1），与 Python 编排的产物相同。
+
 | 模块 | C++ 入口 | 内容 |
 |---|---|---|
 | 点云配准 | `registration` | 体素哈希地图、多尺度点到面 ICP、由粗到精 ICP（`icp_multiscale`） |
 | 激光里程计 | `imu`、`odometry` | 轮速 + 陀螺运动先验、扫描时间窗内 IMU 去畸变、逐帧配准、关键帧选择与关键帧点云（`OdometryPipeline`） |
 | 回环检测 | `keyframes`、`loop_closure` | 位置半径 + 楼层高差门控、Scan Context 排序、子图多尺度 ICP 验证（按查询帧并行）、PCM 一致性筛选 |
 | 位姿图优化（含 IMU） | `imu_preintegration`、`pose_graph`、`backend` | 入口 INS / GNSS 锚点（按时间戳用轮速 / 陀螺推到关键帧）；无锚点趟次的整趟粗对齐（`AlignTrips`：重力对齐粗搜索 + 多尺度 ICP）；IMU 预积分因子（流形预积分，含零偏雅可比；惯性"体"的原点在 IMU 处，即杆臂）、每个关键帧的速度与零偏状态、轮速 + 非完整约束的车体速度因子、零偏随机游走；LM 优化；整个阶段一次调用（`run_graph_stage`），以及逐帧位姿修正。加速度计重力因子、扫描到地图精修保留为可选项 |
-| LiDAR BA | `plane_factor`、`lidar_ba` | 见 4.1（`RunLidarBa`） |
+| LiDAR BA | `plane_factor`、`lidar_ba`、`backend` | 见 4.1（`RunLidarBa`；分层 `HierarchicalLidarBa`） |
+| LiDAR–IMU 外参检查 | `lidar_imu` | 轨迹二阶差分对照比力与角速度：旋转、时间偏差、杆臂、倾角、可选加计标度（`CalibrateLidarImu`，4.4） |
 | 连续时间轨迹（位姿集合） | `trajectory`、`exposure` | 以全部激光帧位姿为节点，节点间用去零偏陀螺和轮速积分并做端点修正（`ContinuousTrajectory`）；用它重新去畸变关键帧（`DeskewKeyframeSweep`）；相机每一行按曝光时刻取位姿（卷帘快门，`CameraExposure`） |
 | 相机标定 | `camera_calibration` | 在固定轨迹上联合估计相机时间偏差与外参：多视图特征轨迹 + 三角化路标 + 路标到 LiDAR 面的点面约束，LM + 路标 Schur 消元（`CalibrateCamera`） |
-| 地图与动态点判断 | `static_map`、`visibility` | 测量点云（多次观测融合、每点 σ）；法向定向、按趟距离图像可见性投票、自车扫过区域、高度门限，输出"本趟内移动 / 跨趟变化"（`DynamicDetector`） |
+| 地图与动态点判断 | `static_map`、`visibility`、`bev` | 测量点云（多次观测融合、每点 σ）；法向定向、按趟距离图像可见性投票、自车扫过区域、高度门限，输出"本趟内移动 / 跨趟变化"（`DynamicDetector`）；每层 BEV 栅格与地面高度（`LevelRasters`） |
+| 变化检测 | `change_detection` | 定位后的点云对照地图：命中与射线穿过的体素、跨时长过滤、聚类与分类（`ChangeDetector`，6.3） |
 | 占据栅格 | `objects`、`occupancy` | 目标框时间线（停放 + 移动轨迹插值）、每帧语义占据与 LiDAR / 相机可见性掩膜（`OccupancyGenerator`） |
 | 投影 | `projector`、`labeling`、`raster` | z-buffer 渲染、逐帧标签图、车位 / 标线 / 目标框投影与遮挡、投影一致性分（`FrameLabeler`）、2D→3D 多视角投票（`LabelLifter`）、地面纹理的遮挡渲染；全部按曝光（卷帘快门）投影 |
 | 时钟同步 | `clock_sync` | 两个陀螺分窗口互相关（积分后的平均角速度，避免插值相位偏差），每窗口估旋转，稳健拟合偏差与漂移 |
@@ -1517,22 +1616,24 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 | 结构 | `structure` | 主方向、多高度切片栅格、柱（线形开运算、连通块、面测量、轴网吸附）、墙与女儿墙、结构标签（`ExtractStructure`） |
 | 标线 | `markings`、`vector_fit` | 骨架分支拟合直线、共线合并、长度 / 宽度过滤、两侧有观测与轴网对齐的过滤；正射影像上的亚像素线拟合与端点；按行驶路径分车道线 / 车位线 |
 | 车位 | `slots` | 车位排、倾斜、背靠背拆分、柱面虚拟隔线、推断车位的证据、去重、占用、编号（`AssembleSlots`） |
-| 导航地图 | `nav_map`、`arrows`、`traffic`、`lanes`、`position` | 精确欧氏距离变换、Zhang-Suen 细化、骨架提图（节点聚类、毛刺剪枝、二度节点合并）、Douglas-Peucker 简化、Dijkstra 路网（含单行边）、8 邻域栅格 A*；地面箭头检测（连通块主轴、宽度剖面、箭头与尖端）；箭头归边、走廊与单行判定（`DecideTraffic`）；按车位排的车道线（`PlanLanes`）；位姿在路网上的位置（`Where`） |
+| 导航地图 | `layers`、`nav_map`、`arrows`、`traffic`、`lanes`、`features`、`slot_state`、`map_update`、`position` | 分层（`ComputeLevelLayers`）；精确欧氏距离变换、Zhang-Suen 细化、骨架提图（节点聚类、毛刺剪枝、二度节点合并）、Douglas-Peucker 简化、Dijkstra 路网（含单行边）、8 邻域栅格 A*；地面箭头检测（连通块主轴、宽度剖面、箭头与尖端）；箭头 / 行驶通过 / 标志归边、走廊与单行判定（`DecideTraffic`、`CountPasses`）；按车位排、长墙、行驶路线的车道线（`PlanLanes`）；道闸与减速带的脚印（`ObjectFootprints`）；车位实时占用（`SlotStateTracker`）；变化对路网的影响（`AssessChanges`）；位姿在路网上的位置（`Where`） |
 | 车端定位 | `localization`、`trip_localizer`、`cloud_compare` | 地图上的点到面 ICP 跟踪、以传感器为中心的退化方向判定与协方差、丢失后重新初始化；无先验时子图的重力对齐放置（`PlaceGravityAligned`，与整趟粗对齐共用）；整趟循环：用加速度计摆平起步坐标系、里程计去畸变、逐帧定位与统计（`TripLocalizer`） |
-| 基础 | `geometry`、`kdtree`、`morphology` | 法向、RANSAC 平面、局部平面投影、凸包、凸多边形裁剪与内缩、点在多边形内；2D k-d 树；与 scipy / OpenCV 约定一致的形态学（十字膨胀、3×3 最大值、线形开运算、距离变换、细化、多边形填充、8 连通标记） |
-| 数据读写（`gr_io`） | `value`、`npy`、`tables`、`trip`、`config`、`nav_files` | YAML（PyYAML 的类型规则）与 JSON 读写；npy / npz（存储或 deflate、ZIP64、Fortran 顺序、float16）；CSV、TUM（四元数符号与 scipy 一致）；趟目录（rig、meta、LiDAR、IMU、轮速）；YAML 配置到 C++ 配置结构；导航地图文件与定位结果 |
+| 基础 | `geometry`、`kdtree`、`morphology` | 法向、RANSAC 平面、局部平面投影、凸包、凸多边形裁剪与内缩、点在多边形内；2D k-d 树；与 scipy / OpenCV / scikit-image 逐格一致的栅格运算（十字膨胀、椭圆核开闭运算、3×3 最大值、线形开运算、高斯滤波、Otsu、距离变换、细化、scikit-image 骨架、LINE_8 画线与 `fillPoly`、8 连通标记） |
+| 数据读写（`gr_io`） | `value`、`npy`、`tables`、`trip`、`config`、`nav_files`、`recon_files`、`digest` | YAML（PyYAML 的类型规则）与 JSON 读写，PyYAML 能读回的 YAML 写出；npy / npz（存储或 deflate、ZIP64、Fortran 顺序、float16 读写）；CSV、TUM（四元数符号与 scipy 一致）；趟目录（rig、meta、LiDAR、IMU、轮速、GNSS、控制点）；YAML 配置到 C++ 配置结构（字段表由绑定生成）、IMU 等级；导航地图文件与定位结果；重建工作目录（里程计、关键帧、图优化结果、位姿集合、测量点云、楼层、产物版本）；SHA-256 与 Python 式 `json.dumps`（位姿集合的哈希） |
+| 重建编排（`gr_pipeline`） | `recon_pipeline` | odometry → graph → trajectory → map 四个阶段（`ReconPipeline`，程序 `gr_recon`） |
 | 3DGS 支撑 | `gaussians`、`coverage`、`raycast` | 由 LiDAR 测量点生成扁平高斯；沿射线渲染高斯的深度和强度（3DGRT / 3DGUT 式逐高斯求峰值，网格 DDA 遍历），用于强度通道和留出扫描核验；相机覆盖统计（每点有效视角数、最佳分辨率、加权颜色）；训练掩膜；自由空间栅格 |
 | 深度先验 | `depth_prior`、`projector` | DA3 深度与 LiDAR 的稳健对齐（在可见地图点上拟合尺度 / 偏移，按网格剔除，只填空洞）；第一表面平均深度 |
 | LiDAR-惯性里程计 | `lio` | 迭代误差状态卡尔曼滤波（状态在 IMU 处）：IMU 传播、按 IMU 位姿逐点去畸变、点到面（无平面时点到点）迭代更新；可选零速更新与限速 |
 
-这些 C++ 接口不依赖 Python，可以直接在 C++ 程序里调用。`cpp/gr/testing/e2e_test.cc` 在仿真车库里跑两趟，从里程计、图优化、地图、动态点一直到占据栅格和逐帧标签，全程不经过 Python。车端定位有完整的纯 C++ 程序 `gr_localize`（`cpp/apps/`，数据读写用 `gr_io`）。离线重建仍由 Python 编排：它在服务器上跑，还要调 PyTorch 模型。
+这些 C++ 接口不依赖 Python，可以直接在 C++ 程序里调用。`cpp/gr/testing/e2e_test.cc` 在仿真车库里跑两趟，从里程计、图优化、地图、动态点一直到占据栅格和逐帧标签，全程不经过 Python。纯 C++ 程序（`cpp/apps/`，数据读写用 `gr_io`）：车端定位 `gr_localize` 和离线重建的几何阶段 `gr_recon`。离线重建的完整流程仍由 Python 编排：后面的阶段要调 PyTorch 模型。
 
 **从 Python 迁到 C++ 的语义与导航几何**（2026-10-26）：楼层、结构、标线矢量化与分类、车位组装、单行判定、车道线、整趟定位循环和路网位置。迁移时保留旧 Python 实现逐项对照（合成、FusionPortableV2 手持与无人车三份数据）：
 - 楼层、车位组装、单行、车道线：结果完全一致；
 - 结构：合成与无人车一致，手持数据的柱有浮点级差别（旧实现用 float32 主方向）；
-- 标线：段数一致。骨架仍用 scikit-image 的细化（它在斜向台阶处和经典 Zhang-Suen 不同，下游车位组装对线段怎么断开很敏感），由 Python 传给 C++；
+- 标线：段数一致。骨架原来用 scikit-image 的细化（它在斜向台阶处和经典 Zhang-Suen 不同，下游车位组装对线段怎么断开很敏感）；2026-10-27 起 C++ `Skeletonize` 用 scikit-image 的查找表，500 个随机掩膜上逐格一致，涂料掩膜（OpenCV 顶帽、Otsu、线形开闭）也一并迁入，标线与车位结果不变；
 - 线段方向取决于 SVD 的符号（numpy 的符号是任意的），真实数据上车位数会差 1–3 个；
 - 加速：楼层 10–17 倍，结构约 10 倍，标线约 2 倍。
+- 2026-10-27：导航分层（含 `cv2.fillPoly` 的移植、孔洞填充、椭圆核闭运算与膨胀）和 BEV 栅格迁入 C++，结果逐值一致（9.9）。
 
 第 8 章新增的 C++ 部分：
 - **DA3 深度对齐**（`depth_prior`）：在 LiDAR 点上做稳健尺度 / 偏移拟合，按网格剔除，只填空洞；
@@ -1545,9 +1646,8 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 
 Python 部分：
 - 数据与标定读写、位姿集合（`recon/pose_set.py`）与产物版本记录（`provenance.py`）、阶段编排；
-- BEV 栅格；
-- 语义：标线的涂料掩膜（OpenCV）与骨架（scikit-image）、地面箭头的栅格准备、目标检测跟踪、车位号、规则、导出；
-- 导航地图的分层、路网编辑（合并、接入、碎片剪枝，shapely）、目标点、地址与 QA；
+- 语义：地面箭头的栅格准备、目标检测跟踪（`objects4d`）、车位号、规则、导出；
+- 导航地图的路网编辑（合并、接入、碎片剪枝，shapely）、目标点、地址、路网更新与 QA；
 - 语言路线的特征提取与身份级语言特征（`semantics/language_field.py`）；
 - 模型接口与合成真值实现（`models/`）；
 - 评测、自检和合成数据；
@@ -1567,24 +1667,28 @@ Python 部分：
 | `tests/` | pytest：端到端 + 单元 |
 | `data/` | 运行时：转换后的趟次、合成数据 |
 | `work/` | 运行时：各次重建的工作目录 |
-| `cpp/apps/` | 命令行程序：`gr_localize.cc`（车端定位） |
-| `build/` | 编译输出（`gr_tests`、`gr_localize`、`libgr_core.a`、`libgr_io.a`） |
+| `cpp/apps/` | 命令行程序：`gr_localize.cc`（车端定位）、`gr_recon.cc`（离线重建的几何阶段） |
+| `build/` | 编译输出（`gr_tests`、`gr_localize`、`gr_recon`、`libgr_core.a`、`libgr_io.a`、`libgr_pipeline.a`） |
+| `tools/` | `gen_config_tables.py`：由绑定生成 C++ 配置表 |
+| `docker/` | `Dockerfile`：`gr_localize` / `gr_recon` 镜像 |
+| `.github/workflows/` | CI（3.1） |
 
-**C++ 库 `cpp/gr/`**：按功能分文件夹，每个模块的 `<name>.h`、`<name>.cc`、`<name>_test.cc` 放在同一个文件夹里，按 `"gr/<文件夹>/<name>.h"` 引用（如 `"gr/nav/localization.h"`），头文件保护宏随路径（`GARAGE_RECON_GR_NAV_LOCALIZATION_H_`）。`io/` 编成静态库 `gr_io`（依赖 zlib），其余编进 `gr_core`（只依赖 Eigen），`CMakeLists.txt` 按文件夹分组列出源文件。算法细节见 10.1。
+**C++ 库 `cpp/gr/`**：按功能分文件夹，每个模块的 `<name>.h`、`<name>.cc`、`<name>_test.cc` 放在同一个文件夹里，按 `"gr/<文件夹>/<name>.h"` 引用（如 `"gr/nav/localization.h"`），头文件保护宏随路径（`GARAGE_RECON_GR_NAV_LOCALIZATION_H_`）。`io/` 编成静态库 `gr_io`（依赖 zlib），`pipeline/` 编成 `gr_pipeline`（依赖 `gr_io`），其余编进 `gr_core`（只依赖 Eigen），`CMakeLists.txt` 按文件夹分组列出源文件。算法细节见 10.1。
 
 | 文件夹 | 模块 | 内容 |
 |---|---|---|
 | `core/` | `types`、`pose`、`voxel`、`numeric`、`image`、`logging`、`check`、`geometry`、`kdtree`、`morphology` | 基础类型、SE(3)、体素哈希、与 numpy 一致的数值函数、8 位图像视图、日志、`GR_CHECK`；法向、RANSAC 平面、局部平面投影、凸多边形；2D k-d 树；栅格形态学 |
 | `sensors/` | `camera`、`exposure`、`imu`、`imu_preintegration` | 针孔 / Kannala-Brandt 鱼眼 / Double Sphere；卷帘快门的逐行位姿与行投影；轮速 + 陀螺先验与去畸变；IMU 预积分 |
-| `calibration/` | `camera_calibration`、`clock_sync` | 相机时间偏差与外参；两个陀螺的时钟偏差 |
+| `calibration/` | `camera_calibration`、`clock_sync`、`lidar_imu` | 相机时间偏差与外参；两个陀螺的时钟偏差；LiDAR–IMU 外参检查 |
 | `registration/` | `registration`、`cloud_compare` | 体素哈希地图与多尺度点到面 ICP；重力对齐的粗配准、放置（`PlaceGravityAligned`）与点到参考表面的距离 |
 | `odometry/` | `odometry`、`lio`、`trajectory` | 每趟前端 `OdometryPipeline`；LiDAR-惯性里程计；连续时间轨迹与重新去畸变 |
 | `backend/` | `keyframes`、`scan_context`、`loop_closure`、`pose_graph`、`plane_factor`、`lidar_ba`、`backend` | 关键帧表；回环门控、排序、ICP 验证、PCM；LM 位姿图；平面因子与 LiDAR BA；整个图优化阶段 |
-| `mapping/` | `static_map`、`visibility`、`raycast`、`raster`、`levels` | 测量点云与动态点判断；体素遍历与自由空间；BEV 栅格与地面纹理；楼层与坡道 |
-| `semantics/` | `objects`、`occupancy`、`projector`、`labeling`、`identity`、`structure`、`markings`、`vector_fit`、`slots` | 目标框时间线；每帧语义占据；z-buffer、第一表面深度与点云空间索引；逐帧标签与 2D→3D 投票；跨视角身份关联；柱与墙；标线矢量化、亚像素拟合与分类；车位组装 |
+| `mapping/` | `static_map`、`visibility`、`raycast`、`raster`、`bev`、`levels`、`change_detection` | 测量点云与动态点判断；体素遍历与自由空间；栅格化与地面纹理；每层 BEV 栅格；楼层与坡道；结构变化检测 |
+| `semantics/` | `objects`、`occupancy`、`projector`、`labeling`、`identity`、`structure`、`paint`、`markings`、`vector_fit`、`slots`、`slot_paint` | 目标框时间线；每帧语义占据；z-buffer、第一表面深度与点云空间索引；逐帧标签与 2D→3D 投票；跨视角身份关联；柱与墙；标线涂料掩膜；标线矢量化、亚像素拟合与分类；车位组装；车位涂色（充电车位） |
 | `splat/` | `gaussians`、`coverage`、`depth_prior` | LiDAR 锚定高斯与沿射线渲染；相机覆盖与训练掩膜；DA3 深度与 LiDAR 的对齐 |
-| `nav/` | `nav_map`、`arrows`、`traffic`、`lanes`、`position`、`localization`、`trip_localizer` | 距离变换、细化、骨架提图、路网最短路、栅格 A*；地面箭头；单行判定；车道线；路网上的位置；车端定位（逐帧、整趟） |
-| `io/` | `value`、`npy`、`tables`、`trip`、`config`、`nav_files` | 文件格式库 `gr_io`：YAML / JSON、npy / npz、CSV / TUM、趟目录、配置、导航地图文件 |
+| `nav/` | `layers`、`nav_map`、`arrows`、`traffic`、`lanes`、`features`、`position`、`localization`、`trip_localizer`、`slot_state`、`map_update` | 分层；距离变换、细化、骨架提图、路网最短路、栅格 A*；地面箭头；单行判定；车道线；道闸与减速带；路网上的位置；车端定位（逐帧、整趟）；车位实时占用；变化对路网的影响 |
+| `io/` | `value`、`npy`、`tables`、`trip`、`config`（+ 生成的 `config_tables.inc`）、`nav_files`、`recon_files`、`digest` | 文件格式库 `gr_io`：YAML / JSON、npy / npz、CSV / TUM、趟目录、配置、导航地图文件、重建工作目录、内容哈希 |
+| `pipeline/` | `recon_pipeline` | 重建阶段的编排 `gr_pipeline`（`gr_recon`） |
 | `sim/` | `sim` | 长方体场景的光线投射（合成数据用） |
 | `testing/` | `test`、`sim_garage`、`e2e_test.cc` | 测试框架（`GR_TEST` / `GR_EXPECT_*`）与仿真车库；纯 C++ 两趟全链路 |
 
@@ -1597,9 +1701,9 @@ Python 部分：
 | `bind_core.cc` | 基础构件：配准、里程计与 LIO 配置、位姿图、可见性、相机、投影与第一表面深度、栅格、几何、仿真场景 |
 | `bind_recon.cc` | 重建阶段：IMU / 轮速与运动先验、每趟前端、关键帧、回环、图优化阶段（含 BA、整趟粗对齐、外观回环）、地图融合与动态点、连续轨迹、相机标定、验收的粗配准 |
 | `bind_labels.cc` | 语义：目标框时间线、占据生成、逐帧标签、2D→3D 投票、身份关联 |
-| `bind_nav.cc` | 导航路网、单行判定、车道线 |
-| `bind_localization.cc` | 车端定位（逐帧 `Localizer`、整趟 `TripLocalizer`）、路网位置 `nav_position`、重力对齐放置 |
-| `bind_mapping.cc` | 楼层与坡道 |
+| `bind_nav.cc` | 导航分层、多边形填充、路网、单行判定、车道线、道路要素 |
+| `bind_localization.cc` | 车端定位（逐帧 `Localizer`、整趟 `TripLocalizer`）、路网位置 `nav_position`、重力对齐放置、车位实时占用、变化检测 |
+| `bind_mapping.cc` | 楼层与坡道、BEV 栅格 |
 | `bind_semantics.cc` | 结构、标线（矢量化、过滤、亚像素拟合、分类）、车位组装 |
 | `bind_splat.cc` | 3DGS 支撑：高斯初始化、沿射线渲染、相机覆盖、训练掩膜、DA3 深度对齐 |
 
@@ -1607,7 +1711,7 @@ Python 部分：
 
 | 位置 | 内容 |
 |---|---|
-| `cli.py` | 命令行：`synth`、`handheld`、`convert`、`import-scan`、`recon`、`semantics`、`qa`、`eval`、`accept`、`view`、`demo` |
+| `cli.py` | 命令行：`synth`、`handheld`、`convert`、`import-scan`、`recon`、`semantics`、`qa`、`eval`、`accept`、`view`、`localize`、`update-map`、`calibrate-lidar-imu`、`demo` |
 | `config.py`、`default_config.yaml` | 默认配置与用户 YAML 的深度合并 |
 | `core_config.py` | YAML 配置 → C++ 配置结构 |
 | `provenance.py` | 每个阶段的产物用的是哪个位姿集合（过期产物由自检拒收） |
@@ -1615,10 +1719,10 @@ Python 部分：
 | `parallel.py` | 逐帧任务的线程池（结果按输入顺序返回，产物与串行一致） |
 | `data/` | 趟目录格式（`dataset.py`）、标定 `rig.yaml`（`schema.py`）；合成车库 `synthetic/`：场景、轨迹、传感器仿真、生成器、真值重渲染（`ground_truth.py`）、模拟手持扫描（`handheld.py`） |
 | `convert/` | 真实数据 → 趟目录：`rosbag.py`（ROS 1 / 2 bag）、`mandeye.py`（Mandeye LAZ）、`frames.py`（摆正、放到地面、rig）、`profile.py`；`profiles/`：FusionPortableV2、Oxford Spires、Mandeye Mid-360、Hilti 2021（`*_recon.yaml` 是对应的重建配置） |
-| `recon/` | 第 4、8 章重建，`pipeline.py` 按阶段编排：`odometry` → `keyframes` / `backend` / `appearance`（回环与图优化）→ `trajectory` / `pose_set`（位姿集合）→ `calibration` → `static_map` → `levels` → `bev` → `floor_texture` → `depth_prior`（DA3）→ `gs`（3DGS）→ `gs_verify`（核验与正射）；`stereo.py`（双目近场深度） |
+| `recon/` | 第 4、8 章重建，`pipeline.py` 按阶段编排：`odometry` → `keyframes` / `backend` / `appearance`（回环与图优化）→ `trajectory` / `pose_set`（位姿集合）→ `calibration` → `static_map` → `levels` → `bev` → `floor_texture` → `depth_prior`（DA3）→ `gs`（3DGS）→ `gs_verify`（核验与正射）；`stereo.py`（双目近场深度）、`text_loops.py`（OCR 文字回环候选）、`lidar_imu.py`（LiDAR–IMU 外参检查） |
 | `models/` | 基础模型接口 `interfaces.py`、合成真值实现 `oracle.py`、真实模型 `da3.py`（DA3）与 `dino.py`（RoMa、DINOv2、VLAD），按配置构建的 `registry.py`（第一次使用时加载） |
 | `semantics/` | 第 5 章语义，`pipeline.py` 编排：`structure` → `markings`（`vector_fit` 矢量拟合）→ `slots` → `objects4d` → `occupancy` → `frame_labels` → `language_field`（特征 → 身份 → 语言）→ `numbers`（车位号 OCR）→ `rules`；`lifting`（2D→3D 投票）、`taxonomy`（类别表）、`adapters`（真实模型适配器） |
-| `nav/` | 第 6 章导航地图，`navmap.py` 编排：`layers` → `graph`（路网、桥、坡道）+ `lanes`（按车位排的车道线）→ `traffic`（单行）→ `goals` / `attributes`（地点、净空与限高）→ `address` → `qa` → `export`；`localize`（车端定位，命令 `localize`） |
+| `nav/` | 第 6 章导航地图，`navmap.py` 编排：`layers` → `graph`（路网、桥、坡道）+ `lanes`（按车位排的车道线）→ `traffic`（单行）→ `goals` / `attributes`（地点、净空与限高）→ `address` → `qa` → `export`；`localize`（车端定位、车位实时占用、变化检测，命令 `localize`）；`update`（按变化更新路网，命令 `update-map`） |
 | `eval/` | 对照合成真值评测：`synthetic_eval`、`pose_eval`（零偏 / 标定 / 曝光重投影）、`semantic_eval`（语言路线） |
 | `acceptance/` | 第 7 章手持真值验收：`handheld`（读取）、`scan_import`（扫描导出的裁剪、抽稀、楼层 / 柱草稿）、`registration`（自动 / 控制点配准、柱检查点）、`report`（表面精度、完整度、结论） |
 | `qa/` | 无真值自检 `selfcheck.py`：位姿集合与过期产物、平面厚度、BA 残差、回环与 IMU 残差、标定、多趟重复性、投影与跨视角一致性、规则违例 |
@@ -1628,7 +1732,7 @@ Python 部分：
 
 | 语言 | 位置 | 运行 |
 |---|---|---|
-| C++ | `cpp/gr/*/*_test.cc` | `./build/gr_tests`（单元测试 + 纯 C++ 端到端；`io/trip_test.cc` 写一趟仿真数据再读回、定位） |
+| C++ | `cpp/gr/*/*_test.cc` | `./build/gr_tests`（单元测试 + 纯 C++ 端到端；`io/trip_test.cc` 写一趟仿真数据再读回、定位；`io/recon_files_test.cc` 对照 Python 的哈希与文件格式） |
 | Python | `tests/test_*.py` | `PYTHONPATH=python .venv/bin/python -m pytest -q`（含一次 tiny 端到端） |
 
 ## 11. 工程约束
@@ -1652,6 +1756,8 @@ Python 部分：
 | SAM 3 | Meta SAM License | 有条件，需法务确认 |
 | DINOv2 | Apache 2.0 | 可用 |
 | DINOv3 | Meta DINOv3 License | 有条件，需法务确认 |
+| scikit-image 骨架查找表（复制进 `core/morphology.cc`） | BSD-3 | 可用，保留出处说明 |
+| OpenCV `fillPoly` / `LineIterator` / `clipLine` 的算法（`core/morphology.cc` 按其行为重写） | Apache 2.0 | 可用 |
 
 ### 11.3 风险
 
@@ -1673,7 +1779,7 @@ Python 部分：
 **下一步**
 - 本机可做：
   - 定位：用地面标线的反射强度补水平约束（露天停车场，9.8）；OCR 文字地标区分布局相同的楼层；
-  - 地图更新：多趟采集之间的变化检测，更新车位与路网。
+  - 地图更新：变化检测与路网更新已有（6.3），还要在真实数据上验证，并把更新后的路网和定位地图一起发版本。
 - 需要模型下载许可：OCR 模型（真实数据的车位号）。
 - 需要 GPU 服务器：
   - 3DGS 训练：冻结与保护策略、强度损失、核验流程、覆盖率 QA；
@@ -1683,10 +1789,11 @@ Python 部分：
 - 之后：点云网络（用审核后的 3D 标签训练），补相机盲区，并作为新车库的第二意见。
 
 **导航**
-- 单行道只来自地面箭头：箭头被车挡住或磨损时按双向；转弯箭头只取主轴方向；吊牌上的方向箭头还没用上。
-- 车道线只来自车位排，没有车位的开阔空地仍是骨架。
-- 地点只有入口（采集起点）和 OCR 读到的出口、门；车辆出入口道闸、坡道口没有单独标出；车位属性（充电、无障碍、专用）还没有。
-- 车位占用只是采集时刻的，导航要接实时状态。
+- 单行道：箭头、采集行驶方向和 OCR 标志都已用上（6.1）；吊牌上的图形方向箭头（没有文字）还没识别，转弯箭头只取主轴方向。行驶方向只在采集多次同向通过时才算证据，单趟采集给不出。
+- 车道线：车位排、长墙、采集行驶路线三种来源；既没有车位、也没有长墙、又没开过的空地仍是骨架。
+- 道闸、减速带依赖 2D 检测（合成数据用真值），真实模型还没接；道闸开闭状态目前不随时间变化。
+- 车位属性：绿色涂装与文字；只画了图标（轮椅、充电桩图形）的车位要靠图标检测。
+- 实时占用和变化检测只在合成数据上验证（9.4）；真实数据上停放车的遮挡、行人、施工围挡还要看。
 - 真实场地的车位检测仍有漏检：隔线碎成多段时整排丢失；室外停车场还有车位入口朝向判反的情况。
 
 **车端定位**
@@ -1696,16 +1803,15 @@ Python 部分：
 - 只在离线回放上验证，没有接车上的实时数据流和控制。
 
 **位姿与标定**
-- LiDAR–IMU 外参未估计（杆臂已建模，9.6）；加计的标度和轴间误差未建模，Keble 上只加 IMU 因子时仍比纯里程计差（9.6）。
-- LiDAR 时间偏差只在转换时按段估计，前提是雷达有内置 IMU；没有时要在后端作为待估参数。
-- LiDAR BA 把位姿块当稠密矩阵求解（先消去惯性状态），适用于约 2500 个关键帧以内。更大的车库要走稀疏求解（已有，但填充多、较慢）或分层 BA（HBA 式子图）。
-- 回环候选有 Scan Context 和 DINO 外观描述子（8.4，默认关闭，需要 GPU），还没有 OCR 文字候选。
-- 地图的绝对坐标只由入口 INS / GNSS 决定，测量级成果要用控制点定坐标系。
+- LiDAR–IMU 外参：有了检查工具（4.4），只报告不改标定；车载数据航向不可观，手持数据与 rig.yaml 差 1.7° 无法裁定。加计标度和轴间误差只能在姿态变化充分的数据上估，Keble 上只加 IMU 因子时仍比纯里程计差（9.6）。
+- LiDAR 时间偏差只在转换时按段估计，前提是雷达有内置 IMU；外参检查能给出 IMU 相对 LiDAR 的时间偏差，但还没回写到后端。
+- 分层 BA（4.1）只验证到 2290 个关键帧（合成）；更大的车库要验证窗口间约束是否足够，以及内存与耗时。
+- 回环候选：Scan Context、DINO 外观描述子（8.4）、OCR 文字（4.4），后两者默认关闭，需要模型。
+- 控制点已能作为锚点（4.4），还没有真实数据验证；没有控制点时绝对坐标只由入口 INS / GNSS 决定。
 
 **真实数据（FusionPortableV2）**
 - 用新默认（`ba.min_range` 5 m）复测手持数据的 BA；原先怀疑的线束仰角误差在另两台手持设备上没有得到印证（4.3）。
 - 找一份有厘米级参照的车载数据验证绝对精度，例如全站仪控制点或密集地面扫描。
-- IMU 噪声和零偏先验改为按传感器等级配置。
 - 没有柱的车库需要别的检查点，例如墙角、车位角或全站仪靶标（`points.csv`）。
 - 长走廊需要控制点或回环来约束航向。
 
@@ -1744,11 +1850,13 @@ Python 部分：
   - 只给需要的帧出标签（`frames.frame_stride`、`features.frame_stride`）；
   - 减小回环检测密度（`loops.stride`）；
   - 减少标定轨迹数（`calibration.tracks_per_anchor`）。
-- **不带 Python 部署**：车端定位已有纯 C++ 程序 `gr_localize`（6.2）。离线重建仍由 Python 编排；若整条重建链也要脱离 Python，读写层 `gr_io` 已经有了，还缺各阶段的编排和其余配置段的映射。
+- **不带 Python 部署**：车端定位 `gr_localize`（6.2）和重建的几何阶段 `gr_recon`（4.1）都是纯 C++，有 Docker 镜像和 CPack 包（3.1）。之后的阶段（标定、纹理、语义、导航）仍由 Python 编排，其中要调模型的部分本来就在 GPU 服务器上跑。
+- **CI**：工作流已写好（3.1），还没在 GitHub 上跑过（仓库未推送这次改动）；Linux 上的 Eigen 3.4、Docker 镜像只会在 CI 里第一次验证。
+- **大车库的分块处理**：分层 BA 解决了位姿块的大小；测量点云、动态点判断、语义仍是整图一次处理，内存随车库面积线性增长，还没按楼层 / 区域分块验证。
 - **仍在 Python 里的几何**：
-  - 标线的涂料掩膜与骨架（OpenCV、scikit-image）、地面箭头的栅格准备；
-  - 路网编辑（shapely）；
-  - 目标跟踪（`objects4d`）和 BEV 栅格。
+  - 地面箭头的栅格准备；
+  - 路网编辑（合并、接入、碎片剪枝）、车位内缩与目标点、车道投影（shapely）；
+  - 目标跟踪（`objects4d`：scipy / shapely / OpenCV），约 570 行，是剩下最大的一块。
 - 部分旧 Python 模块（objects4d、bev、数据读写等）仍按约 120 列写，尚未改成 Google 风格。
 - 合成路线的转弯很急（每帧最多 45°），转角处的单帧旋转误差可达 1–3°；真实 10 Hz 数据的转角误差会小得多。
 

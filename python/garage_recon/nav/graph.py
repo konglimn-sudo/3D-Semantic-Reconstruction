@@ -37,6 +37,10 @@ class Edge:
         headroom: Lowest object above the floor along the edge (m; None
             for open sky or ramps; attributes.py).
         posted_height: Posted height limit (m) of a sign along the edge.
+        features: Road features on the edge ("barrier": a barrier gate,
+            "speed_bump"; attributes.py).
+        blocked: A later trip found it impassable (update.py); routes
+            avoid it.
     """
 
     a: int
@@ -48,6 +52,8 @@ class Edge:
     one_way: bool = False
     headroom: float | None = None
     posted_height: float | None = None
+    features: tuple = ()
+    blocked: bool = False
 
     @property
     def length(self) -> float:
@@ -59,6 +65,8 @@ class Edge:
                 "one_way": self.one_way, "length": round(self.length, 3),
                 "headroom": self.headroom,
                 "posted_height": self.posted_height,
+                "features": list(self.features),
+                "blocked": self.blocked,
                 "points": np.round(self.points, 3).tolist()}
 
     @property
@@ -179,6 +187,9 @@ class NavGraph:
         graph = _core.RouteGraph(len(self.nodes))
         for edge in self.edges:
             a, b = (edge.b, edge.a) if reverse else (edge.a, edge.b)
+            if edge.blocked:  # A loop keeps the edge numbering.
+                graph.add_edge(a, a, 0.0, True)
+                continue
             graph.add_edge(a, b, edge.length, edge.one_way and not two_way)
         return graph
 
@@ -212,7 +223,9 @@ class NavGraph:
             graph.add_edge(Edge(e["a"], e["b"], np.asarray(e["points"], float),
                                 e["kind"], e["level"], e["width"],
                                 e["one_way"], e.get("headroom"),
-                                e.get("posted_height")))
+                                e.get("posted_height"),
+                                tuple(e.get("features", ())),
+                                bool(e.get("blocked", False))))
         return graph
 
 
@@ -236,7 +249,12 @@ def add_level_graph(graph: NavGraph, layers, cfg) -> int:
     nav = cfg.nav
     grid = layers.grid
     half = 0.5 * nav.vehicle.width + nav.vehicle.margin
-    aisle = layers.drivable & (layers.slot == 0) & ~layers.ramp
+    # Off the slots, unless the survey vehicle drove there (a slot detected
+    # on an aisle, or an empty slot crossed): those cells are drivable.
+    off_slots = layers.slot == 0
+    if layers.driven is not None:
+        off_slots = off_slots | layers.driven
+    aisle = layers.drivable & off_slots & ~layers.ramp
     navigable = aisle & (layers.clearance >= half)
     skeleton = _core.thin_mask(navigable.astype(np.uint8))
     result = _core.skeleton_graph(skeleton, nav.min_spur / grid.res)
@@ -430,9 +448,10 @@ def bridge_components(graph: NavGraph, layers, cfg) -> int:
 
 
 def build_graph(layers_by_level: dict, levels, cfg, log=print,
-                slots=()) -> tuple[NavGraph, dict]:
-    """Aisle graphs of all levels (with the lanes of the slot rows, see
-    lanes.py) joined by the ramps; also the lane report per level."""
+                slots=(), walls=(), drives=()) -> tuple[NavGraph, dict]:
+    """Aisle graphs of all levels (with the lanes of the slot rows, walls
+    and drives in open areas, see lanes.py) joined by the ramps; also the
+    lane report per level."""
     # pylint: disable-next=import-outside-toplevel
     from garage_recon.nav import lanes as lanes_lib  # Imports this module.
     nav = cfg.nav
@@ -440,11 +459,14 @@ def build_graph(layers_by_level: dict, levels, cfg, log=print,
     lane_reports = {}
     for level, layers in sorted(layers_by_level.items()):
         count = add_level_graph(graph, layers, cfg)
-        lanes = lanes_lib.add_level_lanes(graph, layers, slots, cfg)
+        lanes = lanes_lib.add_level_lanes(graph, layers, slots, cfg, walls,
+                                          drives)
         lane_reports[level] = lanes
         bridges = bridge_components(graph, layers, cfg)
         log(f"[nav] level {level}: {count} aisle edges, {lanes['lanes']} "
-            f"lanes from {lanes['rows']} slot rows ({lanes['lane_length_m']} "
+            f"lanes from {lanes['rows']} slot rows, "
+            f"{lanes.get('walls', 0)} walls and {lanes.get('drives', 0)} "
+            f"drive stretches ({lanes['lane_length_m']} "
             f"m, {lanes['replaced_edges']} skeleton edges replaced, "
             f"{lanes['links']} links, {lanes.get('pruned_edges', 0)} "
             f"fragment edges dropped), {bridges} bridges")

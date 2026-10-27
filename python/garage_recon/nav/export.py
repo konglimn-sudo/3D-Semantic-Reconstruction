@@ -100,7 +100,8 @@ def write_graph(directory: pathlib.Path, graph) -> None:
                   "coordinates": np.round(e.points, 3).tolist()},
                  {"edge": k, "a": e.a, "b": e.b, "kind": e.kind,
                   "level": e.level, "width": round(e.width, 2),
-                  "one_way": e.one_way, "length": round(e.length, 2)})
+                  "one_way": e.one_way, "length": round(e.length, 2),
+                  "features": list(e.features)})
         for k, e in enumerate(graph.edges)]
     features += [
         _feature({"type": "Point", "coordinates": np.round(p, 3).tolist()},

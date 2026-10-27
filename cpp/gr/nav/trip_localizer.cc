@@ -82,6 +82,7 @@ std::optional<SweepLocalization> TripLocalizer::Process(
   out.stamp = stamp;
   const auto started = std::chrono::steady_clock::now();
   out.result = localizer_.Process(frame.points, {}, stamp, frame.pose);
+  last_sweep_ = frame.points;
   out.ms = 1000.0 * Seconds(started);
   out.map_from_vehicle = out.result.pose * lidar_from_vehicle;
   out.odom_from_vehicle = frame.pose * lidar_from_vehicle;

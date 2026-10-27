@@ -19,6 +19,7 @@
 #include "gr/backend/loop_closure.h"
 #include "gr/calibration/camera_calibration.h"
 #include "gr/calibration/clock_sync.h"
+#include "gr/calibration/lidar_imu.h"
 #include "gr/mapping/static_map.h"
 #include "gr/odometry/odometry.h"
 #include "gr/odometry/trajectory.h"
@@ -521,6 +522,7 @@ void BindBackend(py::module_& m) {
       .def_readwrite("anchor_sigma_r", &BackendConfig::anchor_sigma_r)
       .def_readwrite("gnss_sigma_scale", &BackendConfig::gnss_sigma_scale)
       .def_readwrite("gnss_max_dt", &BackendConfig::gnss_max_dt)
+      .def_readwrite("control_max_dt", &BackendConfig::control_max_dt)
       .def_readwrite("gravity", &BackendConfig::gravity)
       .def_readwrite("gravity_sigma_deg", &BackendConfig::gravity_sigma_deg)
       .def_readwrite("gravity_window", &BackendConfig::gravity_window)
@@ -589,7 +591,15 @@ void BindBackend(py::module_& m) {
       .def_readwrite("max_cluster_weight", &LidarBaConfig::max_cluster_weight)
       .def_readwrite("robust_scale", &LidarBaConfig::robust_scale)
       .def_readwrite("rounds", &LidarBaConfig::rounds)
-      .def_readwrite("iterations", &LidarBaConfig::iterations);
+      .def_readwrite("iterations", &LidarBaConfig::iterations)
+      .def_readwrite("hierarchical_above", &LidarBaConfig::hierarchical_above)
+      .def_readwrite("window", &LidarBaConfig::window)
+      .def_readwrite("window_prior_sigma_t",
+                     &LidarBaConfig::window_prior_sigma_t)
+      .def_readwrite("window_prior_sigma_r",
+                     &LidarBaConfig::window_prior_sigma_r)
+      .def_readwrite("window_gravity_sigma_deg",
+                     &LidarBaConfig::window_gravity_sigma_deg);
 
   py::class_<AppearanceLoopConfig>(m, "AppearanceLoopConfig")
       .def(py::init<>())
@@ -640,6 +650,20 @@ void BindBackend(py::module_& m) {
                     "gnss rows must be [t, x, y, z(, std)]");
           },
           "(M, 4|5) rows [t, x, y, z(, std)] or None.")
+      .def_property(
+          "control_points",
+          [](const TripInputs& trip) { return trip.control_points; },
+          [](TripInputs& trip, const py::object& rows) {
+            trip.control_points = rows.is_none()
+                                      ? Eigen::MatrixXd()
+                                      : rows.cast<Eigen::MatrixXd>();
+            Require(trip.control_points.rows() == 0 ||
+                        trip.control_points.cols() >= 7,
+                    "control point rows must be [t, px, py, pz, x, y, z(, "
+                    "std)]");
+          },
+          "(M, 7|8) rows [t, px, py, pz (LiDAR frame), x, y, z (world), "
+          "std] or None.")
       .def_readwrite("frame_stamps", &TripInputs::frame_stamps)
       .def_property(
           "frame_odometry",
@@ -1341,6 +1365,55 @@ void BindRecon(py::module_& m) {
   BindCalibration(m);
   BindMap(m);
   BindAcceptance(m);
+
+  py::class_<LidarImuConfig>(m, "LidarImuConfig")
+      .def(py::init<>())
+      .def_readwrite("half_window", &LidarImuConfig::half_window)
+      .def_readwrite("stride", &LidarImuConfig::stride)
+      .def_readwrite("estimate_scale", &LidarImuConfig::estimate_scale)
+      .def_readwrite("estimate_time_offset",
+                     &LidarImuConfig::estimate_time_offset)
+      .def_readwrite("max_time_offset", &LidarImuConfig::max_time_offset)
+      .def_readwrite("estimate_lever_arm", &LidarImuConfig::estimate_lever_arm)
+      .def_readwrite("lever_arm_sigma", &LidarImuConfig::lever_arm_sigma)
+      .def_readwrite("gyro_sigma", &LidarImuConfig::gyro_sigma)
+      .def_readwrite("accel_sigma", &LidarImuConfig::accel_sigma)
+      .def_readwrite("huber", &LidarImuConfig::huber)
+      .def_readwrite("max_iterations", &LidarImuConfig::max_iterations)
+      .def_readwrite("gravity", &LidarImuConfig::gravity);
+
+  m.def(
+      "calibrate_lidar_imu",
+      [](const std::vector<double>& stamps, const py::object& poses,
+         const ImuSamples& imu, const Mat4& initial,
+         const LidarImuConfig& config) {
+        const std::vector<Pose> p = PosesFrom(poses);
+        Require(p.size() == stamps.size() && stamps.size() >= 3,
+                "need 3+ poses, one per stamp");
+        LidarImuResult r;
+        {
+          py::gil_scoped_release release;
+          r = CalibrateLidarImu(stamps, p, imu, Pose::FromMatrix(initial),
+                                config);
+        }
+        return py::dict(
+            "converged"_a = r.converged, "samples"_a = r.samples,
+            "R_imu_lidar"_a = r.imu_from_lidar, "gyro_bias"_a = r.gyro_bias,
+            "accel_bias"_a = r.accel_bias, "accel_scale"_a = r.accel_scale,
+            "gravity_world"_a = r.gravity_world,
+            "time_offset"_a = r.time_offset, "lever_arm"_a = r.lever_arm,
+            "sigma_lever_arm"_a = r.sigma_lever_arm,
+            "sigma_time_offset"_a = r.sigma_time_offset,
+            "sigma_rotation_deg"_a = r.sigma_rotation_deg,
+            "sigma_gyro_bias"_a = r.sigma_gyro_bias,
+            "sigma_accel_bias"_a = r.sigma_accel_bias,
+            "sigma_accel_scale"_a = r.sigma_accel_scale,
+            "gyro_rms"_a = r.gyro_rms, "accel_rms"_a = r.accel_rms);
+      },
+      "stamps"_a, "T_world_lidar"_a, "imu"_a, "T_imu_lidar"_a,
+      "config"_a = LidarImuConfig(),
+      "LiDAR-IMU rotation, biases and accelerometer scales from a trip "
+      "(gr/calibration/lidar_imu.h). `imu` in the IMU's own axes.");
 }
 
 }  // namespace gr::bindings

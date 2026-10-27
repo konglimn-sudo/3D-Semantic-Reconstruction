@@ -75,13 +75,16 @@ class LevelModel:
         A point belongs to the highest floor that is not above it; points over
         a ramp outline that sit closer to the ramp surface use the ramp instead.
         """
+        return _core.assign_levels(
+            *self.core_parts(), np.ascontiguousarray(xyz, dtype=np.float64))
+
+    def core_parts(self) -> tuple[list, list, list]:
+        """(z, grids, ramps) as the C++ functions take the model."""
         grids = [(g.x0, g.y0, g.res, np.asarray(g.z, np.float32))
                  for g in self.grids]
         ramps = [(r.level_from, r.level_to, np.asarray(r.plane, float),
                   np.asarray(r.polygon, float), r.slope) for r in self.ramps]
-        return _core.assign_levels(
-            np.asarray(self.z, float).tolist(), grids, ramps,
-            np.ascontiguousarray(xyz, dtype=np.float64))
+        return np.asarray(self.z, float).tolist(), grids, ramps
 
     def to_json(self) -> dict:
         return {

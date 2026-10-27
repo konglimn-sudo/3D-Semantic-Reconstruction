@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import dataclasses
 
-import cv2
 import numpy as np
 from scipy import ndimage
 
@@ -91,39 +90,14 @@ class FloorImage:
 
 
 def floor_images(rasters: dict, grid: bev.BevGrid) -> list[FloorImage]:
-    """Brightness images: "camera" (orthophoto) and "lidar" (intensity).
-
-    Cells under objects (height raster above 0.3 m) are not observed floor.
-    """
-    covered = (np.nan_to_num(rasters["height_max"]) > 0.3
-               if "height_max" in rasters else None)
-    out = []
-    rgb = rasters.get("rgb")
-    if rgb is not None and "texture_nobs" in rasters:
-        valid = rasters["texture_nobs"] > 0
-        if valid.any():
-            luminance = cv2.cvtColor(rgb.astype(np.uint8),
-                                     cv2.COLOR_RGB2GRAY) / 255.0
-            out.append(("camera", luminance, valid))
-    intensity = rasters.get("intensity")
-    if intensity is not None and np.isfinite(intensity).any():
-        observed = np.isfinite(intensity)
-        weight = ndimage.gaussian_filter(observed.astype(float), 1.0)
-        filled = ndimage.gaussian_filter(np.where(observed, intensity, 0.0),
-                                         1.0)
-        valid = weight > 0.15
-        out.append(("lidar",
-                    np.where(valid, filled / np.maximum(weight, 1e-6), 0.0),
-                    valid))
-    images = []
-    for name, image, valid in out:
-        if covered is not None:
-            valid = valid & ~covered
-        values = image[valid]
-        lo, hi = np.percentile(values, 2), np.percentile(values, 99.5)
-        normalised = np.clip((image - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-        images.append(FloorImage(name, normalised, valid, grid))
-    return images
+    """Brightness images: "camera" (orthophoto) and "lidar" (intensity), C++
+    FloorImages. Cells under objects (height raster above 0.3 m) are not
+    observed floor."""
+    images = _core.floor_images(
+        rasters.get("intensity"), rasters.get("rgb"),
+        rasters.get("texture_nobs"), rasters.get("height_max"))
+    return [FloorImage(name, image, valid > 0, grid)
+            for name, image, valid in images]
 
 
 def line_fit_config(config: FitConfig) -> _core.LineFitConfig:

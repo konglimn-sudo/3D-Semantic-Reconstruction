@@ -1,152 +1,95 @@
 #include "gr/io/config.h"
 
+#include <stdexcept>
+
 namespace gr {
 namespace {
 
-const FieldTable<LioConfig>& LioFields() {
-  static const FieldTable<LioConfig> table =
-      FieldTable<LioConfig>()
-          .Add("map_voxel", &LioConfig::map_voxel)
-          .Add("max_points_per_voxel", &LioConfig::max_points_per_voxel)
-          .Add("map_radius", &LioConfig::map_radius)
-          .Add("scan_voxel", &LioConfig::scan_voxel)
-          .Add("insert_voxel", &LioConfig::insert_voxel)
-          .Add("max_iterations", &LioConfig::max_iterations)
-          .Add("convergence", &LioConfig::convergence)
-          .Add("plane_radius", &LioConfig::plane_radius)
-          .Add("max_plane_radius", &LioConfig::max_plane_radius)
-          .Add("min_plane_points", &LioConfig::min_plane_points)
-          .Add("min_planarity", &LioConfig::min_planarity)
-          .Add("max_plane_thickness", &LioConfig::max_plane_thickness)
-          .Add("max_residual", &LioConfig::max_residual)
-          .Add("point_sigma", &LioConfig::point_sigma)
-          .Add("robust_scale", &LioConfig::robust_scale)
-          .Add("point_weight", &LioConfig::point_weight)
-          .Add("zupt_window", &LioConfig::zupt_window)
-          .Add("zupt_max_gyro", &LioConfig::zupt_max_gyro)
-          .Add("zupt_max_accel", &LioConfig::zupt_max_accel)
-          .Add("zupt_sigma", &LioConfig::zupt_sigma)
-          .Add("max_speed", &LioConfig::max_speed)
-          .Add("speed_sigma", &LioConfig::speed_sigma)
-          .Add("gyro_noise", &LioConfig::gyro_noise)
-          .Add("accel_noise", &LioConfig::accel_noise)
-          .Add("gyro_bias_walk", &LioConfig::gyro_bias_walk)
-          .Add("accel_bias_walk", &LioConfig::accel_bias_walk)
-          .Add("gravity", &LioConfig::gravity)
-          .Add("init_velocity_sigma", &LioConfig::init_velocity_sigma)
-          .Add("init_tilt_sigma_deg", &LioConfig::init_tilt_sigma_deg)
-          .Add("init_gyro_bias_sigma", &LioConfig::init_gyro_bias_sigma)
-          .Add("init_accel_bias_sigma", &LioConfig::init_accel_bias_sigma);
-  return table;
-}
+#include "gr/io/config_tables.inc"
 
-const FieldTable<OdometryConfig>& OdometryFields() {
-  static const FieldTable<OdometryConfig> table =
-      FieldTable<OdometryConfig>()
-          .Add("max_range", &OdometryConfig::max_range)
-          .Add("min_range", &OdometryConfig::min_range)
-          .Add("voxel_size", &OdometryConfig::voxel_size)
-          .Add("max_points_per_voxel", &OdometryConfig::max_points_per_voxel)
-          .Add("initial_threshold", &OdometryConfig::initial_threshold)
-          .Add("min_motion_th", &OdometryConfig::min_motion_th)
-          .Add("max_icp_iters", &OdometryConfig::max_icp_iters)
-          .Add("icp_conv", &OdometryConfig::icp_conv)
-          .Add("deskew", &OdometryConfig::deskew)
-          .Add("use_wheel_prior", &OdometryConfig::use_wheel_prior)
-          .Add("use_gyro_prior", &OdometryConfig::use_gyro_prior)
-          .Add("use_lio", &OdometryConfig::use_lio);
-  return table;
-}
-
-const FieldTable<KeyframeConfig>& KeyframeFields() {
-  static const FieldTable<KeyframeConfig> table =
-      FieldTable<KeyframeConfig>()
-          .Add("distance", &KeyframeConfig::distance)
-          .Add("angle", &KeyframeConfig::angle)
-          .Add("voxel", &KeyframeConfig::voxel);
-  return table;
-}
-
-const FieldTable<PlacementConfig>& PlacementFields() {
-  static const FieldTable<PlacementConfig> table =
-      FieldTable<PlacementConfig>()
-          .Add("voxel", &PlacementConfig::voxel)
-          .Add("icp_schedule", &PlacementConfig::icp_schedule)
-          .Add("icp_iters", &PlacementConfig::icp_iters)
-          .Add("min_score", &PlacementConfig::min_score)
-          .Add("z_peak_ratio", &PlacementConfig::z_peak_ratio)
-          .Add("max_candidates", &PlacementConfig::max_candidates)
-          .Add("min_fitness", &PlacementConfig::min_fitness)
-          .Add("max_rmse", &PlacementConfig::max_rmse)
-          .Add("min_fitness_gap", &PlacementConfig::min_fitness_gap)
-          .Add("distinct_t", &PlacementConfig::distinct_t)
-          .Add("distinct_r", &PlacementConfig::distinct_r);
-  return table;
-}
-
-const FieldTable<LocalizerConfig>& LocalizerFields() {
-  using C = LocalizerConfig;
-  static const FieldTable<C> table =
-      FieldTable<C>()
-          .Add("map_voxel", &C::map_voxel)
-          .Add("hash_voxel", &C::hash_voxel)
-          .Add("scan_voxel", &C::scan_voxel)
-          .Add("min_range", &C::min_range)
-          .Add("max_range", &C::max_range)
-          .Add("deskew", &C::deskew)
-          .Add("gates", &C::gates)
-          .Add("icp_iters", &C::icp_iters)
-          .Add("min_fitness", &C::min_fitness)
-          .Add("max_rmse", &C::max_rmse)
-          .Add("max_jump_t", &C::max_jump_t)
-          .Add("max_jump_r", &C::max_jump_r)
-          .Add("degenerate_ratio", &C::degenerate_ratio)
-          .Add("degenerate_sigma_t", &C::degenerate_sigma_t)
-          .Add("degenerate_sigma_r", &C::degenerate_sigma_r)
-          .Add("max_failures", &C::max_failures)
-          .Add("prior_schedule", &C::prior_schedule)
-          .Add("init_voxel", &C::init_voxel)
-          .Add("init_spacing", &C::init_spacing)
-          .Add("init_distance", &C::init_distance)
-          .Add("init_retry", &C::init_retry)
-          .Add("init_max_distance", &C::init_max_distance);
-  return table;
+// Sets the leaves of `table` (under `path` of `out`) that `user` does not.
+void SetUnlessGiven(const Value& table, const Value& user,
+                    std::vector<std::string>* path, Value* out) {
+  for (const auto& [key, value] : table.members()) {
+    path->push_back(key);
+    if (value.is_map()) {
+      SetUnlessGiven(value, user, path, out);
+    } else {
+      const Value* given = &user;
+      for (const std::string& k : *path) {
+        given = given->Find(k);
+        if (given == nullptr) break;
+      }
+      if (given == nullptr || given->is_null()) {
+        Value* section = out;
+        for (size_t k = 0; k + 1 < path->size(); ++k) {
+          Value* child = section->Find((*path)[k]);
+          section = child != nullptr && child->is_map()
+                        ? child
+                        : &section->Set((*path)[k], Value::Map());
+        }
+        section->Set(path->back(), value);
+      }
+    }
+    path->pop_back();
+  }
 }
 
 }  // namespace
 
+Value ApplyImuGrade(const Value& config, const Value& user) {
+  const Value& grade = config["imu_grade"];
+  if (grade.is_null() || (config["imu_grade_applied"].kind() ==
+                              Value::Kind::kBool &&
+                          config["imu_grade_applied"].AsBool())) {
+    return config;
+  }
+  const Value* table = config["imu_grades"].Find(grade.AsString());
+  if (table == nullptr) {
+    throw std::runtime_error("unknown imu_grade " + grade.AsString());
+  }
+  Value out = config;
+  std::vector<std::string> path;
+  SetUnlessGiven(*table, user, &path, &out);
+  out.Set("imu_grade_applied", Value::Bool(true));
+  return out;
+}
+
 Value LoadConfig(const std::vector<std::string>& paths) {
   Value config = Value::Map();
-  for (const std::string& path : paths) {
-    const Value file = ReadYamlFile(path);
-    if (!file.is_null()) config = DeepMerge(config, file);
+  Value user = Value::Map();
+  for (size_t k = 0; k < paths.size(); ++k) {
+    const Value file = ReadYamlFile(paths[k]);
+    if (file.is_null()) continue;
+    config = DeepMerge(config, file);
+    if (k > 0) user = DeepMerge(user, file);
   }
-  return config;
+  return ApplyImuGrade(config, user);
 }
 
 OdometryConfig OdometryConfigFrom(const Value& config) {
   OdometryConfig out;
   const Value& section = config["odometry"];
-  OdometryFields().Fill(section, &out);
+  OdometryConfigFields().Fill(section, &out);
   out.lio = LioConfig();
-  LioFields().Fill(section["lio"], &out.lio);
+  LioConfigFields().Fill(section["lio"], &out.lio);
   return out;
 }
 
 KeyframeConfig KeyframeConfigFrom(const Value& config) {
   KeyframeConfig out;
-  KeyframeFields().Fill(config["keyframes"], &out);
+  KeyframeConfigFields().Fill(config["keyframes"], &out);
   return out;
 }
 
 LocalizerConfig LocalizerConfigFrom(const Value& config) {
   LocalizerConfig out;
   const Value& section = config["localization"];
-  LocalizerFields().Fill(section, &out);
+  LocalizerConfigFields().Fill(section, &out);
   // As localize.localizer_config: the placement starts from its own
   // defaults, not the localizer's.
   out.placement = PlacementConfig();
-  PlacementFields().Fill(section["placement"], &out.placement);
+  PlacementConfigFields().Fill(section["placement"], &out.placement);
   return out;
 }
 
@@ -158,6 +101,63 @@ TripLocalizerConfig TripLocalizerConfigFrom(const Value& config) {
   const Value& window = config["localization"]["level_window"];
   if (!window.is_null()) out.level_window = window.AsDouble();
   return out;
+}
+
+SlotStateConfig SlotStateConfigFrom(const Value& config) {
+  SlotStateConfig out;
+  SlotStateConfigFields().Fill(config["nav"]["slot_states"], &out);
+  return out;
+}
+
+ChangeConfig ChangeConfigFrom(const Value& config) {
+  ChangeConfig out;
+  ChangeConfigFields().Fill(config["nav"]["changes"], &out);
+  return out;
+}
+
+GraphStageConfig GraphStageConfigFrom(const Value& config) {
+  GraphStageConfig out;
+  const Value& loops = config["loops"];
+  LoopConfigFields().Fill(loops, &out.loops);
+  AppearanceLoopConfigFields().Fill(loops["appearance"], &out.appearance);
+  BackendConfigFields().Fill(config["backend"], &out.backend);
+  TripAlignConfigFields().Fill(config["trip_align"], &out.trip_align);
+  LidarBaConfigFields().Fill(config["ba"], &out.ba);
+  RefineConfigFields().Fill(config["refine"], &out.refine);
+  return out;
+}
+
+MapFusionConfig MapFusionConfigFrom(const Value& config) {
+  MapFusionConfig out;
+  MapFusionConfigFields().Fill(config["map"]["fusion"], &out);
+  return out;
+}
+
+DynamicConfig DynamicConfigFrom(const Value& config) {
+  DynamicConfig out;
+  DynamicConfigFields().Fill(config["map"]["dynamic"], &out);
+  return out;
+}
+
+LevelConfig LevelConfigFrom(const Value& config) {
+  LevelConfig out;
+  LevelConfigFields().Fill(config["levels"], &out);
+  return out;
+}
+
+LidarImuConfig LidarImuConfigFrom(const Value& config) {
+  LidarImuConfig out;
+  LidarImuConfigFields().Fill(config["calibration"]["lidar_imu"], &out);
+  return out;
+}
+
+double CorridorHalfWidth(const Value& config) {
+  const Value& vehicle = config["nav"]["vehicle"];
+  const double width =
+      vehicle["width"].is_null() ? 1.9 : vehicle["width"].AsDouble();
+  const double margin =
+      vehicle["margin"].is_null() ? 0.3 : vehicle["margin"].AsDouble();
+  return 0.5 * width + margin;
 }
 
 }  // namespace gr

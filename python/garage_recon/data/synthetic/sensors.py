@@ -41,6 +41,12 @@ def _hash01(ix, iy, iz) -> np.ndarray:
     return (h & np.uint64(0xFFFF)).astype(np.float64) / 65535.0
 
 
+def _bounds(corners) -> list[float]:
+    """[x0, x1, y0, y1] of axis-aligned corners."""
+    c = np.asarray(corners, float)
+    return [c[:, 0].min(), c[:, 0].max(), c[:, 1].min(), c[:, 1].max()]
+
+
 def value_noise(points: np.ndarray, scale: float) -> np.ndarray:
     """Smooth 3D value noise in [0, 1]."""
     grid = points / scale
@@ -98,6 +104,10 @@ class SceneRaycaster:
             self.static.add_box(box.center, box.size, box.R)
         self.lines = garage.lines_array()
         self.paint_cls = garage.paint_classes()
+        # Green floors of the charging slots: [level, x0, x1, y0, y1].
+        self.green = np.array(
+            [[s["level"], *_bounds(s["corners"])] for s in garage.slots
+             if "ev" in s.get("attributes", [])], float).reshape(-1, 5)
 
     def _attributes(self, boxes: list[scene_lib.Box]):
         return (np.array([b.cls for b in boxes], int),
@@ -227,6 +237,14 @@ class SceneRaycaster:
         }
         for name, colour in palette.items():
             rgb[cls == taxonomy.cid(name)] = colour
+        floor = np.nonzero(cls == taxonomy.cid("floor"))[0]
+        if len(self.green) and len(floor):
+            p = points[floor]
+            level = np.rint(-p[:, 2] / self.scene.layout.level_height)
+            for lv, x0, x1, y0, y1 in self.green:
+                inside = ((level == lv) & (p[:, 0] > x0) & (p[:, 0] < x1)
+                          & (p[:, 1] > y0) & (p[:, 1] < y1))
+                rgb[floor[inside]] = (70, 150, 90)
         vehicle = cls == taxonomy.cid("vehicle")
         if vehicle.any():
             instance = hit["instance"][vehicle]

@@ -23,6 +23,7 @@ def trip_inputs(ds: TripDataset, odom: TripOdometry) -> _core.TripInputs:
     ti.T_vehicle_lidar = ds.rig.primary_lidar.T_vehicle_lidar
     ti.initial_pose = entrance_pose(ds)  # At the first LiDAR stamp.
     ti.gnss = ds.gnss()
+    ti.control_points = ds.control_points()
     ti.frame_stamps = odom.stamps
     ti.frame_odometry = odom.lidar_poses
     ti.imu = ds.imu_samples()

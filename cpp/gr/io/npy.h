@@ -6,8 +6,11 @@
 #define GARAGE_RECON_GR_IO_NPY_H_
 
 #include <cstdint>
+#include <cstring>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace gr {
@@ -34,7 +37,36 @@ struct NpyArray {
                              std::vector<int64_t> shape);
   static NpyArray FromInts(const std::vector<int32_t>& values,
                            std::vector<int64_t> shape);
+  // Any arithmetic element type: <f8, <i2, <u1, ... as its C++ type.
+  template <typename T>
+  static NpyArray Of(const std::vector<T>& values,
+                     std::vector<int64_t> shape);
+  // float16, rounded to nearest even (numpy's astype(np.float16)).
+  static NpyArray FromHalfs(const std::vector<float>& values,
+                            std::vector<int64_t> shape);
+  // numpy bool (|b1) from 0 / non-zero bytes.
+  static NpyArray FromBools(const std::vector<uint8_t>& values,
+                            std::vector<int64_t> shape);
 };
+
+template <typename T>
+NpyArray NpyArray::Of(const std::vector<T>& values,
+                      std::vector<int64_t> shape) {
+  static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>,
+                "NpyArray::Of: arithmetic element types (not bool)");
+  NpyArray a;
+  a.kind = std::is_floating_point_v<T> ? 'f'
+           : std::is_signed_v<T>       ? 'i'
+                                       : 'u';
+  a.item_size = static_cast<int>(sizeof(T));
+  a.shape = std::move(shape);
+  if (a.size() != static_cast<int64_t>(values.size())) {
+    throw std::runtime_error("NpyArray::Of: shape mismatch");
+  }
+  a.data.resize(values.size() * sizeof(T));
+  if (!values.empty()) std::memcpy(a.data.data(), values.data(), a.data.size());
+  return a;
+}
 
 // Member name (without .npy) -> array.
 using NpzArchive = std::map<std::string, NpyArray>;

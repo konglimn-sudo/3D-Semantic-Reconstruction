@@ -17,6 +17,7 @@ aisle (right-hand traffic), centred arrows on a one-way aisle.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -55,6 +56,17 @@ class Layout:
     # a tree (the ramp opening cuts aisle 2), so any one-way aisle would cut
     # part of the level off from the entrance.
     one_way: tuple = ()
+    # Slot attributes: charging slots have a green floor and 充电 painted in
+    # them; the others carry their text (无障碍, 专用) on the floor. Ids
+    # missing in a smaller layout are ignored.
+    ev_slots: tuple = ("L0-A-002", "L0-A-003", "L1-B-005")
+    accessible_slots: tuple = ("L0-B-001",)
+    reserved_slots: tuple = ("L0-D-002",)
+
+    def slot_attributes(self, slot_id: str) -> list[str]:
+        named = {"ev": self.ev_slots, "accessible": self.accessible_slots,
+                 "reserved": self.reserved_slots}
+        return [name for name, ids in named.items() if slot_id in ids]
 
     @property
     def group_span(self) -> float:
@@ -286,6 +298,8 @@ def build_static_scene(L: Layout) -> GarageScene:
                         "entrance": ent,
                         "width": L.bay_width,
                         "depth": y1 - y0,
+                        "attributes": L.slot_attributes(
+                            f"L{i}-{name}-{g * L.bays_per_group + b + 1:03d}"),
                     })
     _add_arrows(sc)
     return sc
@@ -428,3 +442,28 @@ def moving_cars(scene: GarageScene, trip_index: int, seed: int) -> list[MovingCa
     h = 1.5
     return [MovingCar(np.array([x_start, y, L.level_z(0) + h / 2]), np.array([-speed, 0.0, 0.0]), t0,
                       t0 + length / speed, np.array([4.5, 1.85, h]), 0, 900 + trip_index)]
+
+
+def apply_change(scene: GarageScene, change: dict) -> GarageScene:
+    """A copy of the scene with boxes added and removed (one trip's change:
+    construction, maintenance).
+
+    `change`: {"add": [{"center", "size", "level", "cls" (taxonomy name),
+    "kind"}], "remove": [{"kind", "level", "near": [x, y]}]}: the box of that
+    kind and level nearest to `near` is removed.
+    """
+    out = dataclasses.replace(scene, boxes=list(scene.boxes))
+    for spec in change.get("remove", []):
+        candidates = [k for k, b in enumerate(out.boxes)
+                      if b.kind == spec["kind"] and b.level == spec["level"]]
+        if not candidates:
+            raise ValueError(f"no {spec['kind']} box on level {spec['level']}")
+        near = np.asarray(spec["near"], float)
+        k = min(candidates, key=lambda i: float(
+            np.linalg.norm(out.boxes[i].center[:2] - near)))
+        del out.boxes[k]
+    for spec in change.get("add", []):
+        out.boxes.append(_box(spec["center"], spec["size"],
+                              cid(spec.get("cls", "other")),
+                              spec.get("kind", "wall"), int(spec["level"])))
+    return out
