@@ -12,6 +12,7 @@
 //   <trip>/imu.csv                      t, gx, gy, gz, ax, ay, az (IMU frame)
 //   <trip>/wheel.csv                    t, speed
 //   <trip>/gnss.csv                     t, x, y, z, std
+//   <trip>/control_points.csv           t, px, py, pz, x, y, z(, std)
 
 #ifndef GARAGE_RECON_GR_IO_TRIP_H_
 #define GARAGE_RECON_GR_IO_TRIP_H_
@@ -90,6 +91,9 @@ class TripReader {
   Eigen::MatrixXd Imu() const;
   Eigen::MatrixXd Wheel() const;
   Eigen::MatrixXd Gnss() const;
+  // Surveyed targets seen in the sweeps (dataset.control_points): rows
+  // [t, px, py, pz (LiDAR frame), x, y, z (world)(, std)].
+  Eigen::MatrixXd ControlPoints() const;
   // In the vehicle axes / with the speed scale, as dataset.imu_samples and
   // wheel_samples.
   ImuSamples ImuSamplesInVehicle() const;

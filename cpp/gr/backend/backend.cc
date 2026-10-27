@@ -78,6 +78,41 @@ void AddGnssAnchors(const KeyframeSet& keyframes, const std::vector<int>& trip,
   }
 }
 
+// Position anchors from the control points of one trip: the target's
+// LiDAR point moved into the nearest keyframe's frame.
+void AddControlPoints(const KeyframeSet& keyframes,
+                      const std::vector<int>& trip, const TripInputs& inputs,
+                      const BackendConfig& config,
+                      std::vector<Anchor>& anchors) {
+  const Eigen::MatrixXd& rows = inputs.control_points;
+  if (rows.rows() == 0 || rows.cols() < 7 || inputs.frame_stamps.empty()) {
+    return;
+  }
+  const MotionPrior prior(inputs.imu, inputs.wheel);
+  for (Eigen::Index r = 0; r < rows.rows(); ++r) {
+    const double t = rows(r, 0);
+    const auto time_gap = [&](int k) {
+      return std::abs(keyframes[static_cast<size_t>(k)].stamp - t);
+    };
+    size_t best = 0;
+    for (size_t a = 1; a < trip.size(); ++a) {
+      if (time_gap(trip[a]) < time_gap(trip[best])) best = a;
+    }
+    if (time_gap(trip[best]) > config.control_max_dt) continue;
+    const std::optional<Pose> seen_from = OdometryAt(inputs, prior, t);
+    if (!seen_from) continue;
+    const Keyframe& keyframe = keyframes[static_cast<size_t>(trip[best])];
+    Anchor anchor;
+    anchor.type = Anchor::Type::kPosition;
+    anchor.keyframe = trip[best];
+    anchor.position = Vec3(rows(r, 4), rows(r, 5), rows(r, 6));
+    anchor.lever = keyframe.odom.Inverse() *
+                   (*seen_from * Vec3(rows(r, 1), rows(r, 2), rows(r, 3)));
+    anchor.sigma = rows.cols() > 7 ? std::max(rows(r, 7), 1e-3) : 0.01;
+    anchors.push_back(anchor);
+  }
+}
+
 // The wheel speed (vehicle x axis at the vehicle origin) moved to the
 // inertial body origin, the IMU: v + w x p, in the vehicle axes.
 Vec3 BodyVelocityFromWheel(const TripInputs& inputs, double stamp) {
@@ -245,6 +280,7 @@ std::vector<Anchor> MakeAnchors(const KeyframeSet& keyframes,
       anchors.push_back(anchor);
     }
     AddGnssAnchors(keyframes, trip, inputs, lever, config, anchors);
+    AddControlPoints(keyframes, trip, inputs, config, anchors);
     if (anchors.size() == before) {
       Anchor anchor;
       anchor.type = Anchor::Type::kPose;
@@ -567,6 +603,167 @@ std::vector<Pose> RunLidarBa(
   return current;
 }
 
+std::vector<Pose> HierarchicalLidarBa(
+    const KeyframeSet& keyframes, const std::vector<Pose>& poses,
+    const std::vector<LoopConstraint>& loops,
+    const std::vector<Anchor>& anchors,
+    const std::vector<GravityMeasurement>& gravity,
+    const BackendConfig& backend_config, const LidarBaConfig& ba_config,
+    GraphSummary* summary, LidarBaSummary* ba_summary, const Logger& log,
+    const std::vector<TripInputs>* trips, InertialEstimate* inertial) {
+  GR_CHECK(poses.size() == keyframes.size());
+  const double voxel = ba_config.sweep_voxel;
+  // 1. Windows of consecutive keyframes per trip, each refined alone.
+  std::vector<std::vector<int>> windows;
+  std::vector<int> window_of(keyframes.size(), -1);
+  const size_t size = static_cast<size_t>(std::max(ba_config.window, 2));
+  for (int t = 0; t < keyframes.num_trips(); ++t) {
+    const std::vector<int>& trip = keyframes.TripIndices(t);
+    size_t begin = 0;
+    while (begin < trip.size()) {
+      // A short tail joins the window before it.
+      size_t end = std::min(begin + size, trip.size());
+      if (trip.size() - end < std::max<size_t>(3, size / 2)) {
+        end = trip.size();
+      }
+      std::vector<int> members(trip.begin() + static_cast<long>(begin),
+                               trip.begin() + static_cast<long>(end));
+      for (int k : members) {
+        window_of[static_cast<size_t>(k)] = static_cast<int>(windows.size());
+      }
+      windows.push_back(std::move(members));
+      begin = end;
+    }
+  }
+  std::vector<Pose> local = poses;  // Refined within their window.
+  LidarBaConfig window_config = ba_config;
+  window_config.rounds = std::max(1, ba_config.rounds);
+  const int64_t num_windows = static_cast<int64_t>(windows.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+  for (int64_t w = 0; w < num_windows; ++w) {
+    const std::vector<int>& members = windows[static_cast<size_t>(w)];
+    if (members.size() < 3) continue;
+    KeyframeSet sub({voxel});
+    std::vector<Pose> start;
+    for (int k : members) {
+      Keyframe keyframe = keyframes[static_cast<size_t>(k)];
+      keyframe.trip = 0;
+      keyframe.odom = poses[static_cast<size_t>(k)];
+      sub.Add(keyframe, keyframes.Cloud(static_cast<size_t>(k), voxel));
+      start.push_back(poses[static_cast<size_t>(k)]);
+    }
+    Anchor hold;  // The first keyframe stays.
+    hold.keyframe = 0;
+    hold.pose = start.front();
+    hold.sigma_t = 1e-4;
+    hold.sigma_r = 1e-3;
+    const std::vector<Pose> refined =
+        RunLidarBa(sub, start, {}, {hold}, {}, backend_config, window_config);
+    for (size_t m = 0; m < members.size(); ++m) {
+      local[static_cast<size_t>(members[m])] = refined[m];
+    }
+  }
+  // 2. The windows as rigid super-keyframes.
+  std::vector<Pose> frames;  // world_from_window: its first keyframe.
+  KeyframeSet super({voxel});
+  for (const std::vector<int>& members : windows) {
+    const Pose frame = local[static_cast<size_t>(members.front())];
+    const Pose window_from_world = frame.Inverse();
+    Points merged;
+    for (int k : members) {
+      const Points cloud = TransformPoints(
+          keyframes.Cloud(static_cast<size_t>(k), voxel),
+          window_from_world * local[static_cast<size_t>(k)]);
+      merged.insert(merged.end(), cloud.begin(), cloud.end());
+    }
+    Keyframe keyframe = keyframes[static_cast<size_t>(members.front())];
+    keyframe.odom = frame;
+    super.Add(keyframe, VoxelDownsample(merged, voxel));
+    frames.push_back(frame);
+  }
+  // window_from_keyframe within its window.
+  const auto in_window = [&](int k) {
+    const int w = window_of[static_cast<size_t>(k)];
+    return frames[static_cast<size_t>(w)].Inverse() *
+           local[static_cast<size_t>(k)];
+  };
+  std::vector<LoopConstraint> super_loops;
+  for (const LoopConstraint& loop : loops) {
+    const int a = window_of[static_cast<size_t>(loop.i)];
+    const int b = window_of[static_cast<size_t>(loop.j)];
+    if (a == b) continue;
+    LoopConstraint moved = loop;
+    moved.i = a;
+    moved.j = b;
+    // T_b^-1 T_a = (T_b^-1 T_j)(T_j^-1 T_i)(T_i^-1 T_a).
+    moved.j_from_i =
+        in_window(loop.j) * loop.j_from_i * in_window(loop.i).Inverse();
+    super_loops.push_back(moved);
+  }
+  std::vector<Anchor> super_anchors;
+  for (const Anchor& anchor : anchors) {
+    Anchor moved = anchor;
+    moved.keyframe = window_of[static_cast<size_t>(anchor.keyframe)];
+    const Pose keyframe_in_window = in_window(anchor.keyframe);
+    if (anchor.type == Anchor::Type::kPose) {
+      moved.pose = anchor.pose * keyframe_in_window.Inverse();
+    } else {
+      moved.lever = keyframe_in_window * anchor.lever;
+    }
+    super_anchors.push_back(moved);
+  }
+  std::vector<GravityMeasurement> super_gravity;
+  std::vector<uint8_t> has_gravity(windows.size(), 0);
+  for (const GravityMeasurement& g : gravity) {
+    const int w = window_of[static_cast<size_t>(g.index)];
+    if (has_gravity[static_cast<size_t>(w)]) continue;  // One per window.
+    has_gravity[static_cast<size_t>(w)] = 1;
+    GravityMeasurement moved = g;
+    moved.index = w;
+    moved.up = in_window(g.index).rotation * g.up;
+    super_gravity.push_back(moved);
+  }
+  if (trips != nullptr && backend_config.imu_factors &&
+      ba_config.window_gravity_sigma_deg > 0.0) {
+    // The super-keyframes have no IMU factors: each keeps the roll / pitch
+    // the inertial graph gave its keyframes (their mean up direction in the
+    // window frame; single keyframes are off by up to 0.2 deg).
+    for (size_t w = 0; w < windows.size(); ++w) {
+      if (has_gravity[w]) continue;
+      Vec3 up = Vec3::Zero();
+      for (int k : windows[w]) {
+        up += in_window(k).rotation *
+              (poses[static_cast<size_t>(k)].rotation.transpose() *
+               Vec3::UnitZ());
+      }
+      GravityMeasurement tilt;
+      tilt.index = static_cast<int>(w);
+      tilt.up = up.normalized();
+      tilt.sigma_rad = DegToRad(ba_config.window_gravity_sigma_deg);
+      super_gravity.push_back(tilt);
+    }
+  }
+  LogLine(log, StringPrintf("[ba] hierarchical: %zu keyframes in %zu windows",
+                            keyframes.size(), windows.size()));
+  const std::vector<Pose> placed =
+      RunLidarBa(super, frames, super_loops, super_anchors, super_gravity,
+                 backend_config, ba_config, nullptr, ba_summary, log);
+  // 3. Every keyframe near its placed window, smoothed by the full graph.
+  std::vector<Pose> rigid(keyframes.size());
+  std::vector<UnaryPrior> priors;
+  const Mat6 information = PoseInformation(ba_config.window_prior_sigma_t,
+                                           ba_config.window_prior_sigma_r);
+  for (size_t k = 0; k < keyframes.size(); ++k) {
+    const int w = window_of[k];
+    rigid[k] = placed[static_cast<size_t>(w)] * in_window(static_cast<int>(k));
+    priors.push_back({static_cast<int>(k), rigid[k], information});
+  }
+  return OptimizeGraph(keyframes, loops, anchors, gravity, backend_config,
+                       &rigid, &priors, summary, trips, inertial);
+}
+
 std::vector<Pose> RefineScanToMap(
     const KeyframeSet& keyframes, const std::vector<Pose>& poses,
     const std::vector<LoopConstraint>& loops,
@@ -707,7 +904,15 @@ GraphStageResult RunGraphStage(
                         config.backend, &poses, nullptr, &result.summary,
                         imu_trips, &result.inertial);
   log_cost(result.summary, result.loops.size());
-  if (config.ba.enabled) {
+  const bool hierarchical =
+      config.ba.hierarchical_above >= 0 &&
+      static_cast<int>(keyframes.size()) > config.ba.hierarchical_above;
+  if (config.ba.enabled && hierarchical) {
+    poses = HierarchicalLidarBa(keyframes, poses, result.loops,
+                                result.anchors, result.gravity, config.backend,
+                                config.ba, &result.summary, &result.ba, log,
+                                imu_trips, &result.inertial);
+  } else if (config.ba.enabled) {
     poses =
         RunLidarBa(keyframes, poses, result.loops, result.anchors,
                    result.gravity, config.backend, config.ba, &result.summary,

@@ -1,0 +1,11 @@
+.git
+.venv
+build
+data
+work
+out
+python
+!python/garage_recon/default_config.yaml
+tests
+**/__pycache__
+**/.DS_Store

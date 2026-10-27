@@ -149,6 +149,13 @@ class ReconPipeline:
             pairs = appearance.appearance_pairs(
                 keyframes, self.datasets, self.models.features, self.cfg,
                 self.log)
+        text_cfg = self.cfg.loops.get("text") or {}
+        if text_cfg.get("enabled") and self.models.ocr is not None:
+            from garage_recon.recon import text_loops
+            found = text_loops.text_pairs(keyframes, self.datasets,
+                                          self.models.ocr, self.cfg, self.log)
+            pairs = (found if pairs is None else np.unique(
+                np.vstack([pairs, found]), axis=0))
         result = backend.run_graph(keyframes, self.datasets, odoms, self.cfg,
                                    self.log, pairs)
         poses = result["poses"]

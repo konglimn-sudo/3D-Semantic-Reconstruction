@@ -317,8 +317,14 @@ class OracleDepthPrior:
         return out
 
 
+# Text painted in a slot with an attribute.
+_ATTRIBUTE_TEXTS = {"ev": "充电", "accessible": "无障碍", "reserved": "专用"}
+
+
 class OracleOcr:
-    """Slot numbers of the ground-truth slots whose entrance is in view."""
+    """Slot numbers of the ground-truth slots whose entrance is in view, and
+    the attribute texts (充电, 无障碍, 专用) painted a third of the way into
+    their slots."""
 
     needs_images = False  # Reads the ground truth, not the image.
 
@@ -332,15 +338,24 @@ class OracleOcr:
         slots = self.world.scene.slots
         if not slots:
             return []
-        centers = np.array([
-            [(s["corners"][0][0] + s["corners"][1][0]) / 2.0,
-             (s["corners"][0][1] + s["corners"][1][1]) / 2.0, s["z"] + 0.01]
-            for s in slots])
+        texts, points = [], []
+        for s in slots:
+            corners = np.asarray(s["corners"], float)
+            texts.append(s["slot_id"])
+            points.append([*((corners[0] + corners[1]) / 2.0), s["z"] + 0.01])
+            for attribute in s.get("attributes", []):
+                # Painted near the entrance, a third of the way in.
+                entrance = (corners[0] + corners[1]) / 2.0
+                back = (corners[2] + corners[3]) / 2.0
+                texts.append(_ATTRIBUTE_TEXTS[attribute])
+                points.append([*(entrance + (back - entrance) / 3.0),
+                               s["z"] + 0.01])
+        centers = np.array(points)
         pose = self.world.row_poses(frame.trip_id, frame.camera,
                                     frame.stamp_ns)
         center = pose[len(pose) // 2, :3, 3]
         near = np.linalg.norm(centers - center, axis=1) < self.max_range
-        uv = np.full((len(slots), 2), np.nan)
+        uv = np.full((len(centers), 2), np.nan)
         if near.any():
             uv[near] = self.world.project(frame.trip_id, frame.camera,
                                           frame.stamp_ns, centers[near])
@@ -360,7 +375,7 @@ class OracleOcr:
                 continue
             box = np.array([[u - 5, v - 3], [u + 5, v - 3], [u + 5, v + 3],
                             [u - 5, v + 3]])
-            out.append(interfaces.TextResult(slots[k]["slot_id"], box, 1.0))
+            out.append(interfaces.TextResult(texts[k], box, 1.0))
         return out
 
 

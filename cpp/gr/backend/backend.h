@@ -37,6 +37,9 @@ struct BackendConfig {
   double anchor_sigma_r = 0.3;
   double gnss_sigma_scale = 1.0;
   double gnss_max_dt = 1.5;  // s between a fix and its keyframe.
+  // Surveyed control points seen in a sweep (TripInputs::control_points)
+  // join the nearest keyframe within this (s).
+  double control_max_dt = 5.0;
   // Accelerometer roll / pitch factors. They ignore the accelerometer bias;
   // the IMU factors below model it and replace them.
   bool gravity = false;
@@ -104,6 +107,10 @@ struct TripInputs {
   Pose vehicle_from_lidar;
   std::optional<Pose> initial_pose;  // world_from_vehicle, INS at the entrance.
   Eigen::MatrixXd gnss;              // Rows [t, x, y, z(, std)], local ENU (m).
+  // Surveyed control points (total-station targets) seen in the sweeps:
+  // rows [t, px, py, pz, x, y, z, std]: the target at p in the LiDAR
+  // frame of time t has world position (x, y, z) to std (m).
+  Eigen::MatrixXd control_points;
   std::vector<double> frame_stamps;  // Every LiDAR frame of the trip.
   std::vector<Pose> frame_odometry;  // world_from_lidar per frame (odometry).
   ImuSamples imu;                    // Vehicle frame.
@@ -135,9 +142,12 @@ struct InertialEstimate {
   std::vector<uint8_t> valid;
 };
 
-// INS pose at the entrance and GNSS fixes (moved to their keyframe with the
-// odometry increment); trips without any anchor get a weak prior so that the
-// graph stays well posed (they are then placed by inter-trip loops).
+// INS pose at the entrance, GNSS fixes and control points (moved to their
+// keyframe with the odometry increment; a control point anchors the world
+// position of its target, a point of the keyframe's LiDAR frame, which
+// holds a long corridor's heading where loops are missing); trips without
+// any anchor get a weak prior so that the graph stays well posed (they are
+// then placed by inter-trip loops).
 std::vector<Anchor> MakeAnchors(const KeyframeSet& keyframes,
                                 const std::vector<TripInputs>& trips,
                                 const BackendConfig& config,
@@ -184,6 +194,31 @@ std::vector<Pose> RefineScanToMap(
 // ba_config.sweep_voxel; `summary`, `ba_summary`, `trips` and `inertial` as
 // in OptimizeGraph (may be null).
 std::vector<Pose> RunLidarBa(
+    const KeyframeSet& keyframes, const std::vector<Pose>& poses,
+    const std::vector<LoopConstraint>& loops,
+    const std::vector<Anchor>& anchors,
+    const std::vector<GravityMeasurement>& gravity,
+    const BackendConfig& backend_config, const LidarBaConfig& ba_config,
+    GraphSummary* summary = nullptr, LidarBaSummary* ba_summary = nullptr,
+    const Logger& log = nullptr, const std::vector<TripInputs>* trips = nullptr,
+    InertialEstimate* inertial = nullptr);
+
+// LiDAR BA for large maps (HBA-like, two levels), which the dense BA's pose
+// block (about 2500 keyframes) cannot hold:
+//
+//   1. every trip is cut into windows of ba_config.window consecutive
+//      keyframes, and each window gets its own plane BA (its first keyframe
+//      held, the others tied by their current relative poses; windows in
+//      parallel);
+//   2. each window becomes a rigid super-keyframe (its sweeps merged in its
+//      first keyframe's frame) and the super-keyframes get a plane BA with
+//      the loops, anchors and gravity moved onto them;
+//   3. a pose graph over all keyframes with the odometry, loops, anchors and
+//      inertial factors keeps every keyframe near its window placed by step
+//      2 (window_prior_sigma_t / _r), smoothing the window boundaries.
+//
+// Same arguments as RunLidarBa.
+std::vector<Pose> HierarchicalLidarBa(
     const KeyframeSet& keyframes, const std::vector<Pose>& poses,
     const std::vector<LoopConstraint>& loops,
     const std::vector<Anchor>& anchors,

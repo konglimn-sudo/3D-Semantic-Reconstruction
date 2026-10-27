@@ -5,11 +5,14 @@
 
 #include <exception>
 #include <map>
+#include <type_traits>
 #include <string>
 #include <vector>
 
 #include "bind_util.h"
 #include "gr/semantics/markings.h"
+#include "gr/semantics/paint.h"
+#include "gr/semantics/slot_paint.h"
 #include "gr/semantics/slots.h"
 #include "gr/semantics/structure.h"
 #include "gr/semantics/vector_fit.h"
@@ -114,6 +117,19 @@ std::vector<float> RasterFrom(const py::object& raster,
               array.shape(1) == frame.width,
           "rasters must be (height, width) of the frame");
   return std::vector<float>(array.data(), array.data() + array.size());
+}
+
+// (K, 2) points (any array-like) as Vec2s.
+std::vector<Vec2> CornersFrom(const py::handle& points) {
+  const RowMatX2d xy =
+      py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(
+          points)
+          .cast<RowMatX2d>();
+  std::vector<Vec2> out;
+  for (Eigen::Index k = 0; k < xy.rows(); ++k) {
+    out.push_back(xy.row(k).transpose());
+  }
+  return out;
 }
 
 }  // namespace
@@ -418,6 +434,222 @@ void BindSemantics(py::module_& m) {
       "Columns, walls and structure labels of the point map: dict of labels "
       "(uint8 per point), columns, walls, yaw. `path_xy` is (N, 3) "
       "(z unused).");
+
+  py::class_<PaintConfig>(m, "PaintConfig")
+      .def(py::init<>())
+      .def_readwrite("tophat_size", &PaintConfig::tophat_size)
+      .def_readwrite("min_contrast", &PaintConfig::min_contrast)
+      .def_readwrite("mad_k", &PaintConfig::mad_k)
+      .def_readwrite("line_close_length", &PaintConfig::line_close_length)
+      .def_readwrite("line_open_length", &PaintConfig::line_open_length)
+      .def_readwrite("min_area", &PaintConfig::min_area);
+
+  // The rasters of a level (each (H, W[, 3]) or None).
+  const auto rasters_from = [](const py::object& intensity,
+                               const py::object& rgb,
+                               const py::object& texture_nobs,
+                               const py::object& height_max) {
+    PaintRasters r;
+    const auto take = [&](const py::object& a, auto* out, int channels) {
+      if (a.is_none()) return;
+      using T = typename std::remove_pointer_t<decltype(out)>::value_type;
+      const auto array =
+          py::array_t<T, py::array::c_style | py::array::forcecast>::ensure(a);
+      Require(array && array.ndim() >= 2, "rasters are (H, W) arrays");
+      const int h = static_cast<int>(array.shape(0));
+      const int w = static_cast<int>(array.shape(1));
+      Require(array.size() == static_cast<py::ssize_t>(h) * w * channels,
+              "raster shape");
+      Require((r.width == 0 && r.height == 0) ||
+                  (r.width == w && r.height == h),
+              "rasters of different sizes");
+      r.width = w;
+      r.height = h;
+      out->assign(array.data(), array.data() + array.size());
+    };
+    take(intensity, &r.intensity, 1);
+    take(rgb, &r.rgb, 3);
+    take(texture_nobs, &r.texture_nobs, 1);
+    take(height_max, &r.height_max, 1);
+    return r;
+  };
+
+  m.def(
+      "marking_layers",
+      [rasters_from](const py::object& intensity, const py::object& rgb,
+                     const py::object& texture_nobs,
+                     const py::object& height_max) {
+        const PaintRasters r =
+            rasters_from(intensity, rgb, texture_nobs, height_max);
+        std::vector<PaintLayer> layers;
+        {
+          py::gil_scoped_release release;
+          layers = MarkingLayers(r);
+        }
+        py::list out;
+        for (const PaintLayer& layer : layers) {
+          out.append(py::make_tuple(
+              layer.name, ToImage(layer.brightness, r.height, r.width),
+              ToImage(layer.valid, r.height, r.width)));
+        }
+        return out;
+      },
+      "intensity"_a, "rgb"_a, "texture_nobs"_a, "height_max"_a,
+      "Brightness layers (C++ MarkingLayers): [(name, (H, W) brightness, "
+      "(H, W) valid uint8)].");
+
+  m.def(
+      "floor_images",
+      [rasters_from](const py::object& intensity, const py::object& rgb,
+                     const py::object& texture_nobs,
+                     const py::object& height_max) {
+        const PaintRasters r =
+            rasters_from(intensity, rgb, texture_nobs, height_max);
+        std::vector<PaintLayer> images;
+        {
+          py::gil_scoped_release release;
+          images = FloorImages(r);
+        }
+        py::list out;
+        for (const PaintLayer& image : images) {
+          out.append(py::make_tuple(
+              image.name, ToImage(image.brightness, r.height, r.width),
+              ToImage(image.valid, r.height, r.width)));
+        }
+        return out;
+      },
+      "intensity"_a, "rgb"_a, "texture_nobs"_a, "height_max"_a,
+      "Floor images of the line fit (C++ FloorImages): [(camera | lidar, "
+      "(H, W) normalised brightness, (H, W) valid uint8)].");
+
+  m.def(
+      "paint_mask",
+      [rasters_from](const py::object& intensity, const py::object& rgb,
+                     const py::object& texture_nobs,
+                     const py::object& height_max, double res,
+                     const PaintConfig& config) {
+        const PaintRasters r =
+            rasters_from(intensity, rgb, texture_nobs, height_max);
+        Mask mask;
+        {
+          py::gil_scoped_release release;
+          mask = PaintMask(MarkingLayers(r), r.width, r.height, res, config);
+        }
+        return ToImage(mask, r.height, r.width);
+      },
+      "intensity"_a, "rgb"_a, "texture_nobs"_a, "height_max"_a, "res"_a,
+      "config"_a = PaintConfig(),
+      "Painted cells of all layers (C++ PaintMask): (H, W) uint8.");
+
+  m.def(
+      "elongated",
+      [](const py::array_t<uint8_t, py::array::c_style |
+                                        py::array::forcecast>& mask,
+         double res, double yaw, const PaintConfig& config) {
+        Require(mask.ndim() == 2, "mask is (H, W)");
+        const int h = static_cast<int>(mask.shape(0));
+        const int w = static_cast<int>(mask.shape(1));
+        Mask m(mask.data(), mask.data() + mask.size());
+        Mask out;
+        {
+          py::gil_scoped_release release;
+          out = Elongated(m, w, h, res, yaw, config);
+        }
+        return ToImage(out, h, w);
+      },
+      "mask"_a, "res"_a, "yaw"_a, "config"_a = PaintConfig(),
+      "Paint along the grid axes (C++ Elongated): (H, W) uint8.");
+
+  m.def(
+      "close_mask",
+      [](const py::array_t<uint8_t, py::array::c_style |
+                                        py::array::forcecast>& mask,
+         const std::string& shape, int size, int iterations) {
+        Require(mask.ndim() == 2, "mask is (H, W)");
+        Require(shape == "ellipse" || shape == "cross",
+                "shape is ellipse or cross");
+        const int h = static_cast<int>(mask.shape(0));
+        const int w = static_cast<int>(mask.shape(1));
+        Mask m(mask.data(), mask.data() + mask.size());
+        for (uint8_t& v : m) v = v != 0;
+        Mask out;
+        {
+          py::gil_scoped_release release;
+          out = shape == "cross"
+                    ? CloseCross(m, w, h, iterations)
+                    : CloseKernel(m, w, h, EllipseKernel(size), size);
+        }
+        return ToImage(out, h, w);
+      },
+      "mask"_a, "shape"_a, "size"_a = 3, "iterations"_a = 1,
+      "Binary closing: 'ellipse' (cv2.morphologyEx with an ellipse of "
+      "`size`) or 'cross' (scipy binary_closing, `iterations`).");
+
+  m.def(
+      "dilate_cross",
+      [](const py::array_t<uint8_t, py::array::c_style |
+                                        py::array::forcecast>& mask,
+         int iterations) {
+        Require(mask.ndim() == 2, "mask is (H, W)");
+        const int h = static_cast<int>(mask.shape(0));
+        const int w = static_cast<int>(mask.shape(1));
+        Mask m(mask.data(), mask.data() + mask.size());
+        for (uint8_t& v : m) v = v != 0;
+        for (int k = 0; k < iterations; ++k) m = DilateCross(m, w, h);
+        return ToImage(m, h, w);
+      },
+      "mask"_a, "iterations"_a = 1,
+      "scipy binary_dilation with the cross structure, `iterations`.");
+
+  py::class_<SlotPaintConfig>(m, "SlotPaintConfig")
+      .def(py::init<>())
+      .def_readwrite("inset", &SlotPaintConfig::inset)
+      .def_readwrite("min_saturation", &SlotPaintConfig::min_saturation)
+      .def_readwrite("hue_min", &SlotPaintConfig::hue_min)
+      .def_readwrite("hue_max", &SlotPaintConfig::hue_max);
+
+  m.def(
+      "measure_slot_paint",
+      [](const py::list& slots,
+         const py::array_t<uint8_t, py::array::c_style |
+                                        py::array::forcecast>& rgb,
+         const py::array_t<uint8_t, py::array::c_style |
+                                        py::array::forcecast>& observed,
+         double x0, double y0, double res, const SlotPaintConfig& config) {
+        Require(rgb.ndim() == 3 && rgb.shape(2) == 3, "rgb must be (H, W, 3)");
+        Require(observed.ndim() == 2 && observed.shape(0) == rgb.shape(0) &&
+                    observed.shape(1) == rgb.shape(1),
+                "observed must be (H, W) like rgb");
+        std::vector<std::array<Vec2, 4>> corners;
+        for (const py::handle& item : slots) {
+          const std::vector<Vec2> c = CornersFrom(item);
+          Require(c.size() == 4, "a slot needs 4 corners");
+          corners.push_back({c[0], c[1], c[2], c[3]});
+        }
+        const RasterFrame frame{x0, y0, res, static_cast<int>(rgb.shape(1)),
+                                static_cast<int>(rgb.shape(0))};
+        const std::vector<uint8_t> colours(rgb.data(),
+                                           rgb.data() + rgb.size());
+        const std::vector<uint8_t> seen(observed.data(),
+                                        observed.data() + observed.size());
+        std::vector<SlotPaint> paint;
+        {
+          py::gil_scoped_release release;
+          paint = MeasureSlotPaint(corners, colours, seen, frame, config);
+        }
+        py::list out;
+        for (const SlotPaint& p : paint) {
+          out.append(py::dict("cells"_a = p.cells, "observed"_a = p.observed,
+                              "in_band"_a = p.in_band,
+                              "mean_rgb"_a = p.mean_rgb));
+        }
+        return out;
+      },
+      "slots"_a, "rgb"_a, "observed"_a, "x0"_a, "y0"_a, "res"_a,
+      "config"_a = SlotPaintConfig(),
+      "Floor colour inside each slot ((4, 2) corners) on the orthophoto: "
+      "dicts of cells, observed, in_band (share of observed cells in the "
+      "hue band), mean_rgb.");
 }
 
 }  // namespace gr::bindings

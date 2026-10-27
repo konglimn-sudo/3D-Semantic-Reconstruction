@@ -64,6 +64,19 @@ struct LidarBaConfig {
   double robust_scale = 3.0;  // Cauchy scale on the mean point chi2.
   int rounds = 2;             // Plane extraction + optimisation.
   int iterations = 10;        // Levenberg-Marquardt iterations per round.
+  // Hierarchical BA (backend.h HierarchicalLidarBa) for maps with more than
+  // `hierarchical_above` keyframes (0: always, < 0: never): windows of
+  // `window` consecutive keyframes of a trip refined on their own, then the
+  // windows as rigid super-keyframes.
+  int hierarchical_above = 2000;
+  int window = 100;
+  double window_prior_sigma_t = 0.002;  // Final graph: the window shapes (m)
+  double window_prior_sigma_r = 0.02;   // ... and deg.
+  // Step 2 without IMU factors: a window without a measured gravity factor
+  // keeps the roll / pitch of the inertial graph (the input poses of its
+  // keyframes) with this sigma (deg), else the windows tilt freely between
+  // the anchors.
+  double window_gravity_sigma_deg = 0.02;
 };
 
 struct BaPlane {

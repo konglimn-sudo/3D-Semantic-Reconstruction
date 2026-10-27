@@ -1,5 +1,6 @@
 #include "gr/io/value.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -132,6 +133,10 @@ const Value* Value::Find(const std::string& key) const {
     if (name == key) return &value;
   }
   return nullptr;
+}
+
+Value* Value::Find(const std::string& key) {
+  return const_cast<Value*>(static_cast<const Value*>(this)->Find(key));
 }
 
 const Value& Value::operator[](const std::string& key) const {
@@ -760,7 +765,7 @@ std::string FloatRepr(double v) {
   }
   out += digits.substr(0, 1);
   if (digits.size() > 1) out += "." + digits.substr(1);
-  char exp[8];
+  char exp[16];
   std::snprintf(exp, sizeof(exp), "e%c%02d", exponent < 0 ? '-' : '+',
                 std::abs(exponent));
   return out + exp;
@@ -921,6 +926,90 @@ Value ReadJsonFile(const std::string& path) {
 std::string ToJson(const Value& value, int indent) {
   std::string out;
   WriteJson(value, indent, 0, &out);
+  return out;
+}
+
+namespace {
+
+// A scalar as PyYAML (YAML 1.1) reads it back: strings double-quoted (JSON
+// escapes are YAML escapes), floats with a '.' before any exponent.
+std::string YamlScalar(const Value& value) {
+  if (value.is_number() && !value.is_integer()) {
+    std::string text = ToJson(value, -1);
+    const size_t e = text.find('e');
+    if (e != std::string::npos && text.find('.') == std::string::npos) {
+      text.insert(e, ".0");
+    }
+    if (text == "NaN") return ".nan";
+    if (text == "Infinity") return ".inf";
+    if (text == "-Infinity") return "-.inf";
+    return text;
+  }
+  return ToJson(value, -1);
+}
+
+bool IsScalar(const Value& value) {
+  return !value.is_list() && !value.is_map();
+}
+
+void WriteYaml(const Value& value, int depth, std::string* out) {
+  const std::string pad(static_cast<size_t>(2 * depth), ' ');
+  if (value.is_map()) {
+    for (const auto& [key, item] : value.members()) {
+      *out += pad + ToJson(Value::String(key), -1) + ":";
+      if (IsScalar(item) || item.size() == 0) {
+        *out += " " + (item.is_list() ? std::string("[]")
+                       : item.is_map() ? std::string("{}")
+                                       : YamlScalar(item)) +
+                "\n";
+      } else if (item.is_list() &&
+                 std::all_of(item.items().begin(), item.items().end(),
+                             IsScalar)) {
+        std::string flow = " [";
+        for (size_t k = 0; k < item.size(); ++k) {
+          if (k) flow += ", ";
+          flow += YamlScalar(item[k]);
+        }
+        *out += flow + "]\n";
+      } else {
+        *out += "\n";
+        WriteYaml(item, depth + 1, out);
+      }
+    }
+    return;
+  }
+  if (value.is_list()) {
+    for (const Value& item : value.items()) {
+      if (IsScalar(item) || item.size() == 0) {
+        *out += pad + "- " +
+                (item.is_list() ? std::string("[]")
+                 : item.is_map() ? std::string("{}")
+                                 : YamlScalar(item)) +
+                "\n";
+      } else {
+        // The item's block one level deeper, its first line after "- ".
+        std::string block;
+        WriteYaml(item, depth + 1, &block);
+        block.replace(0, static_cast<size_t>(2 * (depth + 1)), pad + "- ");
+        *out += block;
+      }
+    }
+    return;
+  }
+  *out += pad + YamlScalar(value) + "\n";
+}
+
+}  // namespace
+
+std::string ToYaml(const Value& value) {
+  std::string out;
+  if (IsScalar(value) || value.size() == 0) {
+    return (value.is_list() ? std::string("[]")
+            : value.is_map() ? std::string("{}")
+                             : YamlScalar(value)) +
+           "\n";
+  }
+  WriteYaml(value, 0, &out);
   return out;
 }
 

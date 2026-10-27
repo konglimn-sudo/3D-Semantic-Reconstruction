@@ -17,10 +17,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
-import cv2
 import numpy as np
-from scipy import ndimage
-from skimage.morphology import skeletonize
 
 from .. import _core, core_config
 from ..recon.bev import BevGrid
@@ -55,98 +52,36 @@ class MarkingSegmenter(Protocol):
         """Binary marking mask for a BEV image in [0, 1]."""
 
 
-def _normalize(img: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    v = img[valid]
-    if len(v) == 0:
-        return np.zeros_like(img)
-    lo, hi = np.percentile(v, 2), np.percentile(v, 99.5)
-    return np.clip((img - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+def _rasters(rasters: dict) -> tuple:
+    return (rasters.get("intensity"), rasters.get("rgb"),
+            rasters.get("texture_nobs"), rasters.get("height_max"))
 
 
-def _fill_sparse(img: np.ndarray, valid: np.ndarray, sigma: float) -> tuple[np.ndarray, np.ndarray]:
-    """Normalised convolution: interpolates sparse LiDAR samples."""
-    w = ndimage.gaussian_filter(valid.astype(float), sigma)
-    v = ndimage.gaussian_filter(np.where(valid, img, 0.0), sigma)
-    filled = np.where(w > 1e-3, v / np.maximum(w, 1e-6), 0.0)
-    return filled, w > 0.15
+def paint_config(cfg) -> _core.PaintConfig:
+    return core_config.fill(_core.PaintConfig(), cfg.markings)
 
 
 def marking_layers(rasters: dict) -> list[tuple[str, np.ndarray, np.ndarray]]:
-    """(name, brightness in [0, 1], valid mask) for every available source."""
-    layers = []
-    inten = rasters.get("intensity")
-    if inten is not None and np.isfinite(inten).any():
-        filled, ok = _fill_sparse(np.nan_to_num(inten), np.isfinite(inten), 1.0)
-        layers.append(("lidar_intensity", _normalize(filled, ok), ok))
-    rgb = rasters.get("rgb")
-    if rgb is not None and "texture_nobs" in rasters and (rasters["texture_nobs"] > 0).any():
-        ok = rasters["texture_nobs"] > 0
-        lum = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(float) / 255.0
-        layers.append(("camera_texture", _normalize(lum, ok), ok))
+    """(name, brightness in [0, 1], valid mask) for every available source
+    (C++ MarkingLayers)."""
+    layers = _core.marking_layers(*_rasters(rasters))
     if not layers:
         raise ValueError("no intensity or texture raster available")
-    hmax = rasters.get("height_max")
-    if hmax is not None:
-        covered = np.nan_to_num(hmax) > 0.3  # under an object: no paint visible
-        layers = [(n, img, ok & ~covered) for n, img, ok in layers]
-    return layers
-
-
-def _line_kernel(length: int, angle: float) -> np.ndarray:
-    k = np.zeros((length, length), np.uint8)
-    c = (length - 1) / 2.0
-    d = np.array([np.cos(angle), np.sin(angle)]) * c
-    cv2.line(k, (int(round(c - d[0])), int(round(c - d[1]))), (int(round(c + d[0])), int(round(c + d[1]))), 1, 1)
-    return k
-
-
-def layer_mask(img: np.ndarray, valid: np.ndarray, res: float, cfg) -> np.ndarray:
-    """White top-hat with a robust per-layer threshold (median + k * MAD)."""
-    mc = cfg.markings
-    bg = np.median(img[valid]) if valid.any() else 0.0
-    work = np.where(valid, img, bg)
-    k = max(3, int(round(mc.tophat_size / res)) | 1)
-    u8 = (work * 255).astype(np.uint8)
-    tophat = cv2.morphologyEx(u8, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    t = tophat[valid].astype(float)
-    if len(t) == 0:
-        return np.zeros_like(valid)
-    med = np.median(t)
-    mad = np.median(np.abs(t - med)) * 1.4826
-    otsu, _ = cv2.threshold(tophat[valid].reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thr = max(otsu, med + mc.mad_k * mad, mc.min_contrast * 255)
-    return (tophat > thr) & valid
+    return [(name, image, valid > 0) for name, image, valid in layers]
 
 
 def elongated(mask: np.ndarray, res: float, yaw: float, cfg) -> np.ndarray:
     """Keeps paint that forms line pieces along the garage grid axes (removes
-    texture speckle, text and blobs)."""
-    L = max(3, int(round(cfg.markings.line_open_length / res)) | 1)
-    Lc = max(3, int(round(cfg.markings.line_close_length / res)) | 1)
-    m = mask.astype(np.uint8)
-    out = np.zeros_like(m)
-    for a in (yaw, yaw + np.pi / 2):
-        # LiDAR samples paint ring by ring: bridge the dots along the line
-        # direction first (no smearing across), then require line pieces.
-        closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _line_kernel(Lc, a))
-        out |= cv2.morphologyEx(closed, cv2.MORPH_OPEN, _line_kernel(L, a))
-    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    lab, n = ndimage.label(out, structure=np.ones((3, 3)))
-    if n:
-        sizes = ndimage.sum(out, lab, index=np.arange(1, n + 1))
-        keep = np.zeros(n + 1, bool)
-        keep[1:] = sizes * res * res >= 0.05  # >= 0.05 m^2 of paint
-        out = keep[lab].astype(np.uint8)
-    return out.astype(bool)
+    texture speckle, text and blobs; C++ Elongated)."""
+    return _core.elongated(np.ascontiguousarray(mask, np.uint8), res, yaw,
+                           paint_config(cfg)) > 0
 
 
 def paint_mask(rasters: dict, res: float, cfg) -> np.ndarray:
-    """Painted cells of all available layers, before the line filter."""
-    mask = None
-    for _, img, valid in marking_layers(rasters):
-        m = layer_mask(img, valid, res, cfg)
-        mask = m if mask is None else (mask | m)
-    return mask
+    """Painted cells of all available layers, before the line filter (C++
+    PaintMask: per layer a white top-hat above a robust threshold)."""
+    marking_layers(rasters)  # Raises without a usable layer.
+    return _core.paint_mask(*_rasters(rasters), res, paint_config(cfg)) > 0
 
 
 def classical_mask(rasters: dict, res: float, yaw: float, cfg) -> np.ndarray:
@@ -171,9 +106,8 @@ def detect_arrows(mask: np.ndarray, grid: BevGrid,
         area; metres) and the mask of their paint, slightly dilated.
     """
     # Bridge the gaps between LiDAR rings inside an arrow.
-    closed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                                        (3, 3)))
+    closed = _core.close_mask(np.ascontiguousarray(mask, np.uint8),
+                              "ellipse", 3)
     config = core_config.fill(_core.ArrowConfig(),
                               cfg.markings.get("arrows"))
     found = _core.detect_arrows(closed, grid.res, grid.x0, grid.y0, config)
@@ -187,7 +121,7 @@ def detect_arrows(mask: np.ndarray, grid: BevGrid,
                for k in ("center", "direction", "tail", "tip")},
             **{k: round(float(arrow[k]), 3)
                for k in ("length", "shaft_width", "head_width", "area")}})
-    return arrows, ndimage.binary_dilation(paint, iterations=2)
+    return arrows, _core.dilate_cross(paint.astype(np.uint8), 2) > 0
 
 
 def _to_dict(seg: MarkingSegment) -> dict:
@@ -210,14 +144,11 @@ def marking_config(cfg) -> _core.MarkingConfig:
 def vectorize(mask: np.ndarray, grid: BevGrid, cfg,
               level: int) -> list[MarkingSegment]:
     """Line segments of a paint mask (C++ VectorizeMarkings: skeleton
-    branches fitted, collinear pieces merged, length / width filters)."""
-    # The skeleton stays scikit-image's: its thinning differs from plain
-    # Zhang-Suen at diagonal steps, and the slot assembly downstream is
-    # sensitive to how lines split.
-    skeleton = skeletonize(np.asarray(mask, bool))
+    (scikit-image's thinning, ported), branches fitted, collinear pieces
+    merged, length / width filters)."""
     out = _core.vectorize_markings(
         np.ascontiguousarray(mask, np.uint8), grid.x0, grid.y0, grid.res,
-        marking_config(cfg), level, np.ascontiguousarray(skeleton, np.uint8))
+        marking_config(cfg), level)
     return [_from_dict(d) for d in out]
 
 
@@ -249,7 +180,8 @@ def extract_markings(rasters: dict, grid: BevGrid, cfg, yaw: float = 0.0, segmen
             else elongated(paint, grid.res, yaw, cfg))
     observed = np.any([l[2] for l in marking_layers(rasters)], axis=0)
     covered = np.nan_to_num(rasters["height_max"]) > 0.3 if "height_max" in rasters else np.zeros_like(observed)
-    floor = ndimage.binary_closing(observed | covered, iterations=2)  # cars do not end the floor
+    floor = _core.close_mask((observed | covered).astype(np.uint8), "cross",
+                             3, 2) > 0  # Cars do not end the floor.
     # Paint lies on observed floor (both sides) and follows the grid.
     kept = _core.filter_markings(
         [_to_dict(s) for s in vectorize(mask, grid, cfg, grid.level)],

@@ -118,5 +118,37 @@ GR_TEST(LidarBaTest, BundleAdjustmentRemovesOdometryErrors) {
   GR_EXPECT_LT(rotation_after, 0.02);
 }
 
+GR_TEST(LidarBaTest, HierarchicalBaMatchesTheDenseOne) {
+  // The same drive with windows of 4 keyframes (4 windows): close to the
+  // dense BA.
+  std::mt19937 rng(4);
+  std::uniform_real_distribution<double> uniform(-1.0, 1.0);
+  std::vector<Pose> noise;
+  for (int k = 0; k < 14; ++k) {
+    noise.emplace_back(
+        So3Exp(DegToRad(0.3) * Vec3(uniform(rng), uniform(rng), uniform(rng))),
+        0.02 * Vec3(uniform(rng), uniform(rng), uniform(rng)));
+  }
+  noise[0] = Pose();
+  const Drive drive(noise);
+  Anchor anchor;
+  anchor.keyframe = 0;
+  anchor.pose = drive.truth[0];
+  anchor.sigma_t = 0.001;
+  anchor.sigma_r = 0.01;
+  LidarBaConfig config;
+  config.rounds = 3;
+  config.window = 4;
+  const std::vector<Pose> start = drive.keyframes.OdomPoses();
+  const std::vector<Pose> refined = HierarchicalLidarBa(
+      drive.keyframes, start, {}, {anchor}, {}, BackendConfig(), config);
+  double after = 0.0;
+  for (size_t k = 0; k < start.size(); ++k) {
+    after = std::max(
+        after, (refined[k].translation - drive.truth[k].translation).norm());
+  }
+  GR_EXPECT_LT(after, 0.006);
+}
+
 }  // namespace
 }  // namespace gr

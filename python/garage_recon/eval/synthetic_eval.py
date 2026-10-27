@@ -11,6 +11,7 @@ semantic_eval.py.
 
 from __future__ import annotations
 
+import collections
 import json
 import pathlib
 
@@ -167,6 +168,8 @@ def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
     """Slot matching by polygon IoU; corner and entrance errors."""
     tp, corner_errors, entrance_ok = 0, [], 0
     used = set()
+    # Slot attributes (ev, accessible, reserved): name -> tp / fp / fn.
+    attributes = collections.defaultdict(collections.Counter)
     for g in gt:
         truth = shapely.Polygon(g["corners"])
         best, best_index = 0.0, -1
@@ -178,16 +181,30 @@ def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
                    / max(truth.union(candidate).area, 1e-9))
             if iou > best:
                 best, best_index = iou, i
+        truth_attributes = set(g.get("attributes", []))
+        if best < iou_th:
+            for name in truth_attributes:
+                attributes[name]["fn"] += 1
         if best >= iou_th:
             used.add(best_index)
             tp += 1
+            found = set(pred[best_index].get("attributes", []))
+            for name in truth_attributes | found:
+                attributes[name]["tp" if name in found & truth_attributes
+                                 else "fp" if name in found else "fn"] += 1
             pc = np.asarray(pred[best_index]["corners"])
             gc = np.asarray(g["corners"])
             corner_errors += list(np.linalg.norm(pc - gc, axis=1))
             entrance_ok += np.linalg.norm(
                 (pc[0] + pc[1]) / 2 - (gc[0] + gc[1]) / 2) < 0.5
+    for i, p in enumerate(pred):
+        if i not in used:
+            for name in p.get("attributes", []):
+                attributes[name]["fp"] += 1
     errors = np.asarray(corner_errors)
     return {"gt": len(gt), "pred": len(pred), "tp": tp,
+            "attributes": {name: dict(counts) for name, counts in
+                           sorted(attributes.items())},
             **_precision_recall(tp, len(pred), len(gt)),
             "corner_err_mean": float(errors.mean()) if len(errors) else None,
             "corner_err_p95": (float(np.percentile(errors, 95))
@@ -347,8 +364,15 @@ def evaluate(work_dir: str | pathlib.Path, gt_dir: str | pathlib.Path,
             json.loads((semantics / "arrows.json").read_text()),
             scene["arrows"])
     if (semantics / "slots.json").exists():
-        report["slots"] = eval_slots(
-            json.loads((semantics / "slots.json").read_text()), scene["slots"])
+        pred_slots = json.loads((semantics / "slots.json").read_text())
+        numbers_path = semantics / "numbers.json"
+        if numbers_path.exists():  # Attributes read from texts.
+            read = json.loads(numbers_path.read_text()).get("slots", {})
+            for slot in pred_slots:
+                slot["attributes"] = sorted(
+                    set(slot.get("attributes", []))
+                    | set(read.get(slot["slot_id"], {}).get("attributes", [])))
+        report["slots"] = eval_slots(pred_slots, scene["slots"])
     tracks_path = semantics / "objects" / "tracks.json"
     if tracks_path.exists():
         tracks = json.loads(tracks_path.read_text())

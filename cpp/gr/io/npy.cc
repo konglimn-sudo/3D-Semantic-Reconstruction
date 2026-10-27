@@ -68,6 +68,34 @@ float HalfToFloat(uint16_t h) {
   return f;
 }
 
+// Round to nearest even, as numpy's float -> float16 cast.
+uint16_t FloatToHalf(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  const uint16_t sign = static_cast<uint16_t>((x >> 16) & 0x8000);
+  const uint32_t magnitude = x & 0x7FFFFFFF;
+  const uint32_t exponent = magnitude >> 23;
+  if (magnitude > 0x7F800000) {  // NaN: keep it quiet.
+    return static_cast<uint16_t>(sign | 0x7E00 | ((magnitude >> 13) & 0x3FF));
+  }
+  if (exponent >= 143) return static_cast<uint16_t>(sign | 0x7C00);  // Inf.
+  if (exponent >= 113) {  // Normal half (a carry may round up to Inf).
+    uint32_t h = ((exponent - 112) << 10) | ((magnitude >> 13) & 0x3FF);
+    const uint32_t rest = magnitude & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) ++h;
+    return static_cast<uint16_t>(sign | h);
+  }
+  // Subnormal half: units of 2^-24.
+  const int shift = 126 - static_cast<int>(exponent);
+  if (exponent == 0 || shift > 24) return sign;
+  const uint32_t mantissa = (magnitude & 0x7FFFFF) | 0x800000;
+  uint32_t h = mantissa >> shift;
+  const uint32_t rest = mantissa & ((1u << shift) - 1);
+  const uint32_t half = 1u << (shift - 1);
+  if (rest > half || (rest == half && (h & 1))) ++h;
+  return static_cast<uint16_t>(sign | h);
+}
+
 template <typename T>
 T Load(const uint8_t* p) {
   T v;
@@ -220,6 +248,24 @@ NpyArray NpyArray::FromInts(const std::vector<int32_t>& values,
   if (a.size() != static_cast<int64_t>(values.size())) Fail("shape mismatch");
   a.data.resize(values.size() * sizeof(int32_t));
   std::memcpy(a.data.data(), values.data(), a.data.size());
+  return a;
+}
+
+NpyArray NpyArray::FromHalfs(const std::vector<float>& values,
+                             std::vector<int64_t> shape) {
+  std::vector<uint16_t> bits(values.size());
+  for (size_t k = 0; k < values.size(); ++k) bits[k] = FloatToHalf(values[k]);
+  NpyArray a = Of(bits, std::move(shape));
+  a.kind = 'f';
+  return a;
+}
+
+NpyArray NpyArray::FromBools(const std::vector<uint8_t>& values,
+                             std::vector<int64_t> shape) {
+  std::vector<uint8_t> bytes(values.size());
+  for (size_t k = 0; k < values.size(); ++k) bytes[k] = values[k] != 0;
+  NpyArray a = Of(bytes, std::move(shape));
+  a.kind = 'b';
   return a;
 }
 

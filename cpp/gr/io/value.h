@@ -53,6 +53,7 @@ class Value {
 
   // Member of a map (nullptr if absent or not a map).
   const Value* Find(const std::string& key) const;
+  Value* Find(const std::string& key);
   // Member of a map; a null value if absent.
   const Value& operator[](const std::string& key) const;
   const Value& operator[](size_t index) const;  // Lists; throws if out.
@@ -83,6 +84,11 @@ Value ReadJsonFile(const std::string& path);
 // written in their shortest round-trip form, integral ones without a
 // fraction; non-ASCII text is kept as UTF-8.
 std::string ToJson(const Value& value, int indent = 1);
+
+// Block-style YAML that PyYAML (YAML 1.1) reads back to the same value:
+// keys and strings double-quoted, lists of scalars in flow style, floats
+// always with a '.' (1.0e-05, not 1e-05, which YAML 1.1 reads as text).
+std::string ToYaml(const Value& value);
 
 // `over` merged into `base`: maps member by member, anything else replaced
 // (config.deep_merge).

@@ -32,6 +32,7 @@ import numpy as np
 import shapely
 
 from garage_recon import _core
+from garage_recon import core_config
 from garage_recon.recon import bev
 from garage_recon.semantics import markings as markings_lib
 from garage_recon.semantics import structure as structure_lib
@@ -56,6 +57,8 @@ class Slot:
         number: Painted number (OCR, row-repaired).
         zone: Zone letter(s) painted with the number.
         text_votes: OCR readings that voted for this slot.
+        attributes: "ev" (charging: green floor paint or its text),
+            "accessible", "reserved" (texts on the floor or a nearby sign).
     """
 
     slot_id: str
@@ -71,6 +74,7 @@ class Slot:
     number: str | None = None
     zone: str | None = None
     text_votes: int = 0
+    attributes: list[str] = dataclasses.field(default_factory=list)
 
     def polygon(self) -> shapely.Polygon:
         return shapely.Polygon(self.corners)
@@ -151,3 +155,27 @@ def assemble_slots(segments: list[markings_lib.MarkingSegment], level: int,
                  float(d["width"]), float(d["depth"]), d["occupied"],
                  bool(d["inferred"]), float(d["confidence"]), d["row"])
             for d in out]
+
+
+def paint_attributes(slots: list[Slot], grid: bev.BevGrid, rasters: dict,
+                     cfg) -> int:
+    """Adds "ev" to slots whose floor is painted green on the orthophoto
+    (C++ MeasureSlotPaint); returns how many. Needs the floor texture."""
+    section = cfg.slots.get("paint") or {}
+    if "rgb" not in rasters or not slots:
+        return 0
+    config = core_config.fill(_core.SlotPaintConfig(), section)
+    observed = (np.asarray(rasters["texture_nobs"]) > 0
+                if "texture_nobs" in rasters
+                else np.any(np.asarray(rasters["rgb"]) > 0, axis=2))
+    paint = _core.measure_slot_paint(
+        [np.asarray(s.corners, float) for s in slots],
+        np.asarray(rasters["rgb"], np.uint8), observed.astype(np.uint8),
+        grid.x0, grid.y0, grid.res, config)
+    found = 0
+    for slot, p in zip(slots, paint):
+        if (p["observed"] >= int(section.get("min_observed_cells", 10))
+                and p["in_band"] >= float(section.get("ev_min_share", 0.5))):
+            slot.attributes = sorted(set(slot.attributes) | {"ev"})
+            found += 1
+    return found

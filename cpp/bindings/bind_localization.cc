@@ -9,7 +9,10 @@
 
 #include "bind_util.h"
 #include "gr/nav/localization.h"
+#include "gr/mapping/change_detection.h"
+#include "gr/nav/map_update.h"
 #include "gr/nav/position.h"
+#include "gr/nav/slot_state.h"
 #include "gr/nav/trip_localizer.h"
 #include "gr/registration/cloud_compare.h"
 
@@ -284,7 +287,173 @@ void BindLocalization(py::module_& m) {
       .def_property_readonly("map_size",
                              [](const PyTripLocalizer& self) {
                                return self.localizer->localizer().map_size();
-                             });
+                             })
+      .def_property_readonly("last_sweep", [](const PyTripLocalizer& self) {
+        return ToMatrix(self.localizer->last_sweep());
+      });
+
+  py::class_<ChangeConfig>(m, "ChangeConfig")
+      .def(py::init<>())
+      .def_readwrite("voxel", &ChangeConfig::voxel)
+      .def_readwrite("max_range", &ChangeConfig::max_range)
+      .def_readwrite("ray_voxel", &ChangeConfig::ray_voxel)
+      .def_readwrite("min_hits", &ChangeConfig::min_hits)
+      .def_readwrite("min_hit_span", &ChangeConfig::min_hit_span)
+      .def_readwrite("min_free", &ChangeConfig::min_free)
+      .def_readwrite("free_margin", &ChangeConfig::free_margin)
+      .def_readwrite("min_cluster_voxels", &ChangeConfig::min_cluster_voxels)
+      .def_readwrite("flat_thickness", &ChangeConfig::flat_thickness)
+      .def_readwrite("vehicle_min_length", &ChangeConfig::vehicle_min_length)
+      .def_readwrite("vehicle_max_length", &ChangeConfig::vehicle_max_length)
+      .def_readwrite("vehicle_min_width", &ChangeConfig::vehicle_min_width)
+      .def_readwrite("vehicle_max_width", &ChangeConfig::vehicle_max_width)
+      .def_readwrite("vehicle_max_height",
+                     &ChangeConfig::vehicle_max_height);
+
+  py::class_<ChangeDetector>(m, "ChangeDetector")
+      .def(py::init([](const PointsIn& map_points, const ChangeConfig& config) {
+             Require(config.voxel > 0.0 && config.ray_voxel > 0.0,
+                     "voxel sizes must be positive");
+             const Points points = ToPoints(map_points);
+             py::gil_scoped_release release;
+             return ChangeDetector(points, config);
+           }),
+           "map_points"_a, "config"_a = ChangeConfig())
+      .def(
+          "add_sweep",
+          [](ChangeDetector& detector, const PointsIn& sweep,
+             const Mat4& map_from_sensor, double stamp) {
+            const Points p = ToPoints(sweep);
+            const Pose pose = Pose::FromMatrix(map_from_sensor);
+            py::gil_scoped_release release;
+            detector.AddSweep(TransformPoints(p, pose), pose.translation,
+                              stamp);
+          },
+          "sweep"_a, "T_map_sensor"_a, "stamp"_a,
+          "One localized sweep (sensor frame) with its pose in the map.")
+      .def_property_readonly("sweeps", &ChangeDetector::sweeps)
+      .def(
+          "assess",
+          [](const ChangeDetector& detector, const py::list& edges,
+             const py::list& slots, const py::list& floors,
+             double half_width) {
+            std::vector<NavEdge> e;
+            for (const py::handle& item : edges) {
+              const auto t = item.cast<
+                  std::tuple<int, std::string, Eigen::MatrixXd>>();
+              e.push_back({std::get<0>(t), std::get<1>(t),
+                           Xy(std::get<2>(t))});
+            }
+            std::vector<NavSlot> s;
+            for (const py::handle& item : slots) {
+              const auto t = item.cast<
+                  std::tuple<int, std::string, Eigen::MatrixXd>>();
+              s.push_back({std::get<0>(t), std::get<1>(t),
+                           Xy(std::get<2>(t))});
+            }
+            std::vector<FloorHeights> f;
+            for (const py::handle& item : floors) {
+              const auto t = item.cast<std::tuple<int, double, double,
+                                                  double, Eigen::MatrixXd>>();
+              FloorHeights floor;
+              floor.level = std::get<0>(t);
+              floor.x0 = std::get<1>(t);
+              floor.y0 = std::get<2>(t);
+              floor.res = std::get<3>(t);
+              const Eigen::MatrixXd& z = std::get<4>(t);
+              floor.height = static_cast<int>(z.rows());
+              floor.width = static_cast<int>(z.cols());
+              for (Eigen::Index r = 0; r < z.rows(); ++r) {
+                for (Eigen::Index c = 0; c < z.cols(); ++c) {
+                  floor.z.push_back(z(r, c));
+                }
+              }
+              f.push_back(std::move(floor));
+            }
+            py::list out;
+            for (const MapChange& c :
+                 AssessChanges(detector.Clusters(), e, s, f, half_width)) {
+              out.append(py::dict(
+                  "added"_a = c.cluster.added,
+                  "level"_a = c.level ? py::cast(*c.level) : py::none(),
+                  "center"_a = c.cluster.center, "min"_a = c.cluster.min,
+                  "max"_a = c.cluster.max, "voxels"_a = c.cluster.voxels,
+                  "edges"_a = c.edges));
+            }
+            return out;
+          },
+          "edges"_a, "slots"_a, "floors"_a, "half_width"_a,
+          "The structural changes (C++ AssessChanges): dicts of added, "
+          "level, center, min, max, voxels, edges (drivable edges whose "
+          "corridor they reach); edges / slots / floors as nav_position.");
+
+  py::class_<SlotStateConfig>(m, "SlotStateConfig")
+      .def(py::init<>())
+      .def_readwrite("max_range", &SlotStateConfig::max_range)
+      .def_readwrite("inset", &SlotStateConfig::inset)
+      .def_readwrite("min_height", &SlotStateConfig::min_height)
+      .def_readwrite("max_height", &SlotStateConfig::max_height)
+      .def_readwrite("floor_band", &SlotStateConfig::floor_band)
+      .def_readwrite("min_body_points", &SlotStateConfig::min_body_points)
+      .def_readwrite("max_free_points", &SlotStateConfig::max_free_points)
+      .def_readwrite("cell", &SlotStateConfig::cell)
+      .def_readwrite("min_floor_share", &SlotStateConfig::min_floor_share)
+      .def_readwrite("confirm", &SlotStateConfig::confirm);
+
+  // Slots as (slot_id, level, (4, 2) corners, z).
+  const auto slots_from = [](const py::list& slots) {
+    std::vector<SlotGeometry> out;
+    for (const py::handle& item : slots) {
+      const auto t = item.cast<
+          std::tuple<std::string, int, Eigen::MatrixXd, double>>();
+      const std::vector<Vec2> corners = Xy(std::get<2>(t));
+      Require(corners.size() == 4, "a slot has four corners");
+      SlotGeometry slot;
+      slot.slot_id = std::get<0>(t);
+      slot.level = std::get<1>(t);
+      std::copy(corners.begin(), corners.end(), slot.corners.begin());
+      slot.z = std::get<3>(t);
+      out.push_back(slot);
+    }
+    return out;
+  };
+
+  py::class_<SlotStateTracker>(m, "SlotStateTracker")
+      .def(py::init([slots_from](const py::list& slots,
+                                 const SlotStateConfig& config) {
+             return SlotStateTracker(slots_from(slots).size(), config);
+           }),
+           "slots"_a, "config"_a = SlotStateConfig())
+      .def(
+          "observe",
+          [slots_from](SlotStateTracker& tracker, const py::list& slots,
+                       double stamp, const PointsIn& sweep,
+                       const Mat4& map_from_sensor,
+                       const SlotStateConfig& config) {
+            const std::vector<SlotGeometry> s = slots_from(slots);
+            Require(s.size() == tracker.entries().size(),
+                    "the tracker was made for other slots");
+            const Points p = ToPoints(sweep);
+            const Pose pose = Pose::FromMatrix(map_from_sensor);
+            py::gil_scoped_release release;
+            tracker.Update(stamp,
+                           ObserveSlots(TransformPoints(p, pose),
+                                        pose.translation, s, config));
+          },
+          "slots"_a, "stamp"_a, "sweep"_a, "T_map_sensor"_a, "config"_a,
+          "One localized sweep (sensor frame) with its pose in the map.")
+      .def("states", [](const SlotStateTracker& tracker) {
+        static const char* const kState[] = {"unknown", "free", "occupied"};
+        py::list out;
+        for (const SlotStateTracker::Entry& e : tracker.entries()) {
+          out.append(py::dict(
+              "state"_a = kState[static_cast<int>(e.state)],
+              "stamp"_a = e.state == SlotState::kUnknown ? py::none()
+                                                         : py::cast(e.stamp),
+              "observations"_a = e.observations));
+        }
+        return out;
+      });
 
   m.def(
       "nav_position",

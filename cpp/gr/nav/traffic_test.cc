@@ -57,5 +57,76 @@ GR_TEST(TrafficTest, OtherPatternsStayTwoWay) {
                           Arrow(31, 1.6, -1)}) == TrafficVerdict::kTwoWay);
 }
 
+// A drive along the bottom aisle from x0 to x1 (y = 0.5, right lane).
+DrivenPath Drive(double x0, double x1) {
+  DrivenPath path;
+  const int n = 60;
+  for (int k = 0; k <= n; ++k) {
+    path.points.emplace_back(x0 + (x1 - x0) * k / n, x1 > x0 ? -1.0 : 1.0);
+  }
+  return path;
+}
+
+GR_TEST(TrafficTest, PassesCountDrivesAlongEdges) {
+  const std::vector<EdgePasses> passes =
+      CountPasses(Loop(), {Drive(1, 39), Drive(39, 1), Drive(2, 13)},
+                  TrafficConfig());
+  GR_EXPECT_EQ(passes[0].forward, 2);  // 0 -> 4: two drives (one short).
+  GR_EXPECT_EQ(passes[0].backward, 1);
+  GR_EXPECT_EQ(passes[1].forward, 1);
+  GR_EXPECT_EQ(passes[5].forward + passes[5].backward, 0);  // Connector.
+}
+
+GR_TEST(TrafficTest, OneArrowNeedsDrivesOrASign) {
+  const auto decide = [](const std::vector<DrivenPath>& paths,
+                         const std::vector<TrafficSign>& signs) {
+    const std::vector<Corridor> out =
+        DecideTraffic(Loop(), {Arrow(10, 0.1, -1)}, TrafficConfig(), paths,
+                      signs);
+    return out.empty() ? TrafficVerdict::kTwoWay : out[0].verdict;
+  };
+  GR_EXPECT_TRUE(decide({}, {}) == TrafficVerdict::kOneArrow);
+  // Two drives with the arrow (-x), none against: one-way.
+  GR_EXPECT_TRUE(decide({Drive(39, 1), Drive(38, 2)}, {}) ==
+                 TrafficVerdict::kOneWayDriven);
+  // One drive against it: two-way.
+  GR_EXPECT_TRUE(decide({Drive(39, 1), Drive(38, 2), Drive(1, 39)}, {}) ==
+                 TrafficVerdict::kOneArrow);
+  TrafficSign one_way;
+  one_way.xy = Vec2(20.0, 2.0);
+  GR_EXPECT_TRUE(decide({}, {one_way}) == TrafficVerdict::kOneWaySign);
+  GR_EXPECT_TRUE(decide({Drive(1, 39)}, {one_way}) ==
+                 TrafficVerdict::kConflict);
+}
+
+GR_TEST(TrafficTest, NoEntrySignsDecideAlone) {
+  // A no-entry sign near the corridor's start (x = 3): traffic leaves
+  // there, i.e. travels -x, against the steps 0 -> 4 -> 1.
+  TrafficSign sign;
+  sign.kind = TrafficSign::Kind::kNoEntry;
+  sign.xy = Vec2(3.0, -2.5);
+  std::vector<Corridor> out = DecideTraffic(Loop(), {}, TrafficConfig(), {},
+                                            {sign});
+  GR_ASSERT_TRUE(out.size() == 1);
+  GR_EXPECT_TRUE(out[0].verdict == TrafficVerdict::kOneWaySign);
+  GR_EXPECT_EQ(out[0].travel * (out[0].steps[0].forward ? 1 : -1), -1);
+  // At the corner (0, 0) two corridors end; its facing (+y, towards the
+  // left aisle's readers) picks the left aisle (3 -> 0), travelling +y out
+  // of the corner... i.e. towards the readers.
+  sign.xy = Vec2(1.0, 1.0);
+  sign.facing = Vec2(0.0, 1.0);
+  out = DecideTraffic(Loop(), {}, TrafficConfig(), {}, {sign});
+  GR_ASSERT_TRUE(out.size() == 1);
+  GR_EXPECT_EQ(static_cast<int>(out[0].steps.size()), 1);
+  GR_EXPECT_EQ(out[0].steps[0].edge, 4);
+  // Edge 4 runs 3 (0, 20) -> 0 (0, 0): travel towards +y is against it.
+  GR_EXPECT_EQ(out[0].travel * (out[0].steps[0].forward ? 1 : -1), -1);
+  // A drive against the sign's direction: conflicting evidence.
+  sign.facing = Vec2::Zero();
+  sign.xy = Vec2(3.0, -2.5);
+  out = DecideTraffic(Loop(), {}, TrafficConfig(), {Drive(1, 39)}, {sign});
+  GR_EXPECT_TRUE(out[0].verdict == TrafficVerdict::kConflict);
+}
+
 }  // namespace
 }  // namespace gr

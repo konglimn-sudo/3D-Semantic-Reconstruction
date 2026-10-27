@@ -72,11 +72,32 @@ def floor_hits(camera, world_from_camera: np.ndarray, uv: np.ndarray,
     return hits
 
 
+# Slot attributes and their texts (painted in the slot or on a sign).
+SLOT_ATTRIBUTES = {
+    "ev": r"充电|新能源|电动车|EV|CHARG",
+    "accessible": r"无障碍|残疾|残障|ACCESSIBLE|DISABLED|♿",
+    "reserved": r"专用|私家|固定车位|业主|VIP|RESERVED|PRIVATE",
+}
+
+
+def text_attributes(text: str) -> list[str]:
+    """Slot attributes a text names ("充电车位" -> ["ev"])."""
+    t = re.sub(r"\s+", "", str(text).upper())
+    return [name for name, pattern in SLOT_ATTRIBUTES.items()
+            if re.search(pattern, t)]
+
+
 def text_kind(text: str) -> str:
-    """exit | gate | level | zone | text."""
+    """no_entry | one_way | exit | gate | attribute | level | zone | text."""
     t = re.sub(r"\s+", "", text.upper())
+    if re.search(r"禁止驶入|禁止进入|严禁驶入|NOENTRY|DONOTENTER", t):
+        return "no_entry"
+    if re.search(r"单行|ONEWAY", t):
+        return "one_way"
     if re.search(r"EXIT|出口", t):
         return "exit"
+    if text_attributes(t):
+        return "attribute"
     if re.search(r"\d+号门|GATE", t):
         return "gate"
     if re.fullmatch(r"(B|L|F)\d{1,2}|负?[一二三四五六七八九十]+层", t):
@@ -119,34 +140,55 @@ def merge_signs(marks: list[dict], radius: float,
     return out
 
 
-def text_landmarks(observations: list[tuple[str, np.ndarray, float]],
-                   radius: float, min_views: int, min_score: float,
-                   similarity: float = 0.6) -> list[dict]:
-    """Readings (text, xyz, score) of one text within `radius` merged into
-    landmarks (best readings first); kept with `min_views` readings and a
-    summed score of `min_score`; then one landmark per sign (merge_signs)."""
+def _facing(sign: np.ndarray, cameras: list) -> list[float] | None:
+    """Unit horizontal direction from a sign towards the cameras that read
+    it (the side it faces), None without cameras."""
+    rays = [np.asarray(c, float)[:2] - sign[:2] for c in cameras
+            if c is not None]
+    rays = [r / np.linalg.norm(r) for r in rays if np.linalg.norm(r) > 1e-6]
+    if not rays:
+        return None
+    mean = np.mean(rays, axis=0)
+    norm = float(np.linalg.norm(mean))
+    return None if norm < 0.3 else np.round(mean / norm, 3).tolist()
+
+
+def text_landmarks(observations: list[tuple], radius: float, min_views: int,
+                   min_score: float, similarity: float = 0.6) -> list[dict]:
+    """Readings (text, xyz, score[, camera xyz]) of one text within `radius`
+    merged into landmarks (best readings first); kept with `min_views`
+    readings and a summed score of `min_score`; then one landmark per sign
+    (merge_signs). With the cameras, `facing` is the horizontal direction
+    the sign faces (towards its readers)."""
     groups = collections.defaultdict(list)
-    for text, xyz, score in observations:
+    for text, xyz, score, *camera in observations:
         key = normalize_text(text)
         if len(key) >= 2:  # Single characters are mostly misreadings.
-            groups[key].append((np.asarray(xyz, float), float(score)))
+            groups[key].append((np.asarray(xyz, float), float(score),
+                                camera[0] if camera else None))
     out = []
     for key, readings in groups.items():
-        clusters = []  # [points, scores]
-        for xyz, score in sorted(readings, key=lambda r: -r[1]):
+        clusters = []  # [points, scores, cameras]
+        for xyz, score, camera in sorted(readings, key=lambda r: -r[1]):
             for c in clusters:
                 if np.linalg.norm(np.median(c[0], axis=0) - xyz) <= radius:
                     c[0].append(xyz)
                     c[1].append(score)
+                    c[2].append(camera)
                     break
             else:
-                clusters.append([[xyz], [score]])
-        for points, scores in clusters:
+                clusters.append([[xyz], [score], [camera]])
+        for points, scores, cameras in clusters:
             if len(points) >= min_views and sum(scores) >= min_score:
-                out.append({"text": key, "kind": text_kind(key),
-                            "xyz": np.median(points, axis=0).round(3).tolist(),
-                            "views": len(points),
-                            "score": round(float(sum(scores)), 2)})
+                center = np.median(points, axis=0)
+                mark = {"text": key, "kind": text_kind(key),
+                        "xyz": center.round(3).tolist(),
+                        "views": len(points),
+                        "score": round(float(sum(scores)), 2)}
+                facing = _facing(center, cameras)
+                if facing is not None:
+                    mark["facing"] = facing
+                out.append(mark)
     return sorted(merge_signs(out, radius, similarity),
                   key=lambda l: -l["score"])
 
@@ -205,6 +247,7 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                 for s in slots]
     entrances = [np.mean(np.asarray(s.corners)[:2], axis=0) for s in slots]
     votes = [collections.Counter() for _ in slots]  # Text -> summed score.
+    attribute_votes = [collections.Counter() for _ in slots]
     readings = [0] * len(slots)
     needs_images = getattr(ocr, "needs_images", True)
     import json
@@ -255,7 +298,8 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                     if np.isfinite(distance):
                         observations.append((
                             result.text, pose[:3, 3] + distance * (
-                                pose[:3, :3] @ rays[0]), result.score))
+                                pose[:3, :3] @ rays[0]), result.score,
+                            pose[:3, 3]))
                     for level, xyz in floor_hits(camera, pose, uv, levels,
                                                  section.max_range):
                         point = shapely.Point(xyz[0], xyz[1])
@@ -267,10 +311,20 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                             d = np.linalg.norm(entrances[k] - xyz[:2])
                             if d < best_d:
                                 best, best_d = k, d
-                        if best >= 0:
+                        if best < 0:
+                            continue
+                        named = text_attributes(result.text)
+                        for attribute in named:  # "充电", not a number.
+                            attribute_votes[best][attribute] += float(
+                                result.score)
+                        if not named:
                             votes[best][result.text.strip().upper()] += float(
                                 result.score)
                             readings[best] += 1
+    for slot, counter in zip(slots, attribute_votes):
+        slot.attributes = sorted(
+            set(slot.attributes) | {a for a, score in counter.items()
+                                    if score >= section.min_score})
     read = 0
     for slot, counter, count in zip(slots, votes, readings):
         slot.text_votes = count
@@ -306,6 +360,8 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
     kinds = collections.Counter(l["kind"] for l in landmarks)
     summary = {"frames": frames, "texts": texts, "slots": len(slots),
                "read": read,
+               "attributes": dict(collections.Counter(
+                   a for s in slots for a in s.attributes)),
                "numbered": int(sum(s.number is not None for s in slots)),
                "landmarks": dict(kinds)}
     log(f"[numbers] {frames} frames, {texts} texts; {read} of {len(slots)} "

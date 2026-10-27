@@ -42,6 +42,11 @@ PRESETS: dict[str, dict] = {
               "lidar": {"beams": 32, "h_res_deg": 0.6},
               "frame_spacing": 0.6, "image_size": 256, "image_every": 3,
               "trips": 2},
+    # Scale tests: three levels, 8 bay groups, LiDAR-only trips.
+    "large": {"layout": {"n_levels": 3, "groups": 8},
+              "lidar": {"beams": 32, "h_res_deg": 0.6},
+              "frame_spacing": 0.6, "image_size": 128, "image_every": 6,
+              "trips": 3},
     "demo": {"layout": {"n_levels": 2, "groups": 6},
              "lidar": {"beams": 32, "h_res_deg": 0.4},
              "frame_spacing": 0.5, "image_size": 320, "image_every": 2,
@@ -169,17 +174,20 @@ def row_poses(drive: trajectory_lib.Trajectory, calib: schema.CameraCalib,
 def generate(out_dir: str | pathlib.Path, preset: str = "small",
              trips: int | None = None, seed: int = 0, stereo: bool = False,
              images: bool = True, ideal: bool = False, arrows: bool = True,
+             changes: dict | None = None,
              log=print) -> list[pathlib.Path]:
-    """Writes a synthetic dataset and returns the trip directories."""
+    """Writes a synthetic dataset and returns the trip directories.
+
+    `changes` maps a trip index to a scene change of that trip
+    (scene_lib.apply_change: boxes added or removed, e.g. a construction
+    fence or a removed duct)."""
     params = PRESETS[preset]
     layout = scene_lib.Layout(**params["layout"], arrows=arrows)
     garage = scene_lib.build_static_scene(layout)
-    route = trajectory_lib.build_route(layout)
     n_trips = params["trips"] if trips is None else trips
-    true_rig, nominal_rig, imu_biases = sensor_truth(
-        make_rig(params["image_size"], stereo),
-        None if ideal else SENSOR_ERRORS, seed, n_trips)
-    model = sensors.LidarModel(**params["lidar"])
+    rigs = sensor_truth(make_rig(params["image_size"], stereo),
+                        None if ideal else SENSOR_ERRORS, seed, n_trips)
+    true_rig, nominal_rig, imu_biases = rigs
     out = pathlib.Path(out_dir)
     (out / "gt").mkdir(parents=True, exist_ok=True)
     (out / "gt" / "scene.json").write_text(json.dumps(garage.to_json()))
@@ -192,80 +200,108 @@ def generate(out_dir: str | pathlib.Path, preset: str = "small",
         "ideal": bool(ideal),
     }
     (out / "gt" / "calibration.json").write_text(json.dumps(calibration))
+    return [_write_trip(out, k, preset, garage, rigs, seed, images,
+                        (changes or {}).get(k), log)
+            for k in range(n_trips)]
+
+
+def add_trip(out_dir: str | pathlib.Path, trip_index: int,
+             preset: str = "small", seed: int = 0, stereo: bool = False,
+             images: bool = True, ideal: bool = False, arrows: bool = True,
+             change: dict | None = None, log=print) -> pathlib.Path:
+    """Writes trip `trip_index` of a dataset made by generate() with the
+    same preset and seed (same garage, rig and route; its own parked cars),
+    with an optional scene change."""
+    params = PRESETS[preset]
+    layout = scene_lib.Layout(**params["layout"], arrows=arrows)
+    garage = scene_lib.build_static_scene(layout)
+    rigs = sensor_truth(make_rig(params["image_size"], stereo),
+                        None if ideal else SENSOR_ERRORS, seed,
+                        trip_index + 1)
+    return _write_trip(pathlib.Path(out_dir), trip_index, preset, garage,
+                       rigs, seed, images, change, log)
+
+
+def _write_trip(out: pathlib.Path, k: int, preset: str,
+                garage: scene_lib.GarageScene, rigs, seed: int, images: bool,
+                change: dict | None, log) -> pathlib.Path:
+    """Simulates and writes trip k (and its ground truth)."""
+    params = PRESETS[preset]
+    true_rig, nominal_rig, imu_biases = rigs
+    route = trajectory_lib.build_route(garage.layout)
+    model = sensors.LidarModel(**params["lidar"])
     renderers = ({n: sensors.CameraRenderer(c)
                   for n, c in true_rig.cameras.items()} if images else {})
     T_vl = true_rig.primary_lidar.T_vehicle_lidar
-    trip_dirs = []
-    for k in range(n_trips):
-        t_start = time.time()
-        rng = np.random.default_rng(seed * 100 + k)
-        speed = SPEED * (1.0 + 0.04 * k)
-        drive = trajectory_lib.Trajectory(route, speed=speed,
-                                          t0=1000.0 + 600.0 * k)
-        cars = scene_lib.parked_cars(garage, k, seed)
-        movers = scene_lib.moving_cars(garage, k, seed)
-        for m in movers:  # The moving car crosses our path early in the drive.
-            m.t0 += drive.t0
-            m.t1 += drive.t0
-        caster = sensors.SceneRaycaster(garage, cars, movers)
+    t_start = time.time()
+    rng = np.random.default_rng(seed * 100 + k)
+    speed = SPEED * (1.0 + 0.04 * k)
+    drive = trajectory_lib.Trajectory(route, speed=speed,
+                                      t0=1000.0 + 600.0 * k)
+    cars = scene_lib.parked_cars(garage, k, seed)
+    movers = scene_lib.moving_cars(garage, k, seed)
+    for m in movers:  # The moving car crosses our path early in the drive.
+        m.t0 += drive.t0
+        m.t1 += drive.t0
+    scene = garage if not change else scene_lib.apply_change(garage, change)
+    caster = sensors.SceneRaycaster(scene, cars, movers)
 
-        # INS fix at the entrance: the true start pose with small errors.
-        start = drive.poses_at(drive.t0)[0]
-        noise = geometry.make_T(geometry.rot_z(rng.normal(0, np.deg2rad(0.2))),
-                                rng.normal(0, 0.02, 3))
-        meta = {"trip_id": f"trip_{k:02d}", "garage_id": f"synthetic_{preset}",
-                "synthetic": True, "initial_pose": (start @ noise).tolist(),
-                "initial_pose_time": float(drive.t0)}
-        trip_dir = out / f"trip_{k:02d}"
-        writer = dataset.TripWriter(trip_dir, nominal_rig, meta)
-        stamps = np.arange(drive.t0 + model.sweep, drive.t_end,
-                           params["frame_spacing"] / speed)
-        gt_poses = drive.poses_at(stamps)
-        for j, stamp in enumerate(stamps):
-            sweep = sensors.simulate_sweep(caster, drive, stamp, T_vl, model,
-                                           rng)
-            ns = int(round(stamp * 1e9))
-            writer.write_lidar("lidar_top", ns, sweep["points"],
-                               sweep["intensity"], sweep["time"],
-                               quantize=0.005)
-            if images and j % params["image_every"] == 0:
-                for name, renderer in renderers.items():
-                    calib = true_rig.cameras[name]
-                    # Row 0 is exposed at the LiDAR stamp; the image is stamped
-                    # time_offset earlier.
-                    poses = row_poses(drive, calib, stamp)
-                    mid = stamp + 0.5 * calib.height * (
-                        calib.rolling_shutter_line_time)
-                    frame = renderer.render(caster, poses, mid, rng)
-                    image_ns = int(round((stamp - calib.time_offset) * 1e9))
-                    writer.write_image(name, image_ns, frame["rgb"])
-        imu, wheel = sensors.proprioception(drive, drive.t0, drive.t_end, rng,
-                                            imu_bias=imu_biases[k])
-        writer.write_csv("imu.csv", "t,gx,gy,gz,ax,ay,az", imu)
-        writer.write_csv("wheel.csv", "t,speed", wheel)
-        g_t = np.arange(drive.t0, drive.t0 + 3.0, 1.0)
-        g_p = drive.poses_at(g_t)[:, :3, 3] + rng.normal(0, 0.02, (len(g_t), 3))
-        writer.write_csv("gnss.csv", "t,x,y,z,std",
-                         np.column_stack([g_t, g_p, np.full(len(g_t), 0.02)]))
+    # INS fix at the entrance: the true start pose with small errors.
+    start = drive.poses_at(drive.t0)[0]
+    noise = geometry.make_T(geometry.rot_z(rng.normal(0, np.deg2rad(0.2))),
+                            rng.normal(0, 0.02, 3))
+    meta = {"trip_id": f"trip_{k:02d}", "garage_id": f"synthetic_{preset}",
+            "synthetic": True, "initial_pose": (start @ noise).tolist(),
+            "initial_pose_time": float(drive.t0)}
+    trip_dir = out / f"trip_{k:02d}"
+    writer = dataset.TripWriter(trip_dir, nominal_rig, meta)
+    stamps = np.arange(drive.t0 + model.sweep, drive.t_end,
+                       params["frame_spacing"] / speed)
+    gt_poses = drive.poses_at(stamps)
+    for j, stamp in enumerate(stamps):
+        sweep = sensors.simulate_sweep(caster, drive, stamp, T_vl, model, rng)
+        ns = int(round(stamp * 1e9))
+        writer.write_lidar("lidar_top", ns, sweep["points"],
+                           sweep["intensity"], sweep["time"], quantize=0.005)
+        if images and j % params["image_every"] == 0:
+            for name, renderer in renderers.items():
+                calib = true_rig.cameras[name]
+                # Row 0 is exposed at the LiDAR stamp; the image is stamped
+                # time_offset earlier.
+                poses = row_poses(drive, calib, stamp)
+                mid = stamp + 0.5 * calib.height * (
+                    calib.rolling_shutter_line_time)
+                frame = renderer.render(caster, poses, mid, rng)
+                image_ns = int(round((stamp - calib.time_offset) * 1e9))
+                writer.write_image(name, image_ns, frame["rgb"])
+    imu, wheel = sensors.proprioception(drive, drive.t0, drive.t_end, rng,
+                                        imu_bias=imu_biases[k])
+    writer.write_csv("imu.csv", "t,gx,gy,gz,ax,ay,az", imu)
+    writer.write_csv("wheel.csv", "t,speed", wheel)
+    g_t = np.arange(drive.t0, drive.t0 + 3.0, 1.0)
+    g_p = drive.poses_at(g_t)[:, :3, 3] + rng.normal(0, 0.02, (len(g_t), 3))
+    writer.write_csv("gnss.csv", "t,x,y,z,std",
+                     np.column_stack([g_t, g_p, np.full(len(g_t), 0.02)]))
 
-        gt_dir = out / "gt" / f"trip_{k:02d}"
-        gt_dir.mkdir(parents=True, exist_ok=True)
-        geometry.write_tum(gt_dir / "poses.tum", stamps, gt_poses)
-        np.savez_compressed(gt_dir / "trajectory.npz", times=drive.times,
-                            poses=drive.poses)
-        objects = {
-            "parked": [{"key": b.key, "instance": b.instance,
-                        "center": b.center.tolist(), "size": b.size.tolist(),
-                        "yaw": float(np.arctan2(b.R[1, 0], b.R[0, 0])),
-                        "level": b.level} for b in cars],
-            "moving": [{"instance": m.instance, "start": m.start.tolist(),
-                        "velocity": m.velocity.tolist(), "t0": m.t0,
-                        "t1": m.t1, "size": m.size.tolist(),
-                        "level": m.level} for m in movers],
-        }
-        (gt_dir / "objects.json").write_text(json.dumps(objects))
-        log(f"[synth] {trip_dir.name}: {len(stamps)} sweeps, "
-            f"{drive.length:.0f} m route, {len(cars) // 2} parked cars, "
-            f"{time.time() - t_start:.1f}s")
-        trip_dirs.append(trip_dir)
-    return trip_dirs
+    gt_dir = out / "gt" / f"trip_{k:02d}"
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    geometry.write_tum(gt_dir / "poses.tum", stamps, gt_poses)
+    np.savez_compressed(gt_dir / "trajectory.npz", times=drive.times,
+                        poses=drive.poses)
+    objects = {
+        "parked": [{"key": b.key, "instance": b.instance,
+                    "center": b.center.tolist(), "size": b.size.tolist(),
+                    "yaw": float(np.arctan2(b.R[1, 0], b.R[0, 0])),
+                    "level": b.level} for b in cars],
+        "moving": [{"instance": m.instance, "start": m.start.tolist(),
+                    "velocity": m.velocity.tolist(), "t0": m.t0,
+                    "t1": m.t1, "size": m.size.tolist(),
+                    "level": m.level} for m in movers],
+    }
+    if change:
+        objects["change"] = change
+    (gt_dir / "objects.json").write_text(json.dumps(objects))
+    log(f"[synth] {trip_dir.name}: {len(stamps)} sweeps, "
+        f"{drive.length:.0f} m route, {len(cars) // 2} parked cars, "
+        f"{time.time() - t_start:.1f}s")
+    return trip_dir

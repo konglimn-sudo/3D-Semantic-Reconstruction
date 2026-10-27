@@ -18,7 +18,9 @@
 
 #include "gr/core/types.h"
 #include "gr/io/value.h"
+#include "gr/nav/map_update.h"
 #include "gr/nav/position.h"
+#include "gr/nav/slot_state.h"
 #include "gr/nav/trip_localizer.h"
 
 namespace gr {
@@ -26,6 +28,8 @@ namespace gr {
 Points ReadLocalizationMap(const std::string& nav_dir);
 std::vector<NavEdge> ReadNavEdges(const std::string& graph_json);
 std::vector<NavSlot> ReadNavSlots(const std::string& goals_json);
+// The slots of goals.json with their floor height (park point).
+std::vector<SlotGeometry> ReadSlotGeometry(const std::string& goals_json);
 // Floor heights of every level_<k>_layers.npz, in file name order.
 std::vector<FloorHeights> ReadFloorHeights(const std::string& nav_dir);
 
@@ -35,6 +39,14 @@ const char* StatusName(LocalizationStatus status);
 // rounded as localize.py rounds them).
 Value SummaryValue(const TripLocalizationSummary& summary);
 Value PositionValue(const NavPosition& position);
+
+// changes.json: the structural changes and the edges they reach (numbers
+// rounded to the centimetre).
+Value ChangesValue(const std::vector<MapChange>& changes, int sweeps);
+
+// slot_states.json: the tracked state of every slot.
+Value SlotStatesValue(const std::vector<SlotGeometry>& slots,
+                      const SlotStateTracker& tracker);
 
 // poses.tum, sweeps.csv and localization.json (`report`) in `directory`
 // (created if needed).

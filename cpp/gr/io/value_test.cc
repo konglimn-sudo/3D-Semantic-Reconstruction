@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "gr/io/config.h"
 #include "gr/testing/test.h"
 
 namespace gr {
@@ -106,6 +107,36 @@ GR_TEST(ValueTest, DeepMergeOverridesMemberByMember) {
   GR_EXPECT_EQ(merged["a"]["c"].size(), size_t{1});
   GR_EXPECT_EQ(merged["a"]["e"].AsInt(), 5);
   GR_EXPECT_EQ(merged["d"].AsInt(), 4);
+}
+
+GR_TEST(ConfigTest, ImuGradeFillsWhatTheUserDoesNotSet) {
+  const Value defaults = ParseYaml(
+      "imu_grade: consumer\n"
+      "imu_grades:\n"
+      "  consumer: {backend: {gyro_bias_prior: 0.01, accel_bias_prior: 0.2}}\n"
+      "  tactical:\n"
+      "    backend: {gyro_bias_prior: 0.002, accel_bias_prior: 0.03}\n"
+      "    odometry: {lio: {init_accel_bias_sigma: 0.03}}\n"
+      "backend: {gyro_bias_prior: 0.01, accel_bias_prior: 0.2, x: 1}\n");
+  const Value user =
+      ParseYaml("imu_grade: tactical\nbackend: {gyro_bias_prior: 0.004}\n");
+  const Value resolved = ApplyImuGrade(DeepMerge(defaults, user), user);
+  GR_EXPECT_NEAR(resolved["backend"]["gyro_bias_prior"].AsDouble(), 0.004,
+                 0.0);
+  GR_EXPECT_NEAR(resolved["backend"]["accel_bias_prior"].AsDouble(), 0.03,
+                 0.0);
+  GR_EXPECT_NEAR(
+      resolved["odometry"]["lio"]["init_accel_bias_sigma"].AsDouble(), 0.03,
+      0.0);
+  GR_EXPECT_TRUE(resolved["imu_grade_applied"].AsBool());
+  // A resolved configuration loaded again keeps its values.
+  Value edited = resolved;
+  edited.Find("backend")->Set("accel_bias_prior", Value::Number(0.5));
+  GR_EXPECT_NEAR(ApplyImuGrade(edited, Value::Map())["backend"]
+                     ["accel_bias_prior"].AsDouble(),
+                 0.5, 0.0);
+  const LioConfig lio = OdometryConfigFrom(resolved).lio;
+  GR_EXPECT_NEAR(lio.init_accel_bias_sigma, 0.03, 0.0);
 }
 
 }  // namespace

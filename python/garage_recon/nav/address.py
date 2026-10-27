@@ -18,6 +18,8 @@ import re
 import numpy as np
 import shapely
 
+from garage_recon.semantics import numbers as numbers_lib
+
 _CHINESE_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
                    "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -107,17 +109,24 @@ def parse_query(text: str, names: list[str]) -> dict:
 def find(goals: list[dict], text: str, names: list[str]) -> list[dict]:
     """Goals matching a query: its number (and level, zone where given),
     or without a number every goal of its zone. The slot id and the address
-    also match directly."""
+    also match directly. Slot attributes in the query ("充电车位",
+    "B1无障碍车位") select the slots that have them."""
     key = text.strip().upper()
     direct = [g for g in goals if key in (g["slot_id"].upper(),
                                           str(g.get("address", "")).upper())]
     if direct:
         return direct
+    wanted = set(numbers_lib.text_attributes(text))
+    if wanted:
+        for pattern in numbers_lib.SLOT_ATTRIBUTES.values():
+            text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     query = parse_query(text, names)
-    if query["number"] is None and query["zone"] is None:
+    if query["number"] is None and query["zone"] is None and not wanted:
         return []
     out = []
     for goal in goals:
+        if not wanted <= set(goal.get("attributes") or []):
+            continue
         number = goal.get("number")
         if query["number"] is not None and (
                 number is None or int(re.sub(r"\D", "", str(number)) or -1)

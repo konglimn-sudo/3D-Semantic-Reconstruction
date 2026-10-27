@@ -74,6 +74,7 @@ def add_slot_goals(graph: graph_lib.NavGraph, layers_by_level: dict, slots,
             "width": round(float(slot.width), 3),
             "depth": round(float(slot.depth), 3),
             "occupied_at_capture": slot.occupied,
+            "attributes": list(getattr(slot, "attributes", None) or []),
             "inferred": bool(slot.inferred),
             "blocked_cells": blocked,
             # Driven through during the capture (an empty slot crossed, or

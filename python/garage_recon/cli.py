@@ -229,6 +229,24 @@ def main(argv=None) -> int:
     locate.add_argument("--stride", type=int, default=1)
     locate.add_argument("--start", type=float, default=0.0,
                         help="seconds of the trip skipped")
+    locate.add_argument("--changes", action="store_true",
+                        help="also detect structural changes against the map "
+                        "(changes.json)")
+
+    lidar_imu = commands.add_parser(
+        "calibrate-lidar-imu", help="estimate the LiDAR-IMU rotation, IMU "
+        "biases and accelerometer scales from each trip's odometry")
+    lidar_imu.add_argument("--work", required=True)
+    lidar_imu.add_argument("--trips", nargs="+", required=True)
+    lidar_imu.add_argument("--config", default=None)
+
+    update = commands.add_parser(
+        "update-map", help="apply a trip's structural changes (localize "
+        "--changes) to the navigation map")
+    update.add_argument("--work", required=True)
+    update.add_argument("--changes", required=True,
+                        help="changes.json of localize --changes")
+    update.add_argument("--config", default=None)
 
     demo = commands.add_parser(
         "demo", help="synthesise, reconstruct, label and evaluate")
@@ -299,7 +317,19 @@ def main(argv=None) -> int:
         cfg = config_lib.load_config(args.config)
         localize.run(pathlib.Path(args.work), pathlib.Path(args.trip),
                      pathlib.Path(args.out), cfg, args.prior, args.reference,
-                     args.stride, args.start, log=_log)
+                     args.stride, args.start, log=_log, changes=args.changes)
+    elif args.cmd == "calibrate-lidar-imu":
+        # pylint: disable-next=import-outside-toplevel
+        from garage_recon.recon import lidar_imu
+        lidar_imu.run(pathlib.Path(args.work),
+                      [pathlib.Path(t) for t in args.trips],
+                      config_lib.load_config(args.config), log=_log)
+    elif args.cmd == "update-map":
+        # pylint: disable-next=import-outside-toplevel
+        from garage_recon.nav import update
+        update.apply_changes(pathlib.Path(args.work),
+                             json.loads(pathlib.Path(args.changes).read_text()),
+                             config_lib.load_config(args.config), log=_log)
     elif args.cmd == "demo":
         out = pathlib.Path(args.out)
         trips = synthetic.generate(out / "data", args.preset, log=_log)

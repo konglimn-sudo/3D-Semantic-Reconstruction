@@ -212,16 +212,22 @@ class SemanticsPipeline:
         segments = self.markings()
         paths = self.paths_by_level()
         slots: list[slots_lib.Slot] = []
+        painted = 0
         for path in sorted((self.recon.work / "bev").glob("level_*.npz")):
             grid, rasters = bev.load_bev(path)
             level = grid.level
-            slots += slots_lib.assemble_slots(
+            found = slots_lib.assemble_slots(
                 [s for s in segments if s.level == level], level, yaw,
                 paths.get(level, np.zeros((0, 2))),
                 [c for c in columns if c.level == level], grid,
                 rasters["height_max"], rasters["floor_z"], self.cfg, self.log,
                 floor_count=rasters.get("floor_count"),
                 intensity=rasters.get("intensity"))
+            painted += slots_lib.paint_attributes(found, grid, rasters,
+                                                  self.cfg)
+            slots += found
+        if painted:
+            self.log(f"[slots] {painted} charging slots (green floor paint)")
         (self.out / "slots.json").write_text(
             json.dumps([s.to_json() for s in slots]))
         export.write_geojson(self.out / "slots.geojson", [
@@ -619,7 +625,8 @@ class SemanticsPipeline:
         (self.out / "numbers.json").write_text(json.dumps({
             "summary": summary,
             "slots": {s.slot_id: {"number": s.number, "zone": s.zone,
-                                  "text_votes": s.text_votes}
+                                  "text_votes": s.text_votes,
+                                  "attributes": s.attributes}
                       for s in slots}}, indent=1))
         self.record("numbers", uses_cameras=True)
 

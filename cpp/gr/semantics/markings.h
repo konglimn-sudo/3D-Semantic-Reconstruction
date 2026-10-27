@@ -61,8 +61,9 @@ std::vector<MarkingSegment> MergeCollinear(std::vector<MarkingSegment> segs,
                                            const MarkingConfig& config);
 
 // Line segments of a paint mask (merged and filtered). `skeleton` is the
-// mask's skeleton when the caller has one (the Python stage uses scikit-image
-// so that results stay as they were); empty: Zhang-Suen thinning (ThinMask).
+// mask's skeleton when the caller has one; empty: Skeletonize (scikit-image's
+// thinning, which the slot assembly was tuned with: plain Zhang-Suen splits
+// lines differently at diagonal steps).
 std::vector<MarkingSegment> VectorizeMarkings(
     const std::vector<uint8_t>& mask, const RasterFrame& frame,
     const MarkingConfig& config, int level,

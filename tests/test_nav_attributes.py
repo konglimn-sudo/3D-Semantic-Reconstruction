@@ -184,3 +184,141 @@ def test_points_of_interest_and_queries():
     assert [p["kind"] for p in attributes.find_pois(pois, "入口")] == [
         "entrance"]
     assert attributes.find_pois(pois, "B1 C区 105") == []
+
+
+def test_ramp_ends_and_road_features_become_points_of_interest():
+    import types
+    cfg = config_lib.load_config()
+    graph = _loop_graph()
+    # A ramp from node 2 (level 0) down to a node on level 1.
+    lower = graph.add_node([40.0, 44.0, -3.6], 1)
+    graph.add_edge(graph_lib.Edge(
+        2, lower, np.array([graph.nodes[2], graph.nodes[lower]]), "ramp", 0,
+        6.0))
+    ramps = attributes.ramp_pois(graph, ["B1", "B2"])
+    assert [p["direction"] for p in ramps] == ["down", "up"]
+    assert ramps[0]["name"].startswith("坡道口 B1→B2")
+    # A barrier gate cabinet beside the bottom aisle at x = 10 and a speed
+    # bump across the right aisle at y = 10.
+    cabinet = np.column_stack([np.full(40, 10.0) + np.tile([0, .1], 20),
+                               np.repeat(np.linspace(1.2, 1.6, 20), 2),
+                               np.full(40, 0.5)])
+    bump = np.column_stack([np.repeat(np.linspace(37, 43, 61), 3),
+                            np.tile([9.9, 10.0, 10.1], 61), np.full(183, 0.05)])
+    xyz = np.vstack([cabinet, bump])
+    labels = np.array([19] * len(cabinet) + [10] * len(bump))
+    point_map = types.SimpleNamespace(xyz=xyz, level=np.zeros(len(xyz), int),
+                                      dynamic=None)
+    pois, report = attributes.road_features(graph, point_map, labels, cfg)
+    assert report == {"barrier": 1, "speed_bump": 1}
+    assert len(pois) == 1 and pois[0]["kind"] == "barrier"
+    assert pois[0]["node"] is not None
+    assert graph.nodes[pois[0]["node"]][0] == pytest.approx(10.05, abs=0.1)
+    assert "barrier" in graph.edges[0].features
+    assert any("speed_bump" in e.features for e in graph.edges
+               if e.a in (1, 2) and e.b in (1, 2))
+    found = attributes.find_pois(ramps + pois, "去最近的坡道")
+    assert {p["kind"] for p in found} == {"ramp"}
+    assert attributes.find_pois(ramps + pois, "道闸")[0]["kind"] == "barrier"
+    restored = graph_lib.NavGraph.from_json(graph.to_json())
+    assert restored.edges[0].features == graph.edges[0].features
+
+
+def test_slot_attributes_from_signs_and_queries():
+    from garage_recon.nav import address
+    from garage_recon.semantics import numbers
+    assert numbers.text_attributes("新能源充电车位") == ["ev"]
+    assert numbers.text_attributes("无障碍专用") == ["accessible", "reserved"]
+    assert numbers.text_kind("充电车位") == "attribute"
+
+    def goal(slot_id, x, level=0, attributes=()):
+        return {"slot_id": slot_id, "level": level, "number": slot_id[-3:],
+                "zone": "A", "corners": [[x, 0], [x + 2.5, 0], [x + 2.5, 5],
+                                         [x, 5]],
+                "attributes": list(attributes)}
+
+    goals = [goal("L0-A-001", 0.0, attributes=["ev"]), goal("L0-A-002", 2.5),
+             goal("L0-A-003", 5.0), goal("L1-A-001", 0.0, level=1)]
+    signs = [{"kind": "attribute", "text": "无障碍", "texts": ["无障碍"],
+              "level": 0, "xyz": [6.0, 6.5, 2.0]},
+             {"kind": "attribute", "text": "充电车位", "texts": ["充电车位"],
+              "level": 0, "xyz": [50.0, 6.5, 2.0]}]  # Too far from any slot.
+    assert attributes.attach_sign_attributes(goals, signs, 3.0) == 1
+    assert goals[2]["attributes"] == ["accessible"]
+    names = ["B1", "B2"]
+    assert [g["slot_id"] for g in address.find(goals, "充电车位", names)] == [
+        "L0-A-001"]
+    assert [g["slot_id"] for g in address.find(goals, "B1 无障碍车位",
+                                               names)] == ["L0-A-003"]
+    assert address.find(goals, "B2 充电车位", names) == []
+    # Numbers still work.
+    assert [g["slot_id"] for g in address.find(goals, "B1 A-002", names)] == [
+        "L0-A-002"]
+
+
+def test_one_arrow_and_drives_or_signs_make_a_corridor_one_way():
+    cfg = config_lib.load_config()
+    quiet = lambda *_: None  # noqa: E731
+
+    def drive(x0, x1):
+        x = np.linspace(x0, x1, 60)
+        return (0, np.column_stack([x, np.full(60, 1.0 if x1 < x0 else -1.0)]))
+
+    graph = _loop_graph()
+    report = traffic.apply_arrows(graph, [_arrow(10, 0.1, -1)], cfg, quiet,
+                                  drives=[drive(39, 1), drive(38, 2)])
+    assert report["corridors"][0]["verdict"] == "one-way (driven)"
+    assert report["corridors"][0]["passes"] == [0, 4]
+    assert report["one_way_edges"] == 2
+    # A no-entry sign read at the bottom-right corner, facing +x (its
+    # readers come from x > 40 ... and turn in): traffic leaves there.
+    graph = _loop_graph()
+    sign = {"kind": "no_entry", "text": "禁止驶入", "level": 0,
+            "xyz": [37.0, -2.5, 2.0], "facing": [1.0, 0.0]}
+    report = traffic.apply_arrows(graph, [], cfg, quiet, landmarks=[sign])
+    assert report["signs"] == 1
+    verdicts = [c["verdict"] for c in report["corridors"]]
+    assert verdicts == ["one-way (sign)"]
+    bottom = [e for e in graph.edges if e.one_way]
+    assert all(e.points[-1, 0] > e.points[0, 0] for e in bottom)  # +x.
+
+
+def test_text_landmarks_face_their_readers():
+    from garage_recon.semantics import numbers
+    sign = np.array([10.0, 0.0, 2.5])
+    readings = [("禁止驶入", sign + [0.02 * k, 0, 0], 1.0,
+                 np.array([10.0 + k, -8.0, 1.5])) for k in range(-3, 4)]
+    marks = numbers.text_landmarks(readings, 3.0, 2, 1.0)
+    assert marks[0]["kind"] == "no_entry"
+    assert marks[0]["facing"] == pytest.approx([0.0, -1.0], abs=0.05)
+    # Without cameras: no facing.
+    marks = numbers.text_landmarks([r[:3] for r in readings], 3.0, 2, 1.0)
+    assert "facing" not in marks[0]
+
+
+def test_update_checks_whether_the_vehicle_still_passes():
+    from garage_recon.nav import update
+    # A 30 m long, 6 m wide aisle (walls at y = 0 and 6), its edge along
+    # y = 3; a fence from the south wall to y = 2.4 or across it.
+    grid = bev.BevGrid(0, -1.0, -1.0, 0.1, 320, 80)
+
+    def layers_with(fence_top):
+        rows, cols = np.mgrid[0:80, 0:320]
+        y = grid.y0 + (rows + 0.5) * grid.res
+        x = grid.x0 + (cols + 0.5) * grid.res
+        structure = (y < 0.0) | (y > 6.0)
+        structure |= (x > 14.0) & (x < 14.3) & (y < fence_top)
+        clearance = (_core.distance_transform(structure.astype(np.uint8))
+                     * grid.res).astype(np.float32)
+        z = np.zeros(structure.shape, bool)
+        return layers_lib.LevelLayers(grid, ~structure, z, structure, z, z,
+                                      z, np.zeros(structure.shape, np.int32),
+                                      z, np.zeros(structure.shape),
+                                      clearance, None)
+
+    edge = graph_lib.Edge(0, 1, np.array([[1.0, 3.0, 0.0], [29.0, 3.0, 0.0]]),
+                          "aisle", 0, 6.0)
+    ok, width = update.passable(layers_with(2.4), edge, 1.25, 4.0)
+    assert ok and width == pytest.approx(1.75, abs=0.15)
+    ok, _ = update.passable(layers_with(6.0), edge, 1.25, 4.0)
+    assert not ok

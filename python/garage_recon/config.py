@@ -53,13 +53,53 @@ def deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_config(path: str | Path | None = None, overrides: dict | None = None) -> Config:
+def _leaves(table: dict, prefix: tuple = ()):
+    """(key path, value) of the non-dict values of a nested dict."""
+    for key, value in table.items():
+        if isinstance(value, dict):
+            yield from _leaves(value, prefix + (key,))
+        else:
+            yield prefix + (key,), value
+
+
+def apply_imu_grade(cfg: dict, user: dict) -> dict:
+    """The IMU grade's settings (`imu_grades[imu_grade]`) where the user's
+    files do not set them.
+
+    Applied once: the result is marked `imu_grade_applied`, so a saved
+    config.used.yaml loaded again keeps its values (gr/io/config.cc does the
+    same).
+    """
+    grade = cfg.get("imu_grade")
+    if not grade or cfg.get("imu_grade_applied"):
+        return cfg
+    table = (cfg.get("imu_grades") or {}).get(grade)
+    if table is None:
+        raise ValueError(f"unknown imu_grade {grade!r}")
+    out = copy.deepcopy(cfg)
+    for path, value in _leaves(table):
+        given = user
+        for key in path:
+            given = given.get(key) if isinstance(given, dict) else None
+        if given is not None:
+            continue  # Set explicitly.
+        section = out
+        for key in path[:-1]:
+            section = section.setdefault(key, {})
+        section[path[-1]] = copy.deepcopy(value)
+    out["imu_grade_applied"] = True
+    return out
+
+
+def load_config(path: str | Path | None = None,
+                overrides: dict | None = None) -> Config:
     cfg = yaml.safe_load(DEFAULT_PATH.read_text())
+    user = {}
     if path is not None:
         user = yaml.safe_load(Path(path).read_text()) or {}
-        cfg = deep_merge(cfg, user)
     if overrides:
-        cfg = deep_merge(cfg, overrides)
+        user = deep_merge(user, overrides)
+    cfg = apply_imu_grade(deep_merge(cfg, user), user)
     return Config.wrap(cfg)
 
 

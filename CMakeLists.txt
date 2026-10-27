@@ -15,7 +15,7 @@ option(GR_INPLACE "Write the extension into python/garage_recon (development lay
 
 # Some Command Line Tools installs ship libc++ headers only inside the SDK and
 # clang then fails on `#include <vector>`; point it at the SDK copy.
-if(APPLE AND CMAKE_OSX_SYSROOT)
+if(APPLE AND CMAKE_OSX_SYSROOT AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   get_filename_component(_gr_cxx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
   if(NOT EXISTS "${_gr_cxx_bin}/../include/c++/v1/vector" AND EXISTS "${CMAKE_OSX_SYSROOT}/usr/include/c++/v1/vector")
     message(STATUS "garage_recon: using libc++ headers from ${CMAKE_OSX_SYSROOT}/usr/include/c++/v1")
@@ -28,7 +28,7 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 # --------------------------------------------------------------------- OpenMP
 set(GR_OPENMP_TARGET "")
 if(GR_USE_OPENMP)
-  if(APPLE AND NOT OpenMP_CXX_FLAGS)
+  if(APPLE AND NOT OpenMP_CXX_FLAGS AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     # Apple clang needs Homebrew's libomp.
     foreach(prefix /opt/homebrew/opt/libomp /usr/local/opt/libomp)
       if(EXISTS "${prefix}/include/omp.h")
@@ -70,6 +70,7 @@ set(GR_CORE_SOURCES
   # calibration/: Camera time offset / extrinsics, clock sync between sensors.
   cpp/gr/calibration/camera_calibration.cc
   cpp/gr/calibration/clock_sync.cc
+  cpp/gr/calibration/lidar_imu.cc
   # registration/: Voxel-hash ICP, coarse alignment, placement, cloud comparison.
   cpp/gr/registration/cloud_compare.cc
   cpp/gr/registration/registration.cc
@@ -86,6 +87,8 @@ set(GR_CORE_SOURCES
   cpp/gr/backend/pose_graph.cc
   cpp/gr/backend/scan_context.cc
   # mapping/: Survey map, dynamic points, free space, BEV rasters.
+  cpp/gr/mapping/bev.cc
+  cpp/gr/mapping/change_detection.cc
   cpp/gr/mapping/levels.cc
   cpp/gr/mapping/raster.cc
   cpp/gr/mapping/raycast.cc
@@ -97,7 +100,9 @@ set(GR_CORE_SOURCES
   cpp/gr/semantics/markings.cc
   cpp/gr/semantics/objects.cc
   cpp/gr/semantics/occupancy.cc
+  cpp/gr/semantics/paint.cc
   cpp/gr/semantics/projector.cc
+  cpp/gr/semantics/slot_paint.cc
   cpp/gr/semantics/slots.cc
   cpp/gr/semantics/structure.cc
   cpp/gr/semantics/vector_fit.cc
@@ -108,10 +113,14 @@ set(GR_CORE_SOURCES
   # nav/: Navigation map, floor arrows, traffic, lanes, localization in
   # the map (per sweep and per trip), position on the route graph.
   cpp/gr/nav/arrows.cc
+  cpp/gr/nav/features.cc
   cpp/gr/nav/lanes.cc
+  cpp/gr/nav/layers.cc
+  cpp/gr/nav/map_update.cc
   cpp/gr/nav/localization.cc
   cpp/gr/nav/nav_map.cc
   cpp/gr/nav/position.cc
+  cpp/gr/nav/slot_state.cc
   cpp/gr/nav/traffic.cc
   cpp/gr/nav/trip_localizer.cc
   # sim/: Box-scene ray caster of the synthetic garage.
@@ -135,8 +144,10 @@ endif()
 find_package(ZLIB REQUIRED)
 add_library(gr_io STATIC
   cpp/gr/io/config.cc
+  cpp/gr/io/digest.cc
   cpp/gr/io/nav_files.cc
   cpp/gr/io/npy.cc
+  cpp/gr/io/recon_files.cc
   cpp/gr/io/tables.cc
   cpp/gr/io/trip.cc
   cpp/gr/io/value.cc
@@ -146,15 +157,48 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(gr_io PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
+# ---------------------------------------------------------------- gr_pipeline
+# cpp/gr/pipeline: the stages of the offline reconstruction on trip and work
+# directories (gr_core algorithms, gr_io files), with exceptions as gr_io.
+add_library(gr_pipeline STATIC
+  cpp/gr/pipeline/recon_pipeline.cc
+)
+target_link_libraries(gr_pipeline PUBLIC gr_io)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(gr_pipeline PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # ------------------------------------------------------------------ programs
 # cpp/apps: command-line programs on gr_core + gr_io.
-option(GR_BUILD_APPS "Build the command-line programs (gr_localize)" ON)
+option(GR_BUILD_APPS "Build the command-line programs (gr_localize, gr_recon)" ON)
 if(GR_BUILD_APPS)
   add_executable(gr_localize cpp/apps/gr_localize.cc)
   target_link_libraries(gr_localize PRIVATE gr_io)
+  add_executable(gr_recon cpp/apps/gr_recon.cc)
+  target_link_libraries(gr_recon PRIVATE gr_pipeline)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(gr_localize PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(gr_recon PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
+  # `cmake --install`: the programs and the default configuration they take
+  # as their first --config.
+  include(GNUInstallDirs)
+  install(TARGETS gr_localize gr_recon
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES python/garage_recon/default_config.yaml
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/garage_recon)
+
+  # `cpack`: a tarball (and a Debian package on Linux) of the programs.
+  set(CPACK_PACKAGE_NAME garage-recon)
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+      "Garage reconstruction and map localization without Python")
+  set(CPACK_PACKAGE_CONTACT "garage_recon maintainers")
+  set(CPACK_GENERATOR TGZ)
+  if(UNIX AND NOT APPLE)
+    list(APPEND CPACK_GENERATOR DEB)
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libgomp1, zlib1g")
+  endif()
+  include(CPack)
 endif()
 
 # ------------------------------------------------------------ Python module
@@ -208,6 +252,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/sensors/imu_test.cc
     cpp/gr/calibration/camera_calibration_test.cc
     cpp/gr/calibration/clock_sync_test.cc
+    cpp/gr/calibration/lidar_imu_test.cc
     cpp/gr/registration/cloud_compare_test.cc
     cpp/gr/registration/registration_test.cc
     cpp/gr/odometry/lio_test.cc
@@ -220,6 +265,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/backend/plane_factor_test.cc
     cpp/gr/backend/pose_graph_test.cc
     cpp/gr/backend/scan_context_test.cc
+    cpp/gr/mapping/change_detection_test.cc
     cpp/gr/mapping/levels_test.cc
     cpp/gr/mapping/raster_test.cc
     cpp/gr/mapping/raycast_test.cc
@@ -231,17 +277,21 @@ if(GR_BUILD_TESTS)
     cpp/gr/semantics/objects_test.cc
     cpp/gr/semantics/occupancy_test.cc
     cpp/gr/semantics/projector_test.cc
+    cpp/gr/semantics/slot_paint_test.cc
     cpp/gr/semantics/slots_test.cc
     cpp/gr/semantics/structure_test.cc
     cpp/gr/splat/coverage_test.cc
     cpp/gr/splat/depth_prior_test.cc
     cpp/gr/splat/gaussians_test.cc
     cpp/gr/nav/arrows_test.cc
+    cpp/gr/nav/features_test.cc
     cpp/gr/nav/lanes_test.cc
     cpp/gr/nav/localization_test.cc
     cpp/gr/nav/nav_map_test.cc
     cpp/gr/nav/position_test.cc
+    cpp/gr/nav/slot_state_test.cc
     cpp/gr/nav/traffic_test.cc
+    cpp/gr/io/recon_files_test.cc
     cpp/gr/io/trip_test.cc
     cpp/gr/io/value_test.cc
     cpp/gr/testing/e2e_test.cc
@@ -250,7 +300,8 @@ if(GR_BUILD_TESTS)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(gr_tests PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-exceptions)
     # The gr_io tests check its exceptions.
-    set_source_files_properties(cpp/gr/io/trip_test.cc cpp/gr/io/value_test.cc
+    set_source_files_properties(cpp/gr/io/recon_files_test.cc
+                                cpp/gr/io/trip_test.cc cpp/gr/io/value_test.cc
                                 PROPERTIES COMPILE_OPTIONS -fexceptions)
   endif()
   add_test(NAME gr_tests COMMAND gr_tests)

@@ -183,6 +183,9 @@ Eigen::MatrixXd TripReader::Table(const std::string& name) const {
 Eigen::MatrixXd TripReader::Imu() const { return Table("imu.csv"); }
 Eigen::MatrixXd TripReader::Wheel() const { return Table("wheel.csv"); }
 Eigen::MatrixXd TripReader::Gnss() const { return Table("gnss.csv"); }
+Eigen::MatrixXd TripReader::ControlPoints() const {
+  return Table("control_points.csv");
+}
 
 ImuSamples TripReader::ImuSamplesInVehicle() const {
   const Eigen::MatrixXd rows = Imu();

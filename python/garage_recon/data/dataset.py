@@ -13,6 +13,9 @@
       imu.csv                           t, gx, gy, gz, ax, ay, az   (body = vehicle frame)
       wheel.csv                         t, speed
       gnss.csv                          t, x, y, z, std             (local ENU metres)
+      control_points.csv                t, px, py, pz, x, y, z, std (optional: a surveyed
+                                        target at p in the LiDAR frame of time t, world
+                                        position x, y, z)
 
 Converters from ROS bags or vendor logs only need to produce this layout.
 """
@@ -129,6 +132,10 @@ class TripDataset:
 
     def gnss(self) -> np.ndarray | None:
         return _read_csv(self.root / "gnss.csv")
+
+    def control_points(self) -> np.ndarray | None:
+        """Surveyed targets seen in the sweeps (control_points.csv)."""
+        return _read_csv(self.root / "control_points.csv")
 
     def imu_samples(self) -> _core.ImuSamples:
         """IMU in the vehicle frame for the C++ core (empty if absent)."""
