@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "Eigen/Eigenvalues"
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 namespace gr {
 namespace {
@@ -36,22 +38,6 @@ struct CachedPlane {
 };
 
 using PlaneCache = std::unordered_map<VoxelKey, CachedPlane, VoxelKeyHash>;
-
-int MaxThreads() {
-#ifdef _OPENMP
-  return omp_get_max_threads();
-#else
-  return 1;
-#endif
-}
-
-int ThreadId() {
-#ifdef _OPENMP
-  return omp_get_thread_num();
-#else
-  return 0;
-#endif
-}
 
 // Residual model of the map around `point`: grows the neighbourhood until it
 // is planar, because sparse sweeps sample flat surfaces as rings that are far
@@ -84,40 +70,81 @@ CachedPlane ClassifyNeighbourhood(const VoxelHashMap& map, const Vec3& point,
   return plane;
 }
 
+// Correspondences are summed in blocks of a fixed number of source points,
+// added in block order, so that the normal equations do not depend on the
+// number of threads.
+constexpr int kBlockSize = 256;
+
 // One linearisation pass. `robust` toggles the Geman-McClure weights; the
-// unweighted pass gives the final statistics and Hessian.
+// unweighted pass gives the final statistics and Hessian. Residual models
+// are cached per cell of half the plane radius: a cell as large as the
+// radius shares one model between the faces of a pillar or the two sides of
+// an edge, and coarse-to-fine alignment then stalls along a corridor. A
+// cell not in `cache` yet is classified around the first nearest map point
+// (in source order) inside it and kept for the later passes, so that the
+// cache, too, is the same for any number of threads.
 NormalEquations Linearize(const Points& source, const VoxelHashMap& map,
                           const Pose& pose, const IcpOptions& options,
-                          bool robust, std::vector<PlaneCache>& caches) {
+                          bool robust, PlaneCache& cache) {
   const int n = static_cast<int>(source.size());
   const double k = options.kernel;
   const double plane_radius =
       options.plane_radius > 0.0 ? options.plane_radius : map.voxel_size();
-  const double inv_plane_radius = 1.0 / plane_radius;
+  const double inv_cache_cell = 2.0 / plane_radius;
+  const bool parallel = options.parallel;
   auto weight = [&](double r2) {
     if (!robust) return 1.0;
     const double s = k + r2;
     return (k * k) / (s * s);
   };
-  auto accumulate = [&](int i, NormalEquations& acc, PlaneCache& cache) {
-    const Vec3 world_point = pose * source[static_cast<size_t>(i)];
-    const std::optional<VoxelHashMap::Neighbor> nearest =
-        map.Nearest(world_point, options.max_corr_dist, options.exclude_frame,
-                    options.max_search_voxels);
-    if (!nearest) return;
+  std::vector<Vec3> world(static_cast<size_t>(n));
+  std::vector<std::optional<VoxelHashMap::Neighbor>> nearest(
+      static_cast<size_t>(n));
+  std::vector<VoxelKey> keys(options.point_to_plane ? world.size() : 0);
+  std::vector<uint8_t> cached(keys.size(), 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (parallel)
+#endif
+  for (int i = 0; i < n; ++i) {
+    const size_t u = static_cast<size_t>(i);
+    world[u] = pose * source[u];
+    nearest[u] = map.Nearest(world[u], options.max_corr_dist,
+                             options.exclude_frame, options.max_search_voxels);
+    if (!nearest[u] || keys.empty()) continue;
+    keys[u] = VoxelOf(nearest[u]->point, inv_cache_cell);
+    cached[u] = cache.count(keys[u]) > 0;
+  }
+  if (!keys.empty()) {
+    std::vector<std::pair<VoxelKey, Vec3>> fresh;
+    std::unordered_set<VoxelKey, VoxelKeyHash> seen;
+    for (size_t u = 0; u < keys.size(); ++u) {
+      if (!nearest[u] || cached[u]) continue;
+      if (seen.insert(keys[u]).second) {
+        fresh.emplace_back(keys[u], nearest[u]->point);
+      }
+    }
+    std::vector<CachedPlane> planes(fresh.size());
+    const int num_fresh = static_cast<int>(fresh.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16) if (parallel)
+#endif
+    for (int f = 0; f < num_fresh; ++f) {
+      const size_t v = static_cast<size_t>(f);
+      planes[v] =
+          ClassifyNeighbourhood(map, fresh[v].second, plane_radius, options);
+    }
+    for (size_t v = 0; v < fresh.size(); ++v) {
+      cache.emplace(fresh[v].first, planes[v]);
+    }
+  }
+  auto accumulate = [&](size_t u, NormalEquations& acc) {
+    if (!nearest[u]) return;
+    const Vec3& world_point = world[u];
     Eigen::Matrix<double, 3, 6> jacobian;
     jacobian.block<3, 3>(0, 0) = Mat3::Identity();
     jacobian.block<3, 3>(0, 3) = -Hat(world_point);
     if (options.point_to_plane) {
-      const VoxelKey key = VoxelOf(nearest->point, inv_plane_radius);
-      auto it = cache.find(key);
-      if (it == cache.end()) {
-        it = cache
-                 .emplace(key, ClassifyNeighbourhood(map, nearest->point,
-                                                     plane_radius, options))
-                 .first;
-      }
-      const CachedPlane& plane = it->second;
+      const CachedPlane& plane = cache.at(keys[u]);
       if (plane.type == ResidualType::kSkip) return;
       if (plane.type == ResidualType::kPointToPlane) {
         const double r = plane.normal.dot(world_point - plane.centroid);
@@ -134,31 +161,26 @@ NormalEquations Linearize(const Points& source, const VoxelHashMap& map,
     const double point_scale =
         options.point_to_plane ? options.point_weight : 1.0;
     if (point_scale <= 0.0) return;
-    const Vec3 r = world_point - nearest->point;
+    const Vec3 r = world_point - nearest[u]->point;
     const double w = point_scale * weight(r.squaredNorm());
     acc.jtj.noalias() += w * jacobian.transpose() * jacobian;
     acc.jtr.noalias() += w * jacobian.transpose() * r;
     acc.sse += r.squaredNorm();
     acc.count += 1;
   };
-  NormalEquations total;
-  if (!options.parallel) {
-    for (int i = 0; i < n; ++i) accumulate(i, total, caches[0]);
-    return total;
-  }
+  const int num_blocks = (n + kBlockSize - 1) / kBlockSize;
+  std::vector<NormalEquations> blocks(static_cast<size_t>(num_blocks));
 #ifdef _OPENMP
-#pragma omp parallel
-  {
-    NormalEquations local;
-    PlaneCache& cache = caches[static_cast<size_t>(ThreadId())];
-#pragma omp for nowait schedule(static)
-    for (int i = 0; i < n; ++i) accumulate(i, local, cache);
-#pragma omp critical
-    total.Add(local);
-  }
-#else
-  for (int i = 0; i < n; ++i) accumulate(i, total, caches[0]);
+#pragma omp parallel for schedule(static) if (parallel)
 #endif
+  for (int b = 0; b < num_blocks; ++b) {
+    const int end = std::min(n, (b + 1) * kBlockSize);
+    for (int i = b * kBlockSize; i < end; ++i) {
+      accumulate(static_cast<size_t>(i), blocks[static_cast<size_t>(b)]);
+    }
+  }
+  NormalEquations total;
+  for (const NormalEquations& block : blocks) total.Add(block);
   return total;
 }
 
@@ -287,11 +309,10 @@ IcpResult AlignToMap(const Points& source, const VoxelHashMap& map,
   IcpResult result;
   result.pose = initial_guess;
   if (source.empty() || map.empty()) return result;
-  std::vector<PlaneCache> caches(
-      static_cast<size_t>(options.parallel ? std::max(1, MaxThreads()) : 1));
+  PlaneCache cache;
   for (int iteration = 0; iteration < options.max_iters; ++iteration) {
     const NormalEquations eq =
-        Linearize(source, map, result.pose, options, true, caches);
+        Linearize(source, map, result.pose, options, true, cache);
     result.iterations = iteration + 1;
     if (eq.count < 6) break;
     const Vec6 dx = eq.jtj.ldlt().solve(-eq.jtr);
@@ -304,7 +325,7 @@ IcpResult AlignToMap(const Points& source, const VoxelHashMap& map,
     }
   }
   const NormalEquations final_eq =
-      Linearize(source, map, result.pose, options, false, caches);
+      Linearize(source, map, result.pose, options, false, cache);
   result.inliers = final_eq.count;
   result.fitness =
       static_cast<double>(final_eq.count) / static_cast<double>(source.size());
