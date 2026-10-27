@@ -2,16 +2,17 @@
 tilted handheld rig above a floor, IMU in g) is converted into a trip and
 compared with what was written; a sweep spans the chunk boundary."""
 
-import laspy
 import numpy as np
 import pytest
 from scipy.spatial import transform as spatial_transform
 import yaml
 
-from garage_recon import geometry
-from garage_recon.convert import mandeye
-from garage_recon.convert import profile as profile_lib
-from garage_recon.data import dataset
+laspy = pytest.importorskip("laspy")  # The dev extra.
+
+from garage_recon import geometry  # noqa: E402
+from garage_recon.convert import mandeye  # noqa: E402
+from garage_recon.convert import profile as profile_lib  # noqa: E402
+from garage_recon.data import dataset  # noqa: E402
 
 T0 = 60.0  # Device clock (s).
 DURATION = 1.23  # 12 full sweeps of 0.1 s; the last 0.03 s are dropped.

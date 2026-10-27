@@ -8,15 +8,16 @@ import pickle
 import cv2
 import numpy as np
 import pytest
-from rosbags import rosbag1
-from rosbags import typesys
 from scipy.spatial import transform as spatial_transform
 import yaml
 
-from garage_recon import geometry
-from garage_recon.convert import profile as profile_lib
-from garage_recon.convert import rosbag
-from garage_recon.data import dataset
+rosbag1 = pytest.importorskip("rosbags.rosbag1")  # The dev extra.
+typesys = pytest.importorskip("rosbags.typesys")
+
+from garage_recon import geometry  # noqa: E402
+from garage_recon.convert import profile as profile_lib  # noqa: E402
+from garage_recon.convert import rosbag  # noqa: E402
+from garage_recon.data import dataset  # noqa: E402
 
 TYPES = typesys.get_typestore(typesys.Stores.ROS1_NOETIC)
 START = 1_700_000_000.0

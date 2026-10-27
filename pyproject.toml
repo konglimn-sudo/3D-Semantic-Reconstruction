@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 las = ["laspy[lazrs]>=2.4"]
 rosbag = ["rosbags>=0.9"]
-dev = ["pytest>=7", "rosbags>=0.9"]
+dev = ["pytest>=7", "rosbags>=0.9", "laspy>=2.4"]
 
 [project.scripts]
 garage-recon = "garage_recon.cli:main"
