@@ -5,6 +5,7 @@
 #include <random>
 #include <vector>
 
+#include "Eigen/QR"
 #include "gr/sensors/imu_preintegration.h"
 #include "gr/testing/test.h"
 
@@ -369,16 +370,28 @@ GR_TEST(PoseGraphTest, DenseAndSparseSolversAgreeWithInertialStates) {
   }
   // Both stop at the Levenberg-Marquardt tolerance: within micrometres
   // (GCC and clang round differently).
+  Eigen::MatrixXd tilt_design(n, 3);
+  Eigen::VectorXd height_error(n);
   for (int k = 0; k < n; ++k) {
     const size_t kk = static_cast<size_t>(k);
     GR_EXPECT_LT(
         (solutions[0][kk].translation - solutions[1][kk].translation).norm(),
         1e-5);
     GR_EXPECT_LT((biases[0][kk] - biases[1][kk]).norm(), 1e-5);
-    // The floor fixes height, roll and pitch.
-    GR_EXPECT_NEAR(solutions[0][kk].translation.z(), truth[kk].translation.z(),
-                   2e-3);
+    tilt_design.row(k) << truth[kk].translation.x(),
+        truth[kk].translation.y(), 1.0;
+    height_error[k] =
+        solutions[0][kk].translation.z() - truth[kk].translation.z();
   }
+  // The floor tiles are free planes: they fix the height above the floor,
+  // but the tilt of the whole drive comes from gravity (the IMU, whose
+  // biases are estimated). Height errors are that tilt (about 0.006 deg,
+  // 2 mm over the drive) plus a fraction of a millimetre.
+  const Eigen::Vector3d tilt =
+      tilt_design.colPivHouseholderQr().solve(height_error);
+  GR_EXPECT_LT(std::atan(std::hypot(tilt[0], tilt[1])), DegToRad(0.01));
+  GR_EXPECT_LT((height_error - tilt_design * tilt).cwiseAbs().maxCoeff(),
+               5e-4);
 }
 
 }  // namespace

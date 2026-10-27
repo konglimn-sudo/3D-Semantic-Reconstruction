@@ -407,14 +407,19 @@ double PoseGraph::TotalCost(const State& state) const {
             : Vec6(state.biases[inertial(f.j)] - state.biases[inertial(f.i)]);
     cost += e.dot(f.information * e);
   }
-  double plane_cost = 0.0;
+  // Summed in plane order, so that the cost does not depend on the number of
+  // threads.
+  std::vector<double> plane_chi2(planes_.size());
   const int64_t num_planes = static_cast<int64_t>(planes_.size());
 #ifdef _OPENMP
-#pragma omp parallel for reduction(+ : plane_cost) schedule(dynamic, 64)
+#pragma omp parallel for schedule(dynamic, 64)
 #endif
   for (int64_t p = 0; p < num_planes; ++p) {
-    plane_cost += PlaneChi2(planes_[static_cast<size_t>(p)], poses);
+    plane_chi2[static_cast<size_t>(p)] =
+        PlaneChi2(planes_[static_cast<size_t>(p)], poses);
   }
+  double plane_cost = 0.0;
+  for (const double chi2 : plane_chi2) plane_cost += chi2;
   return 0.5 * (cost + plane_cost);
 }
 

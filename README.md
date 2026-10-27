@@ -320,7 +320,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
 PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work work/x --stages bev texture   # Python 接着做
 ```
 
-单线程下与 Python 入口的全部产物逐字节一致（9.9）；多线程时和 Python 一样有 OpenMP 归约顺序带来的约 1e-5 m 差别。
+与 Python 入口的全部产物逐字节一致（9.9），和线程数无关：ICP 与位姿图的并行求和都按固定的块顺序相加（9.9）。
 
 ### 4.2 位姿集合：一套位姿的工程保证
 
@@ -681,7 +681,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
     --config python/garage_recon/default_config.yaml --prior entrance   # 或 --prior none / reference --reference poses.tum
 ```
 
-两种入口的输出逐字节一致（单线程比较：合成车库入口先验 519 帧、40 s 起步全局初始化 418 帧、FusionPortableV2 室外 159 帧，位姿、`sweeps.csv` 和报告除耗时外完全相同）。多线程时 OpenMP 归约的求和顺序会变，同一程序两次运行的位姿也会有约 1e-5 m 的差别。
+两种入口的输出逐字节一致（合成车库入口先验 519 帧、40 s 起步全局初始化 418 帧、FusionPortableV2 室外 159 帧，位姿、`sweeps.csv` 和报告除耗时外完全相同），和线程数无关。
 
 - **定位地图**：nav 阶段从测量点云中去掉车辆、行人、两轮车和动态点，按 0.1 m 抽稀，写成 `nav/localization_map.npz`。停放的车会变，所以不进地图；露天场地除车以外几乎没有竖直结构，可以用 `nav.localization_map_parked` 保留整个采集期间没动过的车。
 - **里程计**：沿用重建的前端（`OdometryPipeline`，LiDAR 或 LiDAR-惯性）。起步时用前后 1 s 加速度计的平均值把坐标系摆平，航向任意；全局初始化要求重力对齐，车可能停在坡道上启动。里程计把每一帧用 IMU / 轮速去畸变后交给定位器（急转弯时比匀速去畸变准得多：航向误差 p95 0.48° → 0.045°）。
@@ -1567,7 +1567,7 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 
 - 第一版（不加重力因子）形状对、整体歪：窗口之间没有 IMU 因子，倾角只靠入口锚点约束，整个地图倾斜 0.09°、高程偏 4.6 cm。只用每个窗口首帧的倾角也不够（还剩 0.025°，单帧倾角误差可达 0.2°），取全窗平均后与稠密 BA 相当。
 
-**纯 C++ 重建链 `gr_recon`**（odometry → graph → trajectory → map，单线程与 Python 入口比较全部产物）：
+**纯 C++ 重建链 `gr_recon`**（odometry → graph → trajectory → map，与 Python 入口比较全部产物；下表是单线程测的，修正并行求和以后多线程也相同）：
 
 | 数据 | 文件 | 逐字节 / 逐值一致 | 耗时 C++ / Python |
 |---|---|---|---|
@@ -1577,6 +1577,17 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - 一致的包括位姿集合的内容哈希 `pose_set_id` / `trajectory_id`（C++ 复现了 Python 的 SHA-256 与 `json.dumps` 格式）、关键帧点云（float32 / float16，float16 按最近偶数舍入）、测量点云、楼层栅格、`config.used.yaml`（PyYAML 读回相同）。Python 的 `bev` 和 `eval` 直接在 C++ 的工作目录上接着跑。
 - 导航分层和 BEV 栅格迁到 C++ 后，在 small 的两层上 34 个栅格全部与原 Python 实现逐值一致；`cv2.fillPoly`（LINE_8、4 位小数）的移植在 6000 个随机多边形（自交、部分出界、旋转矩形、凸包）上与 OpenCV 4.9 逐格一致。
 - 编译器：Apple clang 和 GCC 15 都通过 150 个 C++ 测试（GCC 下稠密 / 稀疏求解器的一致性从 < 1 µm 变成约 2 µm，测试门限放到 10 µm）。
+
+**结果与线程数无关**：第一次 CI（3 核 / 4 核机器）有两个测试失败，本机 8 核下都能通过。
+- ICP 的平面缓存原来是每个线程一份，各线程的部分和又在 `omp critical` 里按先到先得的顺序相加；位姿图的平面代价用的是 `reduction(+)`。结果随线程数变：从 1 m 外起步的由粗到精 ICP 在 1 线程和 3 线程下收敛不到位，GCC 下位姿图的高程检查差 0.1 mm 越过门限。
+- 现在 ICP 只有一份缓存，新格子按点序取第一个点分类；法方程按每 256 个点一块累加、按块序相加；位姿图按平面顺序求和。1、3、4、10 线程的输出逐位相同。
+- ICP 的缓存格子从拟合半径缩到半径的一半。原来一个格子共用一次分类，柱子的几个面或墙角两侧只能分到同一个模型，沿走廊的对齐会停住。这个测试以前是靠多线程下各线程各自分类碰巧通过的。
+- 位姿图测试原来要求每个节点的 z 误差在 2 mm 以内，但这些误差其实是整条轨迹相对重力的整体倾斜（0.006°）。地面的每块都是自由平面，只能定相对高度，绝对倾斜要靠 IMU 的重力。测试改成分别检查：整体倾斜小于 0.01°，去掉倾斜后的高度残差小于 0.5 mm（实测 0.2 mm）。
+- CI 里 `gr_tests` 和 pytest 的失败会写成 GitHub 的错误注释，不登录也能从 checks API 读到。
+- 合成 tiny 两趟：Python 入口与 `gr_recon` 都用 8 线程时 319 个文件逐字节相同，`gr_recon` 8 线程与 3 线程之间也相同。
+- 真实数据新旧对比（`gr_recon` 的 odometry + graph，本机 8 核）：
+  - FusionPortableV2 手持：对齐后 ATE 44.3 → 40.5 cm，PCM 保留回环 6 → 10 / 58。这条 400 m 走廊几乎没有回环，误差以漂移为主，两条轨迹之间差几十厘米。
+  - FusionPortableV2 无人车三趟：回环相同（343 个候选全部通过，PCM 保留 342 个），新旧轨迹相差中位 3–4 cm，对 INS 参考的对齐 ATE 相差不到 0.5 cm。
 
 **LiDAR–IMU 外参检查**（4.4）：
 - FusionPortableV2 无人车：两趟估出的横滚 / 俯仰一致；航向和加计标度不可观（车基本只在平面上开）；
