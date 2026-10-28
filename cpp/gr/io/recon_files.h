@@ -10,7 +10,8 @@
 //   trips/<trip>/poses.{npz,tum}       frame poses after the back-end
 //   graph/kf_poses.npz, loops.json, summary.json
 //   pose_set/pose_set.json, <trip>.npz
-//   map/point_map.npz, levels.json, floor_grids.npz
+//   map/point_map.npz (or tiles/*.npz + tiles.json), levels.json,
+//   floor_grids.npz
 //   provenance.json
 
 #ifndef GARAGE_RECON_GR_IO_RECON_FILES_H_
@@ -114,8 +115,8 @@ std::vector<TripPoses> ReadPoseSet(const std::string& work_dir);
 void RecordProvenance(const std::string& work_dir, const std::string& stage,
                       const PoseSetIds& ids, bool uses_cameras);
 
-// map/point_map.npz (static_map.PointMap); empty optional fields are left
-// out.
+// map/point_map.npz or one map tile (static_map.PointMap); empty optional
+// fields are left out.
 struct PointMapFile {
   Points xyz;
   std::vector<float> intensity;
@@ -130,6 +131,9 @@ struct PointMapFile {
   std::vector<int16_t> level;
   std::vector<float> height;
   std::vector<uint8_t> on_ramp;
+  // Tiles only (map/tiles/*.npz): the map order key (MapAccumulator::Cloud).
+  std::vector<double> range;
+  std::vector<int64_t> sequence;
 };
 void WritePointMap(const std::string& path, const PointMapFile& map);
 

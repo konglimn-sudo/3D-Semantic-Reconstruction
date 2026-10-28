@@ -1,7 +1,8 @@
 """Command line entry point.
 
     garage-recon synth     --out DATA [--preset small] [--trips 2] [--seed 0]
-                           [--ideal] [--no-handheld]
+                           [--ideal] [--no-handheld] [--painted-numbers]
+                           [--image-size PX]
     garage-recon handheld  --data DATA [--seed 0]
     garage-recon convert   (--bag BAG [BAG ...] | --mandeye DIR)
                            --profile PROFILE.yaml --out TRIP [--trip-id ID]
@@ -140,6 +141,10 @@ def main(argv=None) -> int:
                        help="skip the handheld ground truth")
     synth.add_argument("--no-arrows", action="store_true",
                        help="no floor arrows on the aisles")
+    synth.add_argument("--painted-numbers", action="store_true",
+                       help="paint the slot numbers on the floor (images)")
+    synth.add_argument("--image-size", type=int, default=None,
+                       help="fisheye image size (default: the preset's)")
 
     scan = commands.add_parser(
         "handheld", help="add the synthetic handheld ground truth to a dataset")
@@ -260,7 +265,9 @@ def main(argv=None) -> int:
     if args.cmd == "synth":
         synthetic.generate(args.out, args.preset, args.trips, args.seed,
                            stereo=args.stereo, ideal=args.ideal,
-                           arrows=not args.no_arrows, log=_log)
+                           arrows=not args.no_arrows,
+                           painted_numbers=args.painted_numbers,
+                           image_size=args.image_size, log=_log)
         if not args.no_handheld:
             handheld.simulate_handheld(args.out, args.seed, log=_log)
     elif args.cmd == "handheld":

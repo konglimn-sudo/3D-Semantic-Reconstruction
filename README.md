@@ -22,11 +22,11 @@
 |---|---|
 | 位姿骨架 | 已实现：激光里程计、回环、IMU 预积分位姿图、无入口位姿趟次的整趟粗对齐、平面约束的 LiDAR BA（超过 2000 个关键帧时分层，4.1）、连续时间轨迹与重新去畸变、相机时间偏差 / 卷帘快门 / 外参标定、带版本号的位姿集合；控制点锚定、OCR 文字回环候选、按 IMU 等级的噪声与零偏先验、LiDAR–IMU 外参检查（4.4） |
 | 测量点云与验收 | 已实现：多次观测融合且每点带 σ 的测量点云、正射影像上的亚像素矢量拟合、手持真值验收（导入、控制点 / 检查点、报告） |
-| 语义：规则路线 | 已实现：结构、标线、车位、停放 / 移动目标、占据、逐帧标签、车位号（OCR 接口）、审核队列、导出 |
+| 语义：规则路线 | 已实现：结构、标线、车位、停放 / 移动目标、占据、逐帧标签、车位号（RapidOCR，读每个车位摆正的地面正射小图，合成车库 19 / 20 正确，9.10）、审核队列、导出 |
 | 语义：语言路线 | 链路已实现，用合成真值验证：模型接口、跨视角身份关联、身份级语言特征。语义载体暂用 LiDAR 点；真实模型（SAM 2、SigLIP 2、OCR）的适配器还没有写（见 2 的 D） |
 | 导航地图 | 已实现（第 6 章）：分层栅格（含净空高度）、路网（骨架 + 按车位排、长墙和采集行驶路线生成的车道线）、单行道（地面箭头、采集行驶方向、禁行 / 单行标志）、车位目标点与属性（充电、无障碍、专用）、地点（入口、出口、门、坡道口）、道闸与减速带、限高（实测净空 + 限高牌）、地址查询、QA、nav2 / GeoJSON / Lanelet2（车位与车道）导出、查看器里的路线规划；实时车位占用、变化检测与路网更新（6.3） |
 | 车端定位 | 已实现（6.2）：在导航地图的固定结构上用 LiDAR 定位；有入口先验时直接跟踪，没有时把里程计子图放到地图上（全局初始化）；退化方向保留里程计；同时给出看到的车位的实时占用和相对地图的结构变化（6.3）。合成车库误差 p95 1.8 cm（相对地图 0.9 cm），10 个随机起点全部正确初始化；露天停车场几何约束不足（9.8） |
-| 工程 | C++ 按功能分文件夹（10.2）；语义与导航几何已迁到 C++（含标线涂料掩膜与骨架、导航分层、BEV 栅格）；文件格式库 `gr_io`；纯 C++ 程序 `gr_localize`（车端定位）和 `gr_recon`（离线重建的几何阶段：里程计 → 图优化 → 位姿集合 → 测量点云、楼层、动态点），输出与 Python 入口逐字节一致（9.9）；C++ 配置表由绑定自动生成；GitHub Actions CI、`cmake --install` / CPack 打包、Docker 镜像（3.1）；逐帧标签和地面纹理按帧并行（约 5 倍） |
+| 工程 | C++ 按功能分文件夹（10.2）；测量点云与动态点可分块建图（与整图逐位相同，峰值内存随块大小下降，9.11）；语义与导航几何已迁到 C++（含标线涂料掩膜与骨架、导航分层、BEV 栅格）；文件格式库 `gr_io`；纯 C++ 程序 `gr_localize`（车端定位）和 `gr_recon`（离线重建的几何阶段：里程计 → 图优化 → 位姿集合 → 测量点云、楼层、动态点），输出与 Python 入口逐字节一致（9.9）；C++ 配置表由绑定自动生成；GitHub Actions CI、`cmake --install` / CPack 打包、Docker 镜像（3.1）；逐帧标签和地面纹理按帧并行（约 5 倍） |
 | 3DGS / DA3 / DINO | 已实现并在 GPU 上实测（第 8 章）：DA3 位姿条件深度与 LiDAR 对齐、gsplat 3DGUT 鱼眼训练（LiDAR 锚定、冻结、剪枝、分块）、留出扫描核验与正射影像、RoMa 相机标定、DINOv2 外观回环。待做：TSDF 网格、逐帧深度渲染、沿 LiDAR 射线的训练损失、SAM 掩膜 |
 | 真实数据 | ROS bag 转换（含 LiDAR 时钟同步）、Mandeye 原始记录转换、扫描仪导出导入；已试跑 FusionPortableV2 两个场景、Skierniewice 地下车库（Mandeye）、Oxford Spires Keble College、Hilti 2021 Parking Deck。当前精度见 9.0 |
 
@@ -89,7 +89,13 @@
 
 依赖：
 - 必需：CMake ≥ 3.18、C++17 编译器（clang、GCC 均可）、Eigen3、zlib（`gr_io` 读写 npz）、Python ≥ 3.9（numpy、scipy、pyyaml、opencv、shapely）；
-- 可选：libomp（OpenMP）、laspy + lazrs（LAS / LAZ 读写，Mandeye 转换）、rosbags（ROS bag 转换）。
+- 可选：libomp（OpenMP）、laspy + lazrs（LAS / LAZ 读写，Mandeye 转换）、rosbags（ROS bag 转换）、RapidOCR（车位号和标志牌 OCR，CPU 即可，见下）。
+
+OCR（`models.ocr`，PP-OCRv4 的 ONNX 模型随包附带，共约 37 MB）：`rapidocr_onnxruntime` 依赖 `opencv-python`，会和已装的 `opencv-python-headless` 冲突，所以不带依赖安装：
+
+```bash
+.venv/bin/pip install onnxruntime pyclipper && .venv/bin/pip install --no-deps rapidocr_onnxruntime
+```
 
 ```bash
 python3 -m venv --system-site-packages .venv && .venv/bin/pip install pybind11 scikit-build-core "laspy[lazrs]" rosbags pytest
@@ -151,6 +157,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli accept --work work/small 
   - 同时生成模拟的手持扫描真值（`data/small/handheld/`），`--no-handheld` 跳过；已有数据可用 `handheld --data DIR` 补生成。
 - `accept`：把重建配准到手持真值并出验收报告（`work/small/acceptance/report.md`），见第 7 节。
 - `synth --no-arrows`：不画地面箭头（对照用）。
+- `synth --painted-numbers [--image-size 768]`：在相机图像里的车位地面上画编号，用来测真实 OCR 模型（9.10）；默认鱼眼只有 128–320 px，读不出地面文字。
 - `localize`：把一趟数据定位到某次重建的导航地图里（6.2），例如用第三趟定位到前两趟建的图：
 
   ```bash
@@ -287,7 +294,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli import-scan \
 | graph | 位姿图 = 各趟里程计链 + 回环 + 入口锚点（INS 位姿 / GNSS，按各自时间戳推到关键帧）+ **IMU 预积分因子**（每个关键帧带速度与零偏）+ 轮速车体速度因子 + 零偏随机游走。**没有锚点的趟次**（手持等，各自以起点为原点）先整趟粗对齐到已放置的趟次上（见下）。回环候选按位置半径和楼层高差门控，Scan Context 排序，多尺度 ICP 验证，PCM 剔除不一致回环；有相机时还可以加 DINO 外观候选（不需要位姿初值，8.4）。最后做 **LiDAR BA**（见下） | `graph/`（含每个关键帧的速度与零偏、BA 每轮统计）、`trips/<trip>/poses.tum` |
 | trajectory | 生成**位姿集合**：每趟一条连续时间轨迹（全部激光帧位姿为节点，节点间用去零偏陀螺和轮速），加上 rig 标定，带内容哈希 `pose_set_id`；用最终轨迹重新去畸变全部关键帧点云 | `pose_set/`、`trips/<trip>/kf_final/` |
 | calibration | 每台相机：锚点图像的查询点匹配到后续若干帧（DINO / RoMa 类匹配器，合成数据用真值实现），形成多视图轨迹；在固定轨迹上联合估计时间偏差和外参，路标约束在 LiDAR 面上；不达标的相机保留 rig.yaml；结果写成新版本的位姿集合 | `calibration.json`、`pose_set/` |
-| map | **测量点云**：5 cm 体素，只取 20 m 内的回波；同一体素内与最近观测距离相当的观测按 1/σ² 加权平均，σ 随距离增大；每点带沿法向的 σ 与观测次数；另算法向。**楼层 / 坡道**：以车辆轨迹为主识别，每层地面高度栅格取中值并排除坡道。高度栅格取的是该层自己的轨迹在各点附近的高度上下的地面点，不是一个常数高度；所以同一层可以沿车道缓慢起伏（FusionPortableV2：400 m 升高 4.5 m，坡度 1.1%，低于坡道阈值）。**动态点**：距离图像可见性投票，按趟统计，区分"本趟内移动"和"跨趟变化"，再加自车扫过区域必为空闲的约束 | `map/point_map.npz`、`levels.json` |
+| map | **测量点云**：5 cm 体素，只取 20 m 内的回波；同一体素内与最近观测距离相当的观测按 1/σ² 加权平均，σ 随距离增大；每点带沿法向的 σ 与观测次数；另算法向。**楼层 / 坡道**：以车辆轨迹为主识别，每层地面高度栅格取中值并排除坡道。高度栅格取的是该层自己的轨迹在各点附近的高度上下的地面点，不是一个常数高度；所以同一层可以沿车道缓慢起伏（FusionPortableV2：400 m 升高 4.5 m，坡度 1.1%，低于坡道阈值）。**动态点**：距离图像可见性投票，按趟统计，区分"本趟内移动"和"跨趟变化"，再加自车扫过区域必为空闲的约束。<br>**分块**（`map.tile_size`，C++ `BuildTiledMap`，`gr_recon` 与 Python 共用）：按水平方向切成边长 `tile_size` 的块（对齐体素网格），每块只累加自己的体素，外加一圈法向半径宽的边，只用传感器在可达距离内的扫描。每一步都是局部的：体素只取决于落进它的回波，法向只取决于半径内的点，动态投票只取决于看到该点的扫描。所以每块的点与整图一次处理时的同一批点逐位相同，按（最近观测距离，关键帧与点序号）排序后，连点序也相同。楼层需要整座车库的地面和顶板：第一遍逐块只留下法向朝上 / 朝下的点（每点 48 字节），识别楼层；第二遍逐块重算，再加楼层和动态点，写成一个块文件。`load_point_map` 读整图时按同一顺序合并（与不分块逐位相同），也可以只读与某个范围相交的块 | `map/point_map.npz`（分块时 `map/tiles/tile_<ix>_<iy>.npz` + `tiles.json`）、`levels.json` |
 | bev | 每层地面强度、地面高度、物体高度栅格 | `bev/level_<i>.npz` + PNG |
 | texture | 四路鱼眼投影到地面网格（每一行按曝光时刻取位姿），每格取最佳视角（近、俯视、未被遮挡），中值融合去高光 | `bev/level_<i>_rgb.png` |
 
@@ -422,7 +429,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
 | features | 语言路线第一步：每张图像的类别无关掩膜（Segmenter2D：SAM 2 / SAM 3）和每个掩膜的语言嵌入（LanguageEncoder：SigLIP 2 / CLIP） | `features/<trip>/<cam>/<ns>.npz` |
 | identities | 掩膜经位姿集合和静态地图投到 3D（C++ `IdentityAssociator`）：加入已有身份、合并同一物体的碎片、同一帧不同掩膜互斥；每个地图载体点得到身份 | `identities.npz` |
 | language | 每个身份的嵌入 = 各视角掩膜嵌入的加权平均（近、未被图像边界截断的视角权重高），与分类表中每类的中英文提示词比较得到类别；地图点继承身份的类别；再把 3D 标签渲染回每张图，与该图自己的 2D 预测比较，得到跨视角一致率。**实例**：有类别的身份组成物体实例；关联不上的视角会把一个物体拆成几个身份，所以同类身份的 5–95% 外接框（外扩 `instance_pad`）重叠达较小框的 `instance_overlap` 时合并，重叠大的先合并，合并后水平边长不超过 `instance_max_extent`（防止一排灯连成一条） | `language/labels.npz`、`instances.json`、`summary.json` |
-| numbers | **车位号 / 分区号**：OCR（`models.ocr`）读出的每段文字，按其像素中心的射线落到各层的地面高度栅格（不是每层一个常数高度），归给附近的车位投票；每排再按"同排编号连续"修正；"C-105"拆成分区 C 和编号 105。<br>**文字地标**：每段文字还按其像素处 LiDAR 地图表面的深度放到 3D（标志牌挂在墙和柱上）。先去掉两端的箭头字符（OCR 常把箭头读成"个""十""《"）；同一文字 `landmark_radius` 内的多次读取合并成地标，分为出口、门、楼层、分区和其他；同一块标志牌上同类的地标再合并，出口类直接合并（"EXIT"与"出口"），其他类要求文字相似度达 `landmark_similarity`（误读的"中区"并入"中央区"，"5A"和"5B"不合并），其余文字记在 `texts`。语言路线有实例时，地标挂到它所在的标志牌实例上。<br>原始 OCR 结果按帧缓存在 `ocr_cache.json`，重跑不必再读图；换 OCR 模型后删掉它 | `numbers.json`（`slots()` 读取时合并，重跑 slots 不会丢）、`landmarks.json` / `.geojson`、`ocr_cache.json` |
+| numbers | **车位号 / 分区号**：OCR（`models.ocr`）读出的每段文字，按其像素中心的射线落到各层的地面高度栅格（不是每层一个常数高度），归给附近的车位投票。<br>**车位正射小图**（`numbers.patches`，图像 OCR 模型才有）：鱼眼整图里的地面编号又小又斜，还转着方向，整图 OCR 几乎读不出（9.10）。所以每排车位按车位轮廓建一张 1.5 cm 的地面纹理（C++ `FloorTextureFuser`，每格取最好的 3 个俯视、未被遮挡的视角取中值，过往车辆因此去掉），每个车位按"站在通道里面向车位"摆正（入口在下）裁出，转 0° 和 180° 各读一次。同一排的编号朝向相同，所以每排取车位号格式（`A-001`、`B2-017`、`105`）读数得分总和高的朝向；倒着读出的大多不成格式。OCR 常在连字符处把"A-001"拆成"A"和"-001"，同一行的读数先按从左到右拼起来。一次小图读数的票数是一次整帧读数的 `patch_weight` 倍。<br>每排再按"同排编号连续"修正；"C-105"拆成分区 C 和编号 105，"B2-017"拆成 B2 和 017。<br>**文字地标**：每段文字还按其像素处 LiDAR 地图表面的深度放到 3D（标志牌挂在墙和柱上）。先去掉两端的箭头字符（OCR 常把箭头读成"个""十""《"）；同一文字 `landmark_radius` 内的多次读取合并成地标，分为出口、门、楼层、分区和其他；同一块标志牌上同类的地标再合并，出口类直接合并（"EXIT"与"出口"），其他类要求文字相似度达 `landmark_similarity`（误读的"中区"并入"中央区"，"5A"和"5B"不合并），其余文字记在 `texts`。语言路线有实例时，地标挂到它所在的标志牌实例上。<br>原始 OCR 结果按帧缓存在 `ocr_cache.json`，重跑不必再读图；换 OCR 模型后删掉它 | `numbers.json`（`slots()` 读取时合并，重跑 slots 不会丢）、`landmarks.json` / `.geojson`、`ocr_cache.json` |
 | rules | 车位尺寸、编号重复、入口远离车道、推断车位、柱补全等进入人工审核队列 | `issues.json` |
 | nav | 导航地图，见第 6 节 | `nav/` |
 | export | LAS 1.4（类别码 64+id，附楼层 / 动态标志）、PLY、GeoJSON、Lanelet2（parking_space / parking_lot，带车位号 `ref` 和分区 `zone`） | `export/` |
@@ -1595,6 +1602,65 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 
 **OCR 文字回环**：不加筛选时合成地图变差 15 cm（各层重复的文字给出错误候选）；只保留几何门控提不出的候选、每段文字最多 2 对之后，精度与不用文字回环相同。
 
+### 9.10 车位号 OCR（RapidOCR 本机，合成车库，2026-10-28）
+
+真实模型第一次读真实渲染的车位号。
+
+**数据**：合成 tiny（一层，24 个车位）加 `--painted-numbers --image-size 768`。
+- 每个车位入口内 0.9 m 处画着"A-001"这样的编号，字高 0.4 m，按"站在通道里面向车位"摆正；
+- 只画进相机图像，不进 LiDAR；
+- 四路鱼眼，768 px，视场 190°。
+
+**处理**：相机标定用合成真值匹配（标定后 0.26 px）；车位号用 RapidOCR（PP-OCRv4，CPU）。
+
+**评测**：预测车位按 IoU 匹配到真值车位，比较分区 + 编号。
+
+| 读法 | 直接读出的车位 | 修正后有编号（匹配到的 20 个） | 正确 | 错误 |
+|---|---|---|---|---|
+| 只用整帧 OCR（100 帧鱼眼图） | 1 / 21 | 1 | 0（只有编号对） | 0 |
+| 正射小图，`patch_min_cos` 0.3 | 13 / 21 | 15 | 4 | 9 |
+| 正射小图，`patch_min_cos` 0.15（每格 1 / 3 / 5 个视角） | 15–17 / 21 | 20 | 19 | 1 |
+| 默认（整帧 + 小图，3 个视角） | 16 / 21 | 20 | 19 | 1 |
+
+- **整帧 OCR 读不出地面编号**：100 帧里只读到 17 段文字。鱼眼里的地面编号离得近时斜着、转着方向，离得远时只有几个像素。
+- **视角下限 0.3 太严**：侧视鱼眼离地约 1 m，车位里 1 m 以外的地面入射余弦已经低于 0.3。小图只拼到编号的下半截，读出"8-004i""10--003"之类，两排还因此选错了朝向。放宽到 0.15 后，编号完整；每格仍按"俯视、近"挑最好的视角。
+- **剩下的错误**：
+  - 一排开头多检出一个半截车位，它没有读数，按同排连续编号补成了"000"（这是车位检测的问题）；
+  - 另一个车位只有一次读数，读错了编号。
+- **耗时**：numbers 阶段 19 s（整帧 OCR 100 帧 + 21 个车位的小图融合和读数）。
+
+**真实数据**：FusionPortableV2 地下车库和室外停车场的地面上都没有画车位号（室外停车场抽查的图里一段文字也没读到），所以还没有真实车位号的读数率。
+
+### 9.11 分块建图（合成 large，2026-10-28）
+
+合成 large：5 趟、2290 个关键帧，测量点云 632 万点。用同一份位姿集合只跑 map 阶段（`gr_recon --stages map`，本机 8 核）；内存是进程的峰值内存。
+
+| | 块数 | 最大块的点数 | 峰值内存 | 耗时 | 与原整图结果 |
+|---|---|---|---|---|---|
+| 原实现（整图） | 1 | 632 万 | 4.80 GB | 192 s | — |
+| 整图（`tile_size: 0`，新实现） | 1 | 632 万 | 3.32 GB | 198 s | 逐位相同 |
+| 40 m 块 | 6 | 348 万 | 2.20 GB | 211 s | 逐位相同 |
+| 20 m 块 | 15 | 109 万 | 1.18 GB | 244 s | 逐位相同 |
+| 12 m 块 | 28 | 41 万 | 0.80 GB | 314 s | 逐位相同 |
+
+**真实数据**：FusionPortableV2 地下车库（手持，400 m 走廊，1404 万点），同一份位姿集合：
+
+| | 块数 | 最大块的点数 | 峰值内存 | 耗时 | 与原整图结果 |
+|---|---|---|---|---|---|
+| 原实现（整图） | 1 | 1404 万 | 10.2 GB | 87 s | — |
+| 整图（新实现） | 1 | 1404 万 | 7.2 GB | 86 s | 逐位相同 |
+| 40 m 块 | 22 | 338 万 | 2.1 GB | 127 s | 逐位相同 |
+
+- **逐位相同**：每个块合并、按地图顺序排好后，与原实现的 `point_map.npz` 比较全部 13 个数组（坐标、法向、σ、楼层、高度、动态点等）；`levels.json` 和 `floor_grids.npz` 也相同。
+- **Python 与 C++ 一致**：Python 入口（20 m 块）写出的 `tiles.json` 和每个块文件，与 `gr_recon` 逐数组相同；进程峰值内存 0.64 GB。
+- **内存随块大小下降**：剩下的部分主要有两块：
+  - 最大一块的工作内存，约每点 500–600 字节；
+  - 楼层识别要留的整座车库地面 / 顶板点，约每个车库点 30 字节。
+- **耗时**：块越小，每帧扫描被相邻块重复读入的次数越多，楼层识别前后两遍也要各融合一次。12 m 块比整图慢 1.6 倍。
+- **不分块的新实现也省内存**：累加器在拿到点云后就释放。
+- **默认不分块**（`tile_size: 0`）。车库大到整图放不下时，再设成 20–40 m。
+- 块按点的体素坐标分（水平方向），不分楼层；多层车库的一块包含该范围内的所有楼层。
+
 ## 10. 代码结构
 
 ### 10.1 C++ / Python 分工
@@ -1616,7 +1682,7 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 | LiDAR–IMU 外参检查 | `lidar_imu` | 轨迹二阶差分对照比力与角速度：旋转、时间偏差、杆臂、倾角、可选加计标度（`CalibrateLidarImu`，4.4） |
 | 连续时间轨迹（位姿集合） | `trajectory`、`exposure` | 以全部激光帧位姿为节点，节点间用去零偏陀螺和轮速积分并做端点修正（`ContinuousTrajectory`）；用它重新去畸变关键帧（`DeskewKeyframeSweep`）；相机每一行按曝光时刻取位姿（卷帘快门，`CameraExposure`） |
 | 相机标定 | `camera_calibration` | 在固定轨迹上联合估计相机时间偏差与外参：多视图特征轨迹 + 三角化路标 + 路标到 LiDAR 面的点面约束，LM + 路标 Schur 消元（`CalibrateCamera`） |
-| 地图与动态点判断 | `static_map`、`visibility`、`bev` | 测量点云（多次观测融合、每点 σ）；法向定向、按趟距离图像可见性投票、自车扫过区域、高度门限，输出"本趟内移动 / 跨趟变化"（`DynamicDetector`）；每层 BEV 栅格与地面高度（`LevelRasters`） |
+| 地图与动态点判断 | `static_map`、`tiled_map`、`visibility`、`bev` | 测量点云（多次观测融合、每点 σ）；法向定向、按趟距离图像可见性投票、自车扫过区域、高度门限，输出"本趟内移动 / 跨趟变化"（`DynamicDetector`）；整个 map 阶段可分块（`BuildTiledMap`，与整图逐位相同）；每层 BEV 栅格与地面高度（`LevelRasters`） |
 | 变化检测 | `change_detection` | 定位后的点云对照地图：命中与射线穿过的体素、跨时长过滤、聚类与分类（`ChangeDetector`，6.3） |
 | 占据栅格 | `objects`、`occupancy` | 目标框时间线（停放 + 移动轨迹插值）、每帧语义占据与 LiDAR / 相机可见性掩膜（`OccupancyGenerator`） |
 | 投影 | `projector`、`labeling`、`raster` | z-buffer 渲染、逐帧标签图、车位 / 标线 / 目标框投影与遮挡、投影一致性分（`FrameLabeler`）、2D→3D 多视角投票（`LabelLifter`）、地面纹理的遮挡渲染；全部按曝光（卷帘快门）投影 |
@@ -1664,7 +1730,8 @@ Python 部分：
 - 评测、自检和合成数据；
 - PyTorch 部分：
   - 已有：DA3（`models/da3.py`）、RoMa / DINOv2（`models/dino.py`）的推理，gsplat 3DGUT 训练（`recon/gs.py`）与正射 / 核验（`recon/gs_verify.py`）；
-  - 待做：SAM 2、SigLIP 2、OCR。
+  - 待做：SAM 2、SigLIP 2。
+- OCR 用 ONNX Runtime（RapidOCR，`models/ocr.py`），本机 CPU 上跑。
 
 ### 10.2 目录
 
@@ -1694,7 +1761,7 @@ Python 部分：
 | `registration/` | `registration`、`cloud_compare` | 体素哈希地图与多尺度点到面 ICP；重力对齐的粗配准、放置（`PlaceGravityAligned`）与点到参考表面的距离 |
 | `odometry/` | `odometry`、`lio`、`trajectory` | 每趟前端 `OdometryPipeline`；LiDAR-惯性里程计；连续时间轨迹与重新去畸变 |
 | `backend/` | `keyframes`、`scan_context`、`loop_closure`、`pose_graph`、`plane_factor`、`lidar_ba`、`backend` | 关键帧表；回环门控、排序、ICP 验证、PCM；LM 位姿图；平面因子与 LiDAR BA；整个图优化阶段 |
-| `mapping/` | `static_map`、`visibility`、`raycast`、`raster`、`bev`、`levels`、`change_detection` | 测量点云与动态点判断；体素遍历与自由空间；栅格化与地面纹理；每层 BEV 栅格；楼层与坡道；结构变化检测 |
+| `mapping/` | `static_map`、`tiled_map`、`visibility`、`raycast`、`raster`、`bev`、`levels`、`change_detection` | 测量点云与动态点判断（可分块）；体素遍历与自由空间；栅格化与地面纹理；每层 BEV 栅格；楼层与坡道；结构变化检测 |
 | `semantics/` | `objects`、`occupancy`、`projector`、`labeling`、`identity`、`structure`、`paint`、`markings`、`vector_fit`、`slots`、`slot_paint` | 目标框时间线；每帧语义占据；z-buffer、第一表面深度与点云空间索引；逐帧标签与 2D→3D 投票；跨视角身份关联；柱与墙；标线涂料掩膜；标线矢量化、亚像素拟合与分类；车位组装；车位涂色（充电车位） |
 | `splat/` | `gaussians`、`coverage`、`depth_prior` | LiDAR 锚定高斯与沿射线渲染；相机覆盖与训练掩膜；DA3 深度与 LiDAR 的对齐 |
 | `nav/` | `layers`、`nav_map`、`arrows`、`traffic`、`lanes`、`features`、`position`、`localization`、`trip_localizer`、`slot_state`、`map_update` | 分层；距离变换、细化、骨架提图、路网最短路、栅格 A*；地面箭头；单行判定；车道线；道闸与减速带；路网上的位置；车端定位（逐帧、整趟）；车位实时占用；变化对路网的影响 |
@@ -1791,12 +1858,12 @@ Python 部分：
 - 本机可做：
   - 定位：用地面标线的反射强度补水平约束（露天停车场，9.8）；OCR 文字地标区分布局相同的楼层；
   - 地图更新：变化检测与路网更新已有（6.3），还要在真实数据上验证，并把更新后的路网和定位地图一起发版本。
-- 需要模型下载许可：OCR 模型（真实数据的车位号）。
+- OCR 已装在本机（9.10）。真实车位号还缺数据：已有的真实车库（FusionPortableV2 地下车库、室外停车场）地面上都没有画车位号，需要一份画了车位号的车库采集。
 - 需要 GPU 服务器：
   - 3DGS 训练：冻结与保护策略、强度损失、核验流程、覆盖率 QA；
   - DA3 深度对齐；
   - 语言高斯；
-  - 真实模型适配器：SAM 2 / SAM 3、SigLIP 2、DINO / RoMa、Depth Anything 3、OCR。
+  - 真实模型适配器：SAM 2 / SAM 3、SigLIP 2、DINO / RoMa、Depth Anything 3。
 - 之后：点云网络（用审核后的 3D 标签训练），补相机盲区，并作为新车库的第二意见。
 
 **导航**
@@ -1863,7 +1930,7 @@ Python 部分：
   - 减少标定轨迹数（`calibration.tracks_per_anchor`）。
 - **不带 Python 部署**：车端定位 `gr_localize`（6.2）和重建的几何阶段 `gr_recon`（4.1）都是纯 C++，有 Docker 镜像和 CPack 包（3.1）。之后的阶段（标定、纹理、语义、导航）仍由 Python 编排，其中要调模型的部分本来就在 GPU 服务器上跑。
 - **CI**：工作流已写好（3.1），还没在 GitHub 上跑过（仓库未推送这次改动）；Linux 上的 Eigen 3.4、Docker 镜像只会在 CI 里第一次验证。
-- **大车库的分块处理**：分层 BA 解决了位姿块的大小；测量点云、动态点判断、语义仍是整图一次处理，内存随车库面积线性增长，还没按楼层 / 区域分块验证。
+- **大车库的分块处理**：分层 BA 解决了位姿块的大小；测量点云和动态点判断可以分块（`map.tile_size`，与整图逐位相同，12 m 块的峰值内存是整图的 1/4，9.11）。语义阶段（结构、标线、车位、目标、逐帧标签等）仍把整张图读进内存（`load_point_map` 合并各块），内存随车库面积线性增长，还要改成按楼层 / 块流式处理；BEV 的强度均值按点序求和，分块累加后末位会不同，要先定下合并顺序。
 - **仍在 Python 里的几何**：
   - 地面箭头的栅格准备；
   - 路网编辑（合并、接入、碎片剪枝）、车位内缩与目标点、车道投影（shapely）；

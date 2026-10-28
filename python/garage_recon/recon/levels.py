@@ -126,11 +126,15 @@ def detect_levels(vehicle_paths: list[np.ndarray], xyz: np.ndarray,
                   normals: np.ndarray, cfg, log=print) -> LevelModel:
     """Levels and ramps (C++ DetectLevels) from the vehicle poses ((N, 4, 4)
     per trip, vehicle origin on the floor) and the map points."""
-    out = _core.detect_levels(
+    return from_core(_core.detect_levels(
         [np.ascontiguousarray(P[:, :3, 3]) for P in vehicle_paths],
         np.ascontiguousarray(xyz, dtype=np.float64),
         np.ascontiguousarray(normals, dtype=np.float64), level_config(cfg),
-        log)
+        log))
+
+
+def from_core(out: dict) -> LevelModel:
+    """The LevelModel of a C++ detect_levels / build_tiled_map result."""
     grids = [FloorGrid(g["x0"], g["y0"], g["res"], np.asarray(g["z"]))
              for g in out["grids"]]
     ramps = [Ramp(r["level_from"], r["level_to"], np.asarray(r["plane"]),

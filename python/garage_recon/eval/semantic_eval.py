@@ -21,6 +21,7 @@ from garage_recon import _core
 from garage_recon import geometry
 from garage_recon.data.synthetic import ground_truth
 from garage_recon.recon import pose_set as pose_set_lib
+from garage_recon.recon import static_map
 from garage_recon.semantics import language_field
 from garage_recon.semantics import taxonomy
 
@@ -92,9 +93,9 @@ def frame_scores(pose_set: pose_set_lib.PoseSet,
     semantics = work / "semantics"
     with np.load(semantics / "language" / "labels.npz") as z:
         labels = z["labels"]
-    with np.load(work / "map" / "point_map.npz") as z:
-        static = ~z["dynamic"]
-        xyz = z["xyz"][static]
+    point_map = static_map.load_point_map(work / "map")
+    static = ~point_map.dynamic
+    xyz = point_map.xyz[static]
     point_labels = labels[static].astype(np.int32)
     class_ids, class_embeddings = language_field.class_text_embeddings(encoder)
     keys = language_field.frame_keys(pose_set, 1)
@@ -158,8 +159,8 @@ def evaluate_language(work: pathlib.Path, pose_set: pose_set_lib.PoseSet,
     labels_path = semantics / "language" / "labels.npz"
     if not labels_path.exists():
         return {}
-    with np.load(work / "map" / "point_map.npz") as z:
-        xyz, dynamic = z["xyz"], z["dynamic"]
+    point_map = static_map.load_point_map(work / "map")
+    xyz, dynamic = point_map.xyz, point_map.dynamic
     with np.load(labels_path) as z:
         language_labels, identity = z["labels"], z["identity"]
     static = ~dynamic

@@ -4,9 +4,13 @@ Every text the OCR model finds in a camera frame is lifted onto the floor:
 the ray through the text centre, from the mid-row pose of the exposure,
 meets the floor plane of each level, and a hit within `max_distance` of a
 slot of that level votes for its text (the slot whose entrance is nearest).
-A slot takes its most voted text; each row's numbers are then repaired with
-the consecutive-numbering rule (rules.fix_slot_numbers). "C-105" or "C105"
-splits into zone C and number 105.
+With an image OCR model, every slot's floor is also fused into an upright
+patch (read_patches) and read there: painted numbers seen at a grazing
+angle in a fisheye frame are small, slanted and rotated, while the patch
+shows them top-down at a fixed scale. A slot takes its most voted text; each
+row's numbers are then repaired with the consecutive-numbering rule
+(rules.fix_slot_numbers). "C-105" or "C105" splits into zone C and number
+105.
 
 The floor is the level's floor grid, not one height per level (a level may
 rise along an aisle). Every text is also placed in 3D where the LiDAR map
@@ -30,20 +34,29 @@ import cv2
 import numpy as np
 import shapely
 
-from garage_recon import _core, geometry
+from garage_recon import _core, geometry, parallel
 from garage_recon.models import interfaces
 from garage_recon.semantics import rules
 from garage_recon.semantics import slots as slots_lib
 
-_TEXT = re.compile(r"(?:([A-Z]+)\W*)?(\d+)\s*$")
+_TEXT = re.compile(r"(?:([A-Z]+\d*)\W+|([A-Z]+))?(\d+)\s*$")
+# A whole reading that looks like a painted slot number: "A-001", "B2-017",
+# "105". Upside-down text rarely does.
+_SLOT_NUMBER = re.compile(r"[A-Z]{0,2}\d{0,2}[-_.]?\d{1,4}")
+
+
+def is_slot_number(text: str) -> bool:
+    """Whether a whole reading looks like a painted slot number."""
+    return bool(_SLOT_NUMBER.fullmatch(re.sub(r"\s+", "", text.upper())))
 
 
 def split_text(text: str) -> tuple[str | None, str | None]:
-    """(zone, number) of a slot text such as "C-105", "C105" or "105"."""
+    """(zone, number) of a slot text such as "C-105", "C105", "B2-017" or
+    "105"."""
     m = _TEXT.search(text.strip().upper())
     if not m:
         return None, None
-    return m.group(1), m.group(2)
+    return m.group(1) or m.group(2), m.group(3)
 
 
 def floor_hits(camera, world_from_camera: np.ndarray, uv: np.ndarray,
@@ -218,8 +231,198 @@ def _row_order(slots: list[slots_lib.Slot]) -> list[int]:
     return list(np.argsort(centers @ vt[0]))
 
 
+def join_line(results: list[interfaces.TextResult]
+              ) -> list[tuple[str, np.ndarray, float]]:
+    """Readings of one text line joined left to right: the OCR splits
+    "A-001" into "A" and "-001" at the hyphen. Returns (text, centre (u, v),
+    mean score) per line."""
+    boxes = []
+    for r in results:
+        polygon = np.asarray(r.polygon, float)
+        top, bottom = polygon[:, 1].min(), polygon[:, 1].max()
+        boxes.append((polygon[:, 0].min(), top, bottom, r))
+    lines = []  # [left, top, bottom, members]
+    for left, top, bottom, r in sorted(boxes, key=lambda b: b[0]):
+        middle = (top + bottom) / 2.0
+        for line in lines:
+            if abs(middle - (line[1] + line[2]) / 2.0) < 0.5 * (
+                    line[2] - line[1]):
+                line[3].append(r)
+                break
+        else:
+            lines.append([left, top, bottom, [r]])
+    out = []
+    for _, _, _, members in lines:
+        polygon = np.concatenate([np.asarray(m.polygon, float)
+                                  for m in members])
+        out.append(("".join(m.text.strip() for m in members),
+                    polygon.mean(axis=0),
+                    float(np.mean([m.score for m in members]))))
+    return out
+
+
+def _slot_frame(slot: slots_lib.Slot):
+    """(entrance midpoint, inward unit, right unit, width, depth) of a slot:
+    a driver in the aisle faces `inward` and reads along `right`."""
+    corners = np.asarray(slot.corners, float)
+    entrance = (corners[0] + corners[1]) / 2.0
+    inward = (corners[2] + corners[3]) / 2.0 - entrance
+    depth = float(np.linalg.norm(inward))
+    inward /= max(depth, 1e-9)
+    right = np.array([inward[1], -inward[0]])
+    return entrance, inward, right, float(
+        np.linalg.norm(corners[1] - corners[0])), depth
+
+
+def slot_patch(texture: np.ndarray, observed: np.ndarray, x0: float,
+               y0: float, res: float, slot: slots_lib.Slot,
+               margin: float) -> np.ndarray:
+    """The slot's floor upright: its back at the top, the entrance at the
+    bottom (as a driver in the aisle reads it), `margin` around it.
+    Unobserved cells take the median observed colour."""
+    entrance, inward, right, width, depth = _slot_frame(slot)
+    w = int(np.ceil((width + 2 * margin) / res))
+    h = int(np.ceil((depth + 2 * margin) / res))
+    # Patch pixel (col, row) -> texture cell (i, j), cell centres at
+    # x0 + (i + 0.5) * res: rows run from the back towards the aisle.
+    top_left = (entrance - right * (w * res / 2.0)
+                + inward * (depth + margin))
+    linear = np.column_stack([right, -inward])
+    offset = ((top_left - (x0, y0)) / res + linear @ (0.5, 0.5) - 0.5)
+    matrix = np.column_stack([linear, offset])
+    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+    patch = cv2.warpAffine(texture, matrix, (w, h), flags=flags)
+    seen = cv2.warpAffine(observed.astype(np.uint8), matrix, (w, h),
+                          flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP) > 0
+    if seen.any():
+        patch[~seen] = np.median(patch[seen], axis=0).astype(np.uint8)
+    return patch
+
+
+def read_patches(recon, slots: list[slots_lib.Slot], ocr, occluders, cfg,
+                 log=print, save_dir=None) -> tuple[list, list, dict]:
+    """Votes per slot from OCR of its rectified floor patch.
+
+    Every row of slots gets a fine floor texture over its slot outlines (C++
+    FloorTextureFuser at `patch_res`, the median of the top views that see
+    the floor top-down and unoccluded); each slot is cut out upright
+    (slot_patch) and read at 0 and 180 degrees. A row keeps the orientation
+    whose slot-number readings score higher in sum: a garage paints a row
+    one way, and upside down "A-001" reads as garbage or not at all.
+
+    Returns:
+        (number votes, attribute votes) per slot as Counters of summed
+        score, and a summary.
+    """
+    section = cfg.numbers
+    res, margin = float(section.patch_res), float(section.patch_margin)
+    max_range = float(section.patch_max_range)
+    pose_set, levels = recon.pose_set(), recon.levels()
+    votes = [collections.Counter() for _ in slots]
+    attribute_votes = [collections.Counter() for _ in slots]
+    # Every frame's camera centre and level (the vehicle within 1 m of it).
+    frames = []
+    for t, data in enumerate(recon.datasets):
+        rig = pose_set.rig(t)
+        for name, calib in rig.cameras.items():
+            camera = calib.make_model()
+            for ns in data.camera_stamps_ns(name)[::int(section.patch_stride)]:
+                center = pose_set.camera_center_pose(t, name, int(ns))
+                vehicle = center @ geometry.inv(calib.T_vehicle_cam)
+                frames.append((t, data, name, int(ns), camera,
+                               center[:3, 3], vehicle[:3, 3]))
+    if not frames:
+        return votes, attribute_votes, {"patches": 0}
+    vehicles = np.array([f[6] for f in frames])
+    rows = collections.defaultdict(list)
+    for k, slot in enumerate(slots):
+        rows[(slot.level, slot.row)].append(k)
+    threads = parallel.workers(section.get("workers"))
+    read = flipped = 0
+    for (level, _), members in sorted(rows.items()):
+        outlines = [shapely.Polygon(slots[k].corners).buffer(margin)
+                    for k in members]
+        lo = np.min([o.bounds[:2] for o in outlines], axis=0)
+        hi = np.max([o.bounds[2:] for o in outlines], axis=0)
+        width, height = np.ceil((hi - lo) / res).astype(int)
+        mask = np.zeros((height, width), np.uint8)
+        for outline in outlines:
+            ring = (np.asarray(outline.exterior.coords) - lo) / res - 0.5
+            cv2.fillPoly(mask, [np.round(ring).astype(np.int32)], 1)
+        j, i = np.nonzero(mask)
+        floor_z = np.full((height, width), np.nan)
+        floor_z[j, i] = levels.floor_z(
+            np.column_stack([lo[0] + (i + 0.5) * res,
+                             lo[1] + (j + 0.5) * res]), level)
+        fuser = _core.FloorTextureFuser(lo[0], lo[1], res, int(width),
+                                        int(height), floor_z,
+                                        int(section.patch_top_k))
+        # Frames on this level near the row.
+        near = np.nonzero(
+            (np.linalg.norm(np.maximum(np.maximum(lo - vehicles[:, :2],
+                                                  vehicles[:, :2] - hi), 0.0),
+                            axis=1) <= max_range)
+            & (np.abs(vehicles[:, 2] - levels.floor_z(vehicles[:, :2],
+                                                     level)) <= 1.0))[0]
+
+        def prepare(f):
+            t, data, name, ns, camera, _, _ = frames[f]
+            exposure = pose_set.camera_exposure(t, name, ns)
+            camera_from_world = (
+                geometry.inv(exposure) if exposure.ndim == 2
+                else np.stack([geometry.inv(e) for e in exposure]))
+            depth = _core.FloorTextureFuser.occlusion_depth(
+                camera, camera_from_world, occluders, float(cfg.map.voxel),
+                max_range)
+            return data.load_image(name, ns), camera_from_world, depth
+
+        for f, (image, camera_from_world, depth) in zip(
+                near, parallel.ordered_map(prepare, list(near), threads)):
+            fuser.add_frame(frames[f][4], camera_from_world, image, depth,
+                            float(section.patch_depth_tol), max_range,
+                            float(section.patch_min_cos))
+        texture, _, observations = fuser.result()
+        readings = {0: [], 180: []}
+        for k in members:
+            patch = slot_patch(texture, observations > 0, lo[0], lo[1], res,
+                               slots[k], margin)
+            if save_dir is not None:
+                cv2.imwrite(str(save_dir / f"{slots[k].slot_id}.png"),
+                            cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
+            upside_down = np.ascontiguousarray(patch[::-1, ::-1])
+            for angle, image in ((0, patch), (180, upside_down)):
+                found = ocr.read(interfaces.Frame(
+                    "patch", slots[k].slot_id, 0, image))
+                # Lines centred within the slot (not a neighbour's text).
+                half = (image.shape[1] / 2.0) - margin / res
+                readings[angle].append([
+                    (text, score) for text, center, score in join_line(found)
+                    if abs(center[0] - image.shape[1] / 2.0) <= half])
+        # The orientation of the row: its summed slot-number score.
+        totals = {angle: sum(max([score for text, score in lines
+                                  if is_slot_number(text)], default=0.0)
+                             for lines in per_slot)
+                  for angle, per_slot in readings.items()}
+        angle = 180 if totals[180] > totals[0] else 0
+        flipped += angle == 180
+        for k, lines in zip(members, readings[angle]):
+            for text, score in lines:
+                named = text_attributes(text)
+                for attribute in named:
+                    attribute_votes[k][attribute] += score
+                if not named and split_text(text)[1]:
+                    votes[k][re.sub(r"\s+", "", text.upper())] += (
+                        float(section.patch_weight) * score)
+                    read += 1
+    summary = {"patches": len(slots), "patch_readings": read,
+               "rows": len(rows), "rows_read_flipped": flipped}
+    log(f"[numbers] patches: {len(slots)} slots in {len(rows)} rows, "
+        f"{read} number readings ({flipped} rows read upside down)")
+    return votes, attribute_votes, summary
+
+
 def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
-                 cache=None) -> dict:
+                 cache=None, patch_dir=None) -> dict:
     """Sets `number`, `zone` and `text_votes` of the slots in place.
 
     `cache`: a JSON file of the raw OCR results per frame, read if present
@@ -300,6 +503,8 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                             result.text, pose[:3, 3] + distance * (
                                 pose[:3, :3] @ rays[0]), result.score,
                             pose[:3, 3]))
+                    if not section.get("frame_votes", True):
+                        continue
                     for level, xyz in floor_hits(camera, pose, uv, levels,
                                                  section.max_range):
                         point = shapely.Point(xyz[0], xyz[1])
@@ -321,6 +526,14 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                             votes[best][result.text.strip().upper()] += float(
                                 result.score)
                             readings[best] += 1
+    patches = {}
+    if needs_images and section.get("patches", False):
+        patch_votes, patch_attributes, patches = read_patches(
+            recon, slots, ocr, index, cfg, log, patch_dir)
+        for k in range(len(slots)):
+            votes[k].update(patch_votes[k])
+            attribute_votes[k].update(patch_attributes[k])
+            readings[k] += len(patch_votes[k])
     for slot, counter in zip(slots, attribute_votes):
         slot.attributes = sorted(
             set(slot.attributes) | {a for a, score in counter.items()
@@ -363,7 +576,7 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
                "attributes": dict(collections.Counter(
                    a for s in slots for a in s.attributes)),
                "numbered": int(sum(s.number is not None for s in slots)),
-               "landmarks": dict(kinds)}
+               "landmarks": dict(kinds), **patches}
     log(f"[numbers] {frames} frames, {texts} texts; {read} of {len(slots)} "
         f"slots read, {summary['numbered']} numbered after the row repair; "
         f"{len(landmarks)} text landmarks {dict(kinds)}")

@@ -328,7 +328,8 @@ LevelAssignment AssignLevels(const LevelModel& model, const Points& xyz) {
 
 LevelModel DetectLevels(const std::vector<Points>& vehicle_paths,
                         const Points& xyz, const Points& normals,
-                        const LevelConfig& config, const Logger& log) {
+                        const LevelConfig& config, const Logger& log,
+                        const std::optional<MapBounds>& bounds) {
   GR_CHECK(normals.size() == xyz.size());
   GR_CHECK(config.grid_res > 0.0);
   // Slope along every path over +-1 m of arc length.
@@ -399,9 +400,14 @@ LevelModel DetectLevels(const std::vector<Points>& vehicle_paths,
   }
   Vec2 lo = Vec2::Constant(kInf);
   Vec2 hi = Vec2::Constant(-kInf);
-  for (const Vec3& p : xyz) {
-    lo = lo.cwiseMin(p.head<2>());
-    hi = hi.cwiseMax(p.head<2>());
+  if (bounds) {
+    lo = bounds->lo;
+    hi = bounds->hi;
+  } else {
+    for (const Vec3& p : xyz) {
+      lo = lo.cwiseMin(p.head<2>());
+      hi = hi.cwiseMax(p.head<2>());
+    }
   }
   lo -= Vec2::Ones();
   hi += Vec2::Ones();

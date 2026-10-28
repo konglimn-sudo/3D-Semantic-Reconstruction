@@ -605,8 +605,13 @@ class SemanticsPipeline:
             return
         slots = [slots_lib.Slot(**s) for s in json.loads(
             (self.out / "slots.json").read_text())]
-        summary = numbers_lib.read_numbers(self.recon, slots, self.cfg,
-                                           self.log, self.out / "ocr_cache.json")
+        patch_dir = None
+        if self.cfg.numbers.get("save_patches", False):
+            patch_dir = self.out / "numbers_patches"
+            patch_dir.mkdir(exist_ok=True)
+        summary = numbers_lib.read_numbers(
+            self.recon, slots, self.cfg, self.log,
+            self.out / "ocr_cache.json", patch_dir)
         landmarks = summary.pop("landmark_list", [])
         path = self.out / "language" / "instances.json"
         if path.exists() and landmarks:  # Text onto the signs it is on.

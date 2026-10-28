@@ -27,6 +27,8 @@ from garage_recon.eval import semantic_eval
 from garage_recon import geometry
 from garage_recon.models import registry
 from garage_recon.recon import pose_set as pose_set_lib
+from garage_recon.recon import static_map
+from garage_recon.semantics import numbers as numbers_lib
 from garage_recon.semantics import taxonomy
 
 
@@ -165,8 +167,11 @@ def eval_markings(pred: list[dict], gt_lines: list[dict], tol: float = 0.15,
 
 # ---------------------------------------------------------------- slots
 def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
-    """Slot matching by polygon IoU; corner and entrance errors."""
+    """Slot matching by polygon IoU; corner and entrance errors; the
+    numbers read (when `pred` carries them) against the ground-truth slot
+    ids ("L0-A-002": zone A, number 002)."""
     tp, corner_errors, entrance_ok = 0, [], 0
+    numbers = collections.Counter()
     used = set()
     # Slot attributes (ev, accessible, reserved): name -> tp / fp / fn.
     attributes = collections.defaultdict(collections.Counter)
@@ -192,6 +197,15 @@ def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
             for name in truth_attributes | found:
                 attributes[name]["tp" if name in found & truth_attributes
                                  else "fp" if name in found else "fn"] += 1
+            if "number" in pred[best_index]:
+                truth = numbers_lib.split_text(g["slot_id"])
+                read = (pred[best_index].get("zone"),
+                        pred[best_index].get("number"))
+                numbers["read" if read[1] else "unread"] += 1
+                if read[1]:
+                    numbers["correct" if read == truth else
+                            "number_only" if read[1] == truth[1] else
+                            "wrong"] += 1
             pc = np.asarray(pred[best_index]["corners"])
             gc = np.asarray(g["corners"])
             corner_errors += list(np.linalg.norm(pc - gc, axis=1))
@@ -210,7 +224,8 @@ def eval_slots(pred: list[dict], gt: list[dict], iou_th: float = 0.5) -> dict:
             "corner_err_p95": (float(np.percentile(errors, 95))
                                if len(errors) else None),
             "entrance_correct": float(entrance_ok / tp) if tp else None,
-            "inferred": int(sum(p.get("inferred", False) for p in pred))}
+            "inferred": int(sum(p.get("inferred", False) for p in pred)),
+            **({"numbers": dict(numbers)} if numbers else {})}
 
 
 # --------------------------------------------------------------- arrows
@@ -329,11 +344,12 @@ def evaluate(work_dir: str | pathlib.Path, gt_dir: str | pathlib.Path,
             est_t, est_poses = geometry.read_tum(estimate)
             report["trajectory"][trip_gt.name] = eval_trajectory(
                 est_t, est_poses, gt_t, gt_poses)
-    map_path = work / "map" / "point_map.npz"
-    if map_path.exists():
-        with np.load(map_path) as z:
-            xyz, dynamic = z["xyz"], z["dynamic"]
-            sigma = z["sigma"] if "sigma" in z.files else None
+    map_dir = work / "map"
+    if any((map_dir / name).exists()
+           for name in ("point_map.npz", "tiles.json")):
+        point_map = static_map.load_point_map(map_dir)
+        xyz, dynamic = point_map.xyz, point_map.dynamic
+        sigma = point_map.sigma
         boxes = [b for b in scene["boxes"] if b["kind"] in STATIC_KINDS]
         cars = []
         for trip_gt in sorted(gt_dir.glob("trip_*")):
@@ -369,9 +385,12 @@ def evaluate(work_dir: str | pathlib.Path, gt_dir: str | pathlib.Path,
         if numbers_path.exists():  # Attributes read from texts.
             read = json.loads(numbers_path.read_text()).get("slots", {})
             for slot in pred_slots:
+                found = read.get(slot["slot_id"], {})
                 slot["attributes"] = sorted(
                     set(slot.get("attributes", []))
-                    | set(read.get(slot["slot_id"], {}).get("attributes", [])))
+                    | set(found.get("attributes", [])))
+                slot["number"] = found.get("number")
+                slot["zone"] = found.get("zone")
         report["slots"] = eval_slots(pred_slots, scene["slots"])
     tracks_path = semantics / "objects" / "tracks.json"
     if tracks_path.exists():

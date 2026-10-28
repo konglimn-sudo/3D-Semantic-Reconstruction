@@ -1,17 +1,26 @@
 """Global point map (sections 4.2 / 4.3): accumulation, normals and dynamic
 points. The algorithms are C++ (`MapAccumulator`, `map_normals`,
-`DynamicDetector`); this module feeds them the keyframe sweeps and keeps the
-per-point attributes in `PointMap`."""
+`DynamicDetector`, and `build_tiled_map` for the map stage, in one piece or
+tile by tile); this module feeds them the keyframe sweeps and keeps the
+per-point attributes in `PointMap`.
+
+A map built in tiles (`map.tile_size`) is stored as map/tiles/*.npz with an
+index map/tiles.json instead of map/point_map.npz; load_point_map reads
+either, the whole map in the order of one piece or only the tiles that
+touch a region."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 
 from .. import _core
 from ..core_config import dynamic_config, fusion_config
+from . import levels as levels_lib
 from .keyframes import KeyframeSet
 
 
@@ -116,3 +125,104 @@ def carve_dynamic(pm: PointMap, kfs: KeyframeSet, poses: np.ndarray, cfg, log=pr
     log(f"[map] dynamic points: {dyn.sum()} / {len(dyn)} ({100.0 * dyn.mean():.1f}%), "
         f"moved {(pm.dynamic_kind == 1).sum()}, changed between sessions {(pm.dynamic_kind == 2).sum()}")
     return dyn
+
+
+def tiled_map_config(cfg) -> _core.TiledMapConfig:
+    """The C++ map stage configuration (map section, levels)."""
+    config = _core.TiledMapConfig()
+    config.voxel = float(cfg.map.voxel)
+    config.max_range = float(cfg.map.max_range)
+    config.normal_radius = float(cfg.map.normal_radius)
+    config.tile_size = float(cfg.map.get("tile_size") or 0.0)
+    config.fusion = fusion_config(cfg)
+    config.levels = levels_lib.level_config(cfg)
+    config.dynamic = bool(cfg.map.dynamic.enabled)
+    config.dynamic_config = dynamic_config(cfg)
+    return config
+
+
+def build_map(kfs: KeyframeSet, poses: np.ndarray, paths: list[np.ndarray],
+              cfg, out: Path, log=print) -> tuple[dict, dict]:
+    """The map stage (C++ `build_tiled_map`): accumulation, normals and
+    sigmas, levels and dynamic points, written to `out` (map/) as one
+    point_map.npz or, with `map.tile_size`, as tiles.
+
+    Args:
+        kfs: Keyframes (sweeps in the LiDAR frame).
+        poses: (K, 4, 4) world <- LiDAR per keyframe.
+        paths: Vehicle origins on the floor, (N, 3) per trip.
+        cfg: Configuration.
+        out: The map directory.
+        log: Logger.
+
+    Returns:
+        (levels as C++ detect_levels returns them, summary).
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(out / "tiles", ignore_errors=True)
+    for name in ("tiles.json", "point_map.npz"):
+        (out / name).unlink(missing_ok=True)
+    config = tiled_map_config(cfg)
+    tiles = []
+
+    def load(k):
+        points, intensity = kfs.load(k)
+        return points, intensity
+
+    def sink(tile, arrays):
+        if tile["whole"]:
+            del arrays["range"], arrays["sequence"]
+            np.savez(out / "point_map.npz", **arrays)
+            return
+        name = f"tiles/tile_{tile['ix']}_{tile['iy']}.npz"
+        (out / "tiles").mkdir(exist_ok=True)
+        np.savez(out / name, **arrays)
+        tiles.append({"ix": tile["ix"], "iy": tile["iy"], "file": name,
+                      "points": len(arrays["xyz"])})
+
+    result = _core.build_tiled_map(
+        np.ascontiguousarray(poses, dtype=np.float64),
+        np.asarray(kfs.trip, np.int32),
+        [np.ascontiguousarray(p, dtype=np.float64) for p in paths], load,
+        config, sink, log)
+    if config.tile_size > 0.0:
+        (out / "tiles.json").write_text(json.dumps({
+            "tile_size": config.tile_size, "voxel": config.voxel,
+            "points": result["points"], "tiles": tiles}, indent=1))
+    return result.pop("levels"), result
+
+
+def load_point_map(map_dir: Path, bounds=None) -> PointMap:
+    """The point map of a map directory, built in one piece or in tiles.
+
+    Args:
+        map_dir: work/map.
+        bounds: (x0, y0, x1, y1): only the tiles that touch this box (a
+            tiled map; the points of those tiles, not cut to the box). None:
+            the whole map, in the order of a map built in one piece.
+    """
+    map_dir = Path(map_dir)
+    index = map_dir / "tiles.json"
+    if not index.exists():
+        return PointMap.load(map_dir / "point_map.npz")
+    meta = json.loads(index.read_text())
+    size = float(meta["tile_size"])
+    parts = []
+    for tile in meta["tiles"]:
+        if bounds is not None:
+            x0, y0 = tile["ix"] * size, tile["iy"] * size
+            if (x0 > bounds[2] or x0 + size < bounds[0]
+                    or y0 > bounds[3] or y0 + size < bounds[1]):
+                continue
+        with np.load(map_dir / tile["file"]) as z:
+            parts.append({name: z[name] for name in z.files})
+    names = [f.name for f in fields(PointMap)]
+    if not parts:
+        return PointMap(np.zeros((0, 3)), np.zeros(0, np.float32),
+                        np.zeros(0, np.int32), np.zeros(0, np.int16))
+    arrays = {key: np.concatenate([p[key] for p in parts])
+              for key in parts[0]}
+    order = np.lexsort((arrays["sequence"], arrays["range"]))
+    return PointMap(**{name: arrays[name][order] if name in arrays else None
+                       for name in names})
