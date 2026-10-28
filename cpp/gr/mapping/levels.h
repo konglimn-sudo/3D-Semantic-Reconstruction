@@ -12,6 +12,7 @@
 #define GARAGE_RECON_GR_MAPPING_LEVELS_H_
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "gr/core/logging.h"
@@ -75,12 +76,22 @@ struct LevelAssignment {
 // the ramp (and its upper level) instead.
 LevelAssignment AssignLevels(const LevelModel& model, const Points& xyz);
 
+// Horizontal bounds of a map's points.
+struct MapBounds {
+  Vec2 lo = Vec2::Zero();
+  Vec2 hi = Vec2::Zero();
+};
+
 // Levels and ramps from the vehicle paths (one polyline of vehicle origins,
-// on the floor, per trip) and the map points with normals.
+// on the floor, per trip) and the map points with normals. Only points with
+// normal z above 0.8 or below -0.85 (floors, ramps, ceilings) count, so a
+// map built in tiles can pass just those, in map order, with the bounds of
+// all its points (`bounds`; otherwise the bounds of `xyz`).
 LevelModel DetectLevels(const std::vector<Points>& vehicle_paths,
                         const Points& xyz, const Points& normals,
                         const LevelConfig& config = {},
-                        const Logger& log = nullptr);
+                        const Logger& log = nullptr,
+                        const std::optional<MapBounds>& bounds = std::nullopt);
 
 }  // namespace gr
 

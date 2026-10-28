@@ -410,6 +410,8 @@ map:
   voxel: 0.05
   max_range: 20.0            # keyframe returns used for the map
   normal_radius: 0.2
+  tile_size: 0               # m: build the map in tiles of this side (memory follows the tile,
+                             # same points as in one piece); 0: in one piece
   fusion:                    # per voxel: weighted mean of the observations, sigma per point
     fuse: true               # false: the nearest observation wins (v1 map)
     range_ratio: 2.0         # only observations within ratio x nearest range + margin
@@ -629,6 +631,18 @@ numbers:                     # slot numbers / zones read by OCR (models.ocr)
   landmark_min_views: 2
   landmark_min_score: 1.0
   landmark_similarity: 0.6   # one sign: same-kind texts this alike (or exits) within the radius
+  frame_votes: true          # frame readings that land in a slot vote for it
+  patches: true              # also read every slot's rectified floor patch (image OCR models)
+  patch_res: 0.015           # m per patch pixel
+  patch_margin: 0.2          # m of floor around the slot
+  patch_stride: 1            # frames per camera fused into the patches
+  patch_top_k: 3             # views fused per cell (median; passing cars drop out)
+  patch_max_range: 6.0       # m from the camera
+  patch_min_cos: 0.15        # floor 1.5 m into a slot is seen at ~0.2 from a 1 m high fisheye
+  patch_depth_tol: 0.15      # m, occlusion test against the static map
+  patch_weight: 2.0          # a patch reading's vote against one frame reading
+  save_patches: false        # write semantics/numbers_patches/<slot>.png for review
+  workers: 0                 # threads loading frames for the patches (0: one per CPU)
 
 nav:                         # semantic navigation map (stage nav)
   enabled: true

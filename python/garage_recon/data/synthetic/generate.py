@@ -174,18 +174,22 @@ def row_poses(drive: trajectory_lib.Trajectory, calib: schema.CameraCalib,
 def generate(out_dir: str | pathlib.Path, preset: str = "small",
              trips: int | None = None, seed: int = 0, stereo: bool = False,
              images: bool = True, ideal: bool = False, arrows: bool = True,
-             changes: dict | None = None,
+             changes: dict | None = None, painted_numbers: bool = False,
+             image_size: int | None = None,
              log=print) -> list[pathlib.Path]:
     """Writes a synthetic dataset and returns the trip directories.
 
     `changes` maps a trip index to a scene change of that trip
     (scene_lib.apply_change: boxes added or removed, e.g. a construction
-    fence or a removed duct)."""
+    fence or a removed duct). `painted_numbers` paints the slot numbers on
+    the floor (for real OCR models); `image_size` overrides the preset's
+    fisheye size (pixels)."""
     params = PRESETS[preset]
-    layout = scene_lib.Layout(**params["layout"], arrows=arrows)
+    layout = scene_lib.Layout(**params["layout"], arrows=arrows,
+                              painted_numbers=painted_numbers)
     garage = scene_lib.build_static_scene(layout)
     n_trips = params["trips"] if trips is None else trips
-    rigs = sensor_truth(make_rig(params["image_size"], stereo),
+    rigs = sensor_truth(make_rig(image_size or params["image_size"], stereo),
                         None if ideal else SENSOR_ERRORS, seed, n_trips)
     true_rig, nominal_rig, imu_biases = rigs
     out = pathlib.Path(out_dir)
@@ -208,14 +212,16 @@ def generate(out_dir: str | pathlib.Path, preset: str = "small",
 def add_trip(out_dir: str | pathlib.Path, trip_index: int,
              preset: str = "small", seed: int = 0, stereo: bool = False,
              images: bool = True, ideal: bool = False, arrows: bool = True,
-             change: dict | None = None, log=print) -> pathlib.Path:
+             change: dict | None = None, painted_numbers: bool = False,
+             image_size: int | None = None, log=print) -> pathlib.Path:
     """Writes trip `trip_index` of a dataset made by generate() with the
-    same preset and seed (same garage, rig and route; its own parked cars),
-    with an optional scene change."""
+    same preset, seed and options (same garage, rig and route; its own
+    parked cars), with an optional scene change."""
     params = PRESETS[preset]
-    layout = scene_lib.Layout(**params["layout"], arrows=arrows)
+    layout = scene_lib.Layout(**params["layout"], arrows=arrows,
+                              painted_numbers=painted_numbers)
     garage = scene_lib.build_static_scene(layout)
-    rigs = sensor_truth(make_rig(params["image_size"], stereo),
+    rigs = sensor_truth(make_rig(image_size or params["image_size"], stereo),
                         None if ideal else SENSOR_ERRORS, seed,
                         trip_index + 1)
     return _write_trip(pathlib.Path(out_dir), trip_index, preset, garage,

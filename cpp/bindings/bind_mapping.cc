@@ -8,6 +8,7 @@
 #include "bind_util.h"
 #include "gr/mapping/bev.h"
 #include "gr/mapping/levels.h"
+#include "gr/mapping/tiled_map.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;  // NOLINT(build/namespaces)
@@ -93,6 +94,48 @@ py::array FloorHeightsArray(const FloorHeights& heights, const Grid2D& grid) {
   }
   return ToImage(std::vector<float>(heights.z.begin(), heights.z.end()),
                  grid.height, grid.width);
+}
+
+py::dict LevelsToDict(const LevelModel& model) {
+  py::list grids;
+  for (const FloorGrid& g : model.grids) grids.append(GridToDict(g));
+  py::list ramps;
+  for (const Ramp& r : model.ramps) ramps.append(RampToDict(r));
+  return py::dict("z"_a = model.z, "ceiling"_a = model.ceiling,
+                  "grids"_a = grids, "ramps"_a = ramps);
+}
+
+// The point_map.npz arrays of a chunk (static_map.PointMap dtypes), plus
+// its order key.
+py::dict ChunkToDict(const MapChunk& chunk) {
+  const py::ssize_t n = static_cast<py::ssize_t>(chunk.size());
+  py::array_t<float> normals({n, static_cast<py::ssize_t>(3)});
+  float* data = normals.mutable_data();
+  for (size_t i = 0; i < chunk.size(); ++i) {
+    for (int c = 0; c < 3; ++c) {
+      data[3 * i + static_cast<size_t>(c)] =
+          static_cast<float>(chunk.normals[i][c]);
+    }
+  }
+  std::vector<bool> dynamic(chunk.size());
+  for (size_t i = 0; i < chunk.size(); ++i) {
+    dynamic[i] = chunk.dynamic_kind[i] > 0;
+  }
+  std::vector<bool> on_ramp(chunk.on_ramp.begin(), chunk.on_ramp.end());
+  py::dict out("xyz"_a = PointsToArray(chunk.xyz),
+               "intensity"_a = ToArray(chunk.intensity),
+               "kf"_a = ToArray(chunk.keyframe), "trip"_a = ToArray(chunk.trip),
+               "normals"_a = normals, "planarity"_a = ToArray(chunk.planarity),
+               "observations"_a = ToArray(chunk.observations),
+               "dynamic"_a = ToBoolArray(dynamic),
+               "dynamic_kind"_a = ToArray(chunk.dynamic_kind),
+               "level"_a = ToArray(chunk.level),
+               "height"_a = ToArray(chunk.height),
+               "on_ramp"_a = ToBoolArray(on_ramp),
+               "range"_a = ToArray(chunk.range),
+               "sequence"_a = ToArray(chunk.sequence));
+  if (!chunk.sigma.empty()) out["sigma"] = ToArray(chunk.sigma);
+  return out;
 }
 
 }  // namespace
@@ -209,6 +252,86 @@ void BindMapping(py::module_& m) {
       "Levels and ramps from the vehicle paths ((N, 3) per trip) and the map "
       "points: dict of z, ceiling, grids (x0, y0, res, z (H, W)), ramps "
       "(level_from, level_to, plane, polygon, slope).");
+
+  py::class_<TiledMapConfig>(m, "TiledMapConfig")
+      .def(py::init<>())
+      .def_readwrite("voxel", &TiledMapConfig::voxel)
+      .def_readwrite("max_range", &TiledMapConfig::max_range)
+      .def_readwrite("normal_radius", &TiledMapConfig::normal_radius)
+      .def_readwrite("tile_size", &TiledMapConfig::tile_size)
+      .def_readwrite("fusion", &TiledMapConfig::fusion)
+      .def_readwrite("levels", &TiledMapConfig::levels)
+      .def_readwrite("dynamic", &TiledMapConfig::dynamic)
+      .def_readwrite("dynamic_config", &TiledMapConfig::dynamic_config);
+
+  m.def(
+      "build_tiled_map",
+      [](const py::object& world_from_lidar, const py::object& keyframe_trip,
+         const py::list& paths, const py::object& load,
+         const TiledMapConfig& config, const py::object& sink,
+         const py::object& log) {
+        Require(config.voxel > 0.0, "voxel must be positive");
+        const std::vector<Pose> poses = PosesFrom(world_from_lidar);
+        const std::vector<int> trips = ToIntVector(keyframe_trip);
+        Require(trips.size() == poses.size(), "one trip per keyframe");
+        std::vector<Points> vehicle_paths;
+        for (const py::handle& path : paths) {
+          vehicle_paths.push_back(
+              PointsFrom(py::reinterpret_borrow<py::object>(path)));
+        }
+        // Python errors stay out of the exception-free library: the first
+        // one is kept, later callbacks do nothing, and it is raised after.
+        std::exception_ptr error;
+        const SweepLoader loader = [&](int k, Points* points,
+                                       std::vector<float>* intensity) {
+          points->clear();
+          intensity->clear();
+          py::gil_scoped_acquire acquire;
+          if (error) return;
+          try {
+            const py::tuple sweep = load(k);
+            *points = PointsFrom(sweep[0]);
+            *intensity = ToFloatVector(sweep[1]);
+          } catch (...) {
+            error = std::current_exception();
+          }
+        };
+        const ChunkSink writer = [&](const MapTile& tile, MapChunk&& chunk) {
+          py::gil_scoped_acquire acquire;
+          if (error) return;
+          try {
+            sink(py::dict("ix"_a = tile.ix, "iy"_a = tile.iy,
+                          "whole"_a = tile.whole),
+                 ChunkToDict(chunk));
+          } catch (...) {
+            error = std::current_exception();
+          }
+        };
+        std::exception_ptr log_error;
+        const Logger logger = MakeLogger(log, &log_error);
+        TiledMapSummary summary;
+        {
+          py::gil_scoped_release release;
+          summary = BuildTiledMap(poses, trips, vehicle_paths, loader, config,
+                                  writer, logger);
+        }
+        RethrowIfSet(error);
+        RethrowIfSet(log_error);
+        return py::dict("levels"_a = LevelsToDict(summary.levels),
+                        "tiles"_a = summary.tiles, "points"_a = summary.points,
+                        "moved"_a = summary.moved,
+                        "changed"_a = summary.changed,
+                        "elevation_resolution"_a =
+                            summary.elevation_resolution);
+      },
+      "T_world_lidar"_a, "trip"_a, "paths"_a, "load"_a, "config"_a, "sink"_a,
+      "log"_a = py::none(),
+      "The map stage tile by tile (gr/mapping/tiled_map.h): load(k) -> "
+      "(points (N, 3), intensity (N,)) of keyframe k; sink(tile, arrays) "
+      "gets each non-empty tile ({ix, iy, whole}) with its point_map arrays "
+      "plus range / sequence (the map order). Returns the levels (as "
+      "detect_levels), tiles, points, moved, changed and the dynamic "
+      "elevation_resolution.");
 
   m.def(
       "assign_levels",

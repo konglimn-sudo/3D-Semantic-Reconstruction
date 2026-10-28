@@ -25,7 +25,8 @@ Work directory layout:
     trips/<trip>/odometry.{npz,tum}, kf/, kf_final/, poses.{npz,tum}
     graph/kf_poses.npz, loops.json, summary.json
     pose_set/pose_set.json, <trip>.npz;  calibration.json
-    map/point_map.npz, levels.json, floor_grids.npz
+    map/point_map.npz (tiles/*.npz + tiles.json with map.tile_size),
+        levels.json, floor_grids.npz
     bev/level_<i>.npz (+ PNG previews)
     depth_prior/<trip>/<camera>/<stamp>.npz, frames.csv, points.npz
     gs/model.npz, model.ply, summary.json, previews/, verify.json
@@ -115,8 +116,10 @@ class ReconPipeline:
         trip = self.pose_set().trips[self.pose_set().index(data.trip_id)]
         return trip.knot_stamps, trip.knot_poses
 
-    def point_map(self) -> static_map.PointMap:
-        return static_map.PointMap.load(self.work / "map" / "point_map.npz")
+    def point_map(self, bounds=None) -> static_map.PointMap:
+        """The map (built in one piece or in tiles); `bounds` (x0, y0, x1,
+        y1) loads only the tiles that touch it."""
+        return static_map.load_point_map(self.work / "map", bounds)
 
     def levels(self) -> levels_lib.LevelModel:
         return levels_lib.LevelModel.load(self.work / "map")
@@ -230,32 +233,28 @@ class ReconPipeline:
         self.record("calibration", uses_cameras=True)
 
     def stage_map(self) -> None:
-        """Static point map, levels and dynamic points."""
+        """Static point map, levels and dynamic points (in tiles with
+        map.tile_size)."""
         cfg = self.cfg
         keyframes = self.keyframes()
         poses = self.kf_poses(keyframes)
-        point_map = static_map.accumulate(
-            keyframes, poses, float(cfg.map.voxel), float(cfg.map.max_range),
-            core_config.fusion_config(cfg))
-        static_map.compute_normals(point_map, poses,
-                                   float(cfg.map.normal_radius))
-        paths = [self.vehicle_poses(d)[1] for d in self.datasets]
-        levels = levels_lib.detect_levels(paths, point_map.xyz,
-                                          point_map.normals, cfg, self.log)
-        point_map.level, point_map.height, point_map.on_ramp = levels.assign(
-            point_map.xyz)
-        if cfg.map.dynamic.enabled:
-            ego = [p[:, :3, 3] for p in paths]  # Vehicle origin on the floor.
-            point_map.dynamic = static_map.carve_dynamic(
-                point_map, keyframes, poses, cfg, self.log, ego_paths=ego)
-        else:
-            point_map.dynamic = np.zeros(len(point_map), bool)
-            point_map.dynamic_kind = np.zeros(len(point_map), np.uint8)
+        # Vehicle origins on the floor: the levels and the ego swept volume.
+        paths = [self.vehicle_poses(d)[1][:, :3, 3] for d in self.datasets]
         out = self.work / "map"
-        out.mkdir(parents=True, exist_ok=True)
-        point_map.save(out / "point_map.npz")
+        levels_out, summary = static_map.build_map(keyframes, poses, paths,
+                                                   cfg, out, self.log)
+        levels = levels_lib.from_core(levels_out)
+        n = summary["points"]
+        if cfg.map.dynamic.enabled:
+            dynamic = summary["moved"] + summary["changed"]
+            self.log(f"[map] dynamic points: {dynamic} / {n} "
+                     f"({100.0 * dynamic / max(n, 1):.1f}%), moved "
+                     f"{summary['moved']}, changed between sessions "
+                     f"{summary['changed']}")
         levels.save(out)
-        self.log(f"[map] {len(point_map)} points at {cfg.map.voxel} m")
+        tiles = (f" in {summary['tiles']} tiles"
+                 if float(cfg.map.get("tile_size") or 0.0) > 0.0 else "")
+        self.log(f"[map] {n} points at {cfg.map.voxel} m{tiles}")
         self.record("map", uses_cameras=False)
 
     def stage_bev(self) -> None:

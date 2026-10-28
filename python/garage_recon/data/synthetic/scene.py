@@ -62,6 +62,11 @@ class Layout:
     ev_slots: tuple = ("L0-A-002", "L0-A-003", "L1-B-005")
     accessible_slots: tuple = ("L0-B-001",)
     reserved_slots: tuple = ("L0-D-002",)
+    # Slot numbers ("A-002") painted on the floor near each entrance,
+    # upright for a driver in the aisle; camera images only (not LiDAR).
+    painted_numbers: bool = False
+    number_height: float = 0.4   # m, character height
+    number_offset: float = 0.9   # m from the entrance to the text centre
 
     def slot_attributes(self, slot_id: str) -> list[str]:
         named = {"ev": self.ev_slots, "accessible": self.accessible_slots,
@@ -138,6 +143,9 @@ class GarageScene:
     # Floor arrows: id, level, aisle, tail / tip (xy), direction, one_way and
     # the painted rectangles [x0, x1, y0, y1].
     arrows: list[dict] = field(default_factory=list)
+    # Painted floor texts: level, text, centre (xy), right and up (unit xy:
+    # the reading direction and the character's up), height (m).
+    floor_texts: list[dict] = field(default_factory=list)
 
     def levels(self) -> list[dict]:
         L = self.layout
@@ -164,6 +172,7 @@ class GarageScene:
             "columns": self.columns,
             "ramps": self.ramps,
             "arrows": self.arrows,
+            "floor_texts": self.floor_texts,
             "boxes": [
                 {
                     "center": b.center.tolist(),
@@ -302,7 +311,29 @@ def build_static_scene(L: Layout) -> GarageScene:
                             f"L{i}-{name}-{g * L.bays_per_group + b + 1:03d}"),
                     })
     _add_arrows(sc)
+    _add_floor_texts(sc)
     return sc
+
+
+def _add_floor_texts(sc: GarageScene) -> None:
+    """Slot numbers painted near the entrances (Layout.painted_numbers)."""
+    L = sc.layout
+    if not L.painted_numbers:
+        return
+    for slot in sc.slots:
+        corners = np.asarray(slot["corners"], float)
+        entrance = (corners[0] + corners[1]) / 2.0
+        inward = (corners[2] + corners[3]) / 2.0 - entrance
+        inward /= np.linalg.norm(inward)
+        # A driver in the aisle faces into the slot: text up is inward,
+        # the reading direction is the driver's right.
+        right = np.array([inward[1], -inward[0]])
+        sc.floor_texts.append({
+            "level": slot["level"],
+            "text": slot["slot_id"].split("-", 1)[1],  # "A-002"
+            "center": (entrance + L.number_offset * inward).tolist(),
+            "right": right.tolist(), "up": inward.tolist(),
+            "height": L.number_height})
 
 
 def _arrow_rects(tail: np.ndarray, direction: np.ndarray, L: Layout) -> list[list[float]]:

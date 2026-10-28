@@ -158,7 +158,7 @@ def export_dataset(work: str | pathlib.Path, out: str | pathlib.Path,
     work, out = pathlib.Path(work), pathlib.Path(out)
     directory = out / folder
     (directory / "files").mkdir(parents=True, exist_ok=True)
-    point_map = static_map.PointMap.load(work / "map" / "point_map.npz")
+    point_map = static_map.load_point_map(work / "map")
     n = len(point_map)
     labels = np.zeros(n, np.uint8)
     labels_path = work / "semantics" / "labels.npz"

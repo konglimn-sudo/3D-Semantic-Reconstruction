@@ -93,6 +93,7 @@ set(GR_CORE_SOURCES
   cpp/gr/mapping/raster.cc
   cpp/gr/mapping/raycast.cc
   cpp/gr/mapping/static_map.cc
+  cpp/gr/mapping/tiled_map.cc
   cpp/gr/mapping/visibility.cc
   # semantics/: Object timelines, occupancy, projection, labels, identities.
   cpp/gr/semantics/identity.cc
@@ -270,6 +271,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/mapping/raster_test.cc
     cpp/gr/mapping/raycast_test.cc
     cpp/gr/mapping/static_map_test.cc
+    cpp/gr/mapping/tiled_map_test.cc
     cpp/gr/mapping/visibility_test.cc
     cpp/gr/semantics/identity_test.cc
     cpp/gr/semantics/labeling_test.cc

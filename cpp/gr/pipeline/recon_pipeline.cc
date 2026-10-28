@@ -18,6 +18,7 @@
 #include "gr/io/tables.h"
 #include "gr/mapping/levels.h"
 #include "gr/mapping/static_map.h"
+#include "gr/mapping/tiled_map.h"
 #include "gr/odometry/odometry.h"
 #include "gr/odometry/trajectory.h"
 
@@ -452,119 +453,99 @@ void ReconPipeline::StageMap() {
     }
   }
 
-  // static_map.accumulate.
-  MapAccumulator accumulator(voxel, max_range, fusion);
-  if (fusion.fuse) {
-    for (size_t k = 0; k < keyframes.size(); ++k) {
-      accumulator.AddRanges(poses[k], ReadSweep(keyframes[k].path).points);
-    }
-  }
-  for (size_t k = 0; k < keyframes.size(); ++k) {
-    const SweepFile sweep = ReadSweep(keyframes[k].path);
-    accumulator.Add(static_cast<int>(k), poses[k], sweep.points,
-                    sweep.intensity);
-  }
-  MapAccumulator::Cloud cloud = accumulator.Collect();
-  PointMapFile map;
-  map.xyz = cloud.points;
-  map.intensity = cloud.intensity;
-  map.kf.assign(cloud.keyframe.begin(), cloud.keyframe.end());
-  for (int k : cloud.keyframe) {
-    map.trip.push_back(
-        static_cast<int16_t>(keyframes[static_cast<size_t>(k)].trip));
-  }
-  for (int& count : cloud.observations) count = std::min(count, 65535);
-  for (int count : cloud.observations) {
-    map.observations.push_back(static_cast<uint16_t>(count));
-  }
-
-  // static_map.compute_normals.
-  std::vector<Vec3> origins;
-  for (const Pose& pose : poses) origins.push_back(pose.translation);
-  const NormalsResult normals = EstimateOrientedNormals(
-      cloud.points, cloud.keyframe, origins, normal_radius, 6, 48);
-  map.normals = normals.normals;
-  map.planarity.assign(normals.planarity.begin(), normals.planarity.end());
-  if (fusion.fuse) {
-    map.sigma = PointSigmas(cloud, normals.normals, fusion.sigma_floor);
-  }
-  // The later steps see the stored float32 normals.
-  Points stored_normals = normals.normals;
-  for (Vec3& n : stored_normals) n = n.cast<float>().cast<double>();
-
-  // levels.detect_levels and LevelModel.assign.
+  // static_map.build_map: accumulation, normals and sigmas, levels and
+  // dynamic points, tile by tile when map.tile_size is set.
   std::vector<Points> paths;
   for (const TripPoses& trip : pose_set) {
     Points path;
     for (const Pose& pose : trip.knot_poses) path.push_back(pose.translation);
     paths.push_back(std::move(path));
   }
-  const LevelModel levels = DetectLevels(paths, cloud.points, stored_normals,
-                                         LevelConfigFrom(config_), log_);
-  const LevelAssignment assignment = AssignLevels(levels, cloud.points);
-  map.level = assignment.level;
-  map.height = assignment.height;
-  map.on_ramp = assignment.on_ramp;
-
-  // static_map.carve_dynamic.
-  const size_t n = cloud.points.size();
+  TiledMapConfig tiled;
+  tiled.voxel = voxel;
+  tiled.max_range = max_range;
+  tiled.normal_radius = normal_radius;
+  const Value& tile_size = map_config["tile_size"];
+  tiled.tile_size = tile_size.is_null()
+                        ? 0.0
+                        : ConfigDouble(tile_size, "map.tile_size");
+  tiled.fusion = fusion;
+  tiled.levels = LevelConfigFrom(config_);
   const Value& enabled = map_config["dynamic"]["enabled"];
-  if (!enabled.is_null() && enabled.AsBool()) {
-    std::vector<int> trip(n);
-    for (size_t i = 0; i < n; ++i) trip[i] = map.trip[i];
-    DynamicDetector detector(cloud.points, stored_normals, trip,
-                             DynamicConfigFrom(config_));
-    const Value& el_res = map_config["dynamic"]["el_res"];
-    if (el_res.is_null() || (el_res.is_number() && el_res.AsDouble() == 0.0)) {
-      // np.linspace(0, K - 1, min(3, K)).astype(int).
-      const size_t count = std::min<size_t>(3, keyframes.size());
-      std::vector<Points> sample;
-      for (size_t m = 0; m < count; ++m) {
-        const double step =
-            count > 1 ? static_cast<double>(keyframes.size() - 1) /
-                            static_cast<double>(count - 1)
-                      : 0.0;
-        const size_t k = m + 1 == count && count > 1
-                             ? keyframes.size() - 1
-                             : static_cast<size_t>(m * step);
-        sample.push_back(ReadSweep(keyframes[k].path).points);
-      }
-      detector.SetElevationResolution(EstimateBeamSpacing(sample));
+  tiled.dynamic = !enabled.is_null() && enabled.AsBool();
+  tiled.dynamic_config = DynamicConfigFrom(config_);
+  const Value& el_res = map_config["dynamic"]["el_res"];
+  if (el_res.is_null()) tiled.dynamic_config.el_res = 0.0;
+  std::vector<int> keyframe_trip;
+  for (const KeyframeEntry& keyframe : keyframes) {
+    keyframe_trip.push_back(keyframe.trip);
+  }
+  const SweepLoader load = [&](int k, Points* points,
+                               std::vector<float>* intensity) {
+    SweepFile sweep = ReadSweep(keyframes[static_cast<size_t>(k)].path);
+    *points = std::move(sweep.points);
+    *intensity = std::move(sweep.intensity);
+  };
+  const fs::path out = fs::path(work_) / "map";
+  const fs::path tile_dir = out / "tiles";
+  fs::remove_all(tile_dir);
+  fs::remove(out / "tiles.json");
+  fs::remove(out / "point_map.npz");
+  Value tile_list = Value::List();
+  const ChunkSink sink = [&](const MapTile& tile, MapChunk&& chunk) {
+    PointMapFile map;
+    const size_t count = chunk.size();
+    map.xyz = std::move(chunk.xyz);
+    map.intensity = std::move(chunk.intensity);
+    map.kf = std::move(chunk.keyframe);
+    map.trip = std::move(chunk.trip);
+    map.normals = std::move(chunk.normals);
+    map.planarity = std::move(chunk.planarity);
+    map.sigma = std::move(chunk.sigma);
+    map.observations = std::move(chunk.observations);
+    for (uint8_t kind : chunk.dynamic_kind) map.dynamic.push_back(kind > 0);
+    map.dynamic_kind = std::move(chunk.dynamic_kind);
+    map.level = std::move(chunk.level);
+    map.height = std::move(chunk.height);
+    map.on_ramp = std::move(chunk.on_ramp);
+    if (tile.whole) {
+      WritePointMap((out / "point_map.npz").string(), map);
+      return;
     }
-    for (size_t k = 0; k < keyframes.size(); ++k) {
-      detector.AddSweep(keyframes[k].trip, poses[k],
-                        ReadSweep(keyframes[k].path).points);
-    }
-    for (size_t t = 0; t < paths.size(); ++t) {
-      detector.AddEgoPath(static_cast<int>(t), paths[t]);
-    }
-    detector.SetHeights(
-        std::vector<double>(map.height.begin(), map.height.end()));
-    const std::vector<DynamicKind> kinds = detector.Classify();
-    size_t dynamic = 0;
-    size_t moved = 0;
-    size_t changed = 0;
-    for (DynamicKind kind : kinds) {
-      const uint8_t value = static_cast<uint8_t>(kind);
-      map.dynamic_kind.push_back(value);
-      map.dynamic.push_back(value > 0);
-      dynamic += value > 0;
-      moved += value == 1;
-      changed += value == 2;
-    }
+    map.range = std::move(chunk.range);
+    map.sequence = std::move(chunk.sequence);
+    const std::string name = "tile_" + std::to_string(tile.ix) + "_" +
+                             std::to_string(tile.iy) + ".npz";
+    WritePointMap((tile_dir / name).string(), map);
+    Value entry = Value::Map();
+    entry.Set("ix", Value::Integer(tile.ix));
+    entry.Set("iy", Value::Integer(tile.iy));
+    entry.Set("file", Value::String("tiles/" + name));
+    entry.Set("points", Value::Integer(static_cast<long long>(count)));
+    tile_list.Append(std::move(entry));
+  };
+  const TiledMapSummary summary = BuildTiledMap(poses, keyframe_trip, paths,
+                                                load, tiled, sink, log_);
+  const LevelModel& levels = summary.levels;
+  const size_t n = summary.points;
+  if (tiled.dynamic) {
+    const size_t dynamic = summary.moved + summary.changed;
     LogLine(log_, StringPrintf("[map] dynamic points: %zu / %zu (%.1f%%), "
                                "moved %zu, changed between sessions %zu",
                                dynamic, n,
                                n ? 100.0 * static_cast<double>(dynamic) /
                                        static_cast<double>(n)
                                  : 0.0,
-                               moved, changed));
-  } else {
-    map.dynamic.assign(n, 0);
-    map.dynamic_kind.assign(n, 0);
+                               summary.moved, summary.changed));
   }
-  const fs::path out = fs::path(work_) / "map";
-  WritePointMap((out / "point_map.npz").string(), map);
+  if (tiled.tile_size > 0.0) {
+    Value index = Value::Map();
+    index.Set("tile_size", Value::Number(tiled.tile_size));
+    index.Set("voxel", Value::Number(voxel));
+    index.Set("points", Value::Integer(static_cast<long long>(n)));
+    index.Set("tiles", std::move(tile_list));
+    WriteTextFile((out / "tiles.json").string(), ToJson(index));
+  }
   WriteLevels(out.string(), levels);
   LogLine(log_, "[map] " + std::to_string(n) + " points at " + Repr(voxel) +
                     " m");

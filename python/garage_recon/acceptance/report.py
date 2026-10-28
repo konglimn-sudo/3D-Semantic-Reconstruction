@@ -524,7 +524,7 @@ def run_acceptance(work_dir: str | pathlib.Path,
     log(f"[accept] handheld cloud {truth.source.name}: {len(truth.xyz)} "
         f"points, {len(truth.features['columns'])} columns, "
         f"{len(truth.features['slots'])} slots")
-    point_map = static_map.PointMap.load(work / "map" / "point_map.npz")
+    point_map = static_map.load_point_map(work / "map")
     static = ~point_map.dynamic if point_map.dynamic is not None else np.ones(
         len(point_map), bool)
     labels_path = work / "semantics" / "labels.npz"

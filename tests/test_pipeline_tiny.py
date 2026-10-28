@@ -1,10 +1,15 @@
 """End-to-end: synthetic tiny garage -> section 4 -> section 5 -> evaluation."""
 
+import copy
+import dataclasses
 import json
+import shutil
 
 import numpy as np
 
 from garage_recon import provenance
+from garage_recon.recon import pipeline as recon_pipeline
+from garage_recon.recon import static_map
 
 
 def test_trajectory_and_map(tiny_run):
@@ -92,3 +97,35 @@ def test_stages_are_rerunnable(tiny_run):
     after = json.loads(
         (semantics.out / "objects" / "static.json").read_text())["trip_00"]
     assert len(after) == len(static)
+
+
+def test_map_built_in_tiles_is_the_map_built_in_one_piece(tiny_run, tmp_path):
+    recon = tiny_run["recon"]
+    work = tmp_path / "work"
+    shutil.copytree(recon.work, work,
+                    ignore=shutil.ignore_patterns("semantics", "map", "bev"))
+    cfg = copy.deepcopy(tiny_run["cfg"])
+    cfg.map.tile_size = 8.0
+    tiled = recon_pipeline.ReconPipeline(
+        [d.root for d in recon.datasets], work, cfg, lambda *a, **k: None,
+        recon.models)
+    tiled.stage_map()
+    meta = json.loads((work / "map" / "tiles.json").read_text())
+    assert len(meta["tiles"]) >= 6
+    assert not (work / "map" / "point_map.npz").exists()
+    whole = recon.point_map()
+    pieces = tiled.point_map()
+    assert sum(t["points"] for t in meta["tiles"]) == len(whole)
+    for field in dataclasses.fields(static_map.PointMap):
+        a, b = getattr(whole, field.name), getattr(pieces, field.name)
+        if a is None:
+            assert b is None, field.name
+            continue
+        assert a.dtype == b.dtype, field.name
+        np.testing.assert_array_equal(a, b, err_msg=field.name)
+    assert ((work / "map" / "levels.json").read_text()
+            == (recon.work / "map" / "levels.json").read_text())
+    # A region loads only the tiles that touch it.
+    x0, y0 = whole.xyz[:, :2].min(axis=0)
+    part = tiled.point_map(bounds=(x0, y0, x0 + 1.0, y0 + 1.0))
+    assert 0 < len(part) < len(whole)

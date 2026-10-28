@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -33,12 +34,27 @@ struct MapFusionConfig {
   double sigma_floor = 0.003;     // m, pose / calibration residual
 };
 
+// Voxels with x in [x0, x1) and y in [y0, y1) (voxel indices, any z).
+struct VoxelRegion {
+  int x0 = 0;
+  int x1 = 0;
+  int y0 = 0;
+  int y1 = 0;
+
+  bool Contains(const VoxelKey& key) const {
+    return key.x >= x0 && key.x < x1 && key.y >= y0 && key.y < y1;
+  }
+};
+
 // Merges sweeps into one voxel-downsampled cloud of the returns within
 // `max_range`. Without fusion, per voxel the observation taken from the
 // closest sensor position wins: at grazing angles a 0.3 deg attitude error
 // already moves a floor point at 25 m by more than 10 cm. With fusion, a
 // first pass (AddRanges over all sweeps) finds the nearest range of every
 // voxel and Add then averages the observations within the range window.
+//
+// A voxel only depends on the returns that fall into it, so a map can be
+// built region by region (SetRegion) with the same voxels as in one piece.
 class MapAccumulator {
  public:
   // `voxel` must be positive.
@@ -57,7 +73,17 @@ class MapAccumulator {
     // Covariance of the averaged observations (xx, xy, xz, yy, yz, zz), m^2.
     std::vector<std::array<float, 6>> spread;
     std::vector<float> model_sigma;  // Formal sigma of the weighted mean (m).
+    // The order key of Collect: nearest observation range, then the
+    // keyframe (high 32 bits) and point index of that observation. The
+    // points of separately built regions merge into the order of one map
+    // by sorting on (range, sequence).
+    std::vector<double> range;
+    std::vector<int64_t> sequence;
+    std::vector<VoxelKey> voxel;  // The voxel of each point.
   };
+
+  // Only voxels in `region` are kept from now on.
+  void SetRegion(const VoxelRegion& region) { region_ = region; }
 
   // Fusion: first pass, records the nearest observation range per voxel.
   void AddRanges(const Pose& world_from_lidar, const Points& sweep);
@@ -87,7 +113,7 @@ class MapAccumulator {
   double inv_voxel_;
   double max_range_;
   MapFusionConfig fusion_;
-  int64_t sequence_ = 0;
+  std::optional<VoxelRegion> region_;
   std::unordered_map<VoxelKey, Cell, VoxelKeyHash> cells_;
   std::unordered_map<VoxelKey, float, VoxelKeyHash> nearest_;  // AddRanges.
 };

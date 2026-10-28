@@ -22,8 +22,10 @@ void MapAccumulator::AddRanges(const Pose& world_from_lidar,
   for (const Vec3& p : sweep) {
     const double range = p.norm();
     if (range > max_range_) continue;
-    const auto [it, inserted] = nearest_.try_emplace(
-        VoxelOf(world_from_lidar * p, inv_voxel_), static_cast<float>(range));
+    const VoxelKey key = VoxelOf(world_from_lidar * p, inv_voxel_);
+    if (region_ && !region_->Contains(key)) continue;
+    const auto [it, inserted] =
+        nearest_.try_emplace(key, static_cast<float>(range));
     if (!inserted) it->second = std::min(it->second, static_cast<float>(range));
   }
 }
@@ -38,16 +40,19 @@ void MapAccumulator::Add(int keyframe, const Pose& world_from_lidar,
     if (range > max_range_) continue;
     const Vec3 point = world_from_lidar * sweep[i];
     const VoxelKey key = VoxelOf(point, inv_voxel_);
+    if (region_ && !region_->Contains(key)) continue;
     const float value = i < intensity.size() ? intensity[i] : 0.0f;
     Cell& cell = cells_[key];
     if (cell.keyframe < 0 || range < cell.range) {
       cell.range = range;
-      cell.sequence = sequence_;
+      // Increases with every Add (keyframes in order) and point, whatever
+      // the region.
+      cell.sequence = (static_cast<int64_t>(keyframe) << 32) |
+                      static_cast<int64_t>(i);
       cell.point = point;
       cell.intensity = value;
       cell.keyframe = keyframe;
     }
-    ++sequence_;
     if (!fusion_.fuse) continue;
     const auto nearest = nearest_.find(key);
     const double best = nearest == nearest_.end() ? range : nearest->second;
@@ -88,9 +93,15 @@ MapAccumulator::Cloud MapAccumulator::Collect() const {
   cloud.observations.reserve(cells.size());
   cloud.spread.reserve(cells.size());
   cloud.model_sigma.reserve(cells.size());
+  cloud.range.reserve(cells.size());
+  cloud.sequence.reserve(cells.size());
+  cloud.voxel.reserve(cells.size());
   const double angle_sigma = DegToRad(fusion_.angle_sigma_deg);
   for (const auto& [key, cell] : cells) {
     cloud.keyframe.push_back(cell->keyframe);
+    cloud.range.push_back(cell->range);
+    cloud.sequence.push_back(cell->sequence);
+    cloud.voxel.push_back(*key);
     if (!fusion_.fuse || cell->weight <= 0.0f) {
       cloud.points.push_back(cell->point);
       cloud.intensity.push_back(cell->intensity);

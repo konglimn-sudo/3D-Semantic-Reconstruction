@@ -11,7 +11,8 @@
 //   trajectory  the pose set (continuous-time trajectories, rig) and the
 //               keyframe sweeps deskewed again with it;
 //   map         fused point map, normals and sigmas, levels and ramps,
-//               dynamic points.
+//               dynamic points; in tiles with map.tile_size
+//               (gr/mapping/tiled_map.h).
 //
 // The stages that need learned models (appearance / text loop proposals,
 // camera calibration, semantics) stay on the Python side; their loop pairs

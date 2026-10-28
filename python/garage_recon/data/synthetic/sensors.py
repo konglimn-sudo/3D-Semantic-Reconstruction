@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import cv2
 import numpy as np
 from scipy.spatial import transform
 
@@ -45,6 +46,62 @@ def _bounds(corners) -> list[float]:
     """[x0, x1, y0, y1] of axis-aligned corners."""
     c = np.asarray(corners, float)
     return [c[:, 0].min(), c[:, 0].max(), c[:, 1].min(), c[:, 1].max()]
+
+
+class FloorTextRaster:
+    """The painted floor texts of a scene as one 1 cm mask per level."""
+
+    def __init__(self, texts: list[dict], res: float = 0.01):
+        self.res = res
+        self.levels = {}  # level -> (x0, y0, mask (H, W) bool)
+        for level in sorted({t["level"] for t in texts}):
+            mine = [t for t in texts if t["level"] == level]
+            reach = max(len(t["text"]) * t["height"] for t in mine)
+            centers = np.array([t["center"] for t in mine])
+            x0, y0 = centers.min(axis=0) - reach
+            w, h = np.ceil((centers.max(axis=0) + reach - (x0, y0))
+                           / res).astype(int)
+            mask = np.zeros((h, w), np.uint8)
+            for text in mine:
+                self._paint(mask, x0, y0, text)
+            self.levels[level] = (x0, y0, mask > 0)
+
+    def _paint(self, mask: np.ndarray, x0: float, y0: float,
+               text: dict) -> None:
+        """Draws one text: glyph pixels map to the floor through its
+        centre, reading direction and up vector."""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cap = text["height"] / self.res  # Character height in pixels.
+        scale = cap / cv2.getTextSize(text["text"], font, 1.0, 1)[0][1]
+        thickness = max(1, round(0.14 * cap))
+        (tw, th), base = cv2.getTextSize(text["text"], font, scale, thickness)
+        pad = thickness + 2
+        glyph = np.zeros((th + base + 2 * pad, tw + 2 * pad), np.uint8)
+        cv2.putText(glyph, text["text"], (pad, pad + th), font, scale, 255,
+                    thickness, cv2.LINE_AA)
+        gh, gw = glyph.shape
+        right = np.asarray(text["right"], float)
+        up = np.asarray(text["up"], float)
+        center = (np.asarray(text["center"], float) - (x0, y0)) / self.res
+        # Glyph (col, row) -> mask (i, j): rows run down, against `up`.
+        linear = np.column_stack([right, -up])
+        offset = center - linear @ np.array([gw / 2.0, (pad + th / 2.0)])
+        cv2.warpAffine(glyph, np.column_stack([linear, offset]),
+                       (mask.shape[1], mask.shape[0]), dst=mask,
+                       flags=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_TRANSPARENT)
+
+    def painted(self, points: np.ndarray, level: np.ndarray) -> np.ndarray:
+        """Whether each floor point lies on painted text."""
+        out = np.zeros(len(points), bool)
+        for lv, (x0, y0, mask) in self.levels.items():
+            idx = np.nonzero(level == lv)[0]
+            i = np.floor((points[idx, 0] - x0) / self.res).astype(int)
+            j = np.floor((points[idx, 1] - y0) / self.res).astype(int)
+            inside = ((i >= 0) & (i < mask.shape[1]) & (j >= 0)
+                      & (j < mask.shape[0]))
+            out[idx[inside]] = mask[j[inside], i[inside]]
+        return out
 
 
 def value_noise(points: np.ndarray, scale: float) -> np.ndarray:
@@ -108,6 +165,8 @@ class SceneRaycaster:
         self.green = np.array(
             [[s["level"], *_bounds(s["corners"])] for s in garage.slots
              if "ev" in s.get("attributes", [])], float).reshape(-1, 5)
+        self.texts = (FloorTextRaster(garage.floor_texts)
+                      if garage.floor_texts else None)
 
     def _attributes(self, boxes: list[scene_lib.Box]):
         return (np.array([b.cls for b in boxes], int),
@@ -245,6 +304,12 @@ class SceneRaycaster:
                 inside = ((level == lv) & (p[:, 0] > x0) & (p[:, 0] < x1)
                           & (p[:, 1] > y0) & (p[:, 1] < y1))
                 rgb[floor[inside]] = (70, 150, 90)
+        painted = np.zeros(n, bool)
+        if self.texts is not None and len(floor):
+            p = points[floor]
+            level = np.rint(-p[:, 2] / self.scene.layout.level_height)
+            painted[floor[self.texts.painted(p, level)]] = True
+            rgb[painted] = (232, 232, 228)
         vehicle = cls == taxonomy.cid("vehicle")
         if vehicle.any():
             instance = hit["instance"][vehicle]
@@ -264,6 +329,7 @@ class SceneRaycaster:
             rgb[column] = c
         texture = 1.0 + 0.35 * fine + 0.2 * coarse
         line = np.isin(cls, [taxonomy.cid("parking_line"), taxonomy.cid("arrow")])
+        line |= painted
         texture[line] = 1.0 + 0.08 * fine[line]
         nz = hit["normals"][:, 2]
         shade = ((0.62 + 0.38 * (0.5 + 0.5 * nz))

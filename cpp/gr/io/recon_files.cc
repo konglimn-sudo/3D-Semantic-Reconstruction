@@ -553,6 +553,12 @@ void WritePointMap(const std::string& path, const PointMapFile& map) {
   if (check(map.on_ramp.size(), "on_ramp")) {
     archive["on_ramp"] = NpyArray::FromBools(map.on_ramp, {n});
   }
+  if (check(map.range.size(), "range")) {
+    archive["range"] = NpyArray::Of(map.range, {n});
+  }
+  if (check(map.sequence.size(), "sequence")) {
+    archive["sequence"] = NpyArray::Of(map.sequence, {n});
+  }
   WriteNpz(path, archive, false);
 }
 
