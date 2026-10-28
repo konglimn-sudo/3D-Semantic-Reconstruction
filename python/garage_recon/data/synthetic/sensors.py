@@ -68,28 +68,41 @@ class FloorTextRaster:
 
     def _paint(self, mask: np.ndarray, x0: float, y0: float,
                text: dict) -> None:
-        """Draws one text: glyph pixels map to the floor through its
-        centre, reading direction and up vector."""
+        """Draws one text: its ink, `height` tall, centred on `center`,
+        reading along `right` with the characters' up along `up`."""
+        # Rendered large and cropped to the ink, so that neither the font
+        # metrics nor the warp of an OpenCV version change the paint.
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cap = text["height"] / self.res  # Character height in pixels.
-        scale = cap / cv2.getTextSize(text["text"], font, 1.0, 1)[0][1]
-        thickness = max(1, round(0.14 * cap))
-        (tw, th), base = cv2.getTextSize(text["text"], font, scale, thickness)
-        pad = thickness + 2
-        glyph = np.zeros((th + base + 2 * pad, tw + 2 * pad), np.uint8)
-        cv2.putText(glyph, text["text"], (pad, pad + th), font, scale, 255,
+        (tw, th), base = cv2.getTextSize(text["text"], font, 4.0, 1)
+        thickness = max(1, round(0.14 * th))
+        pad = 2 * thickness
+        canvas = np.zeros((th + base + 2 * pad, tw + 2 * pad), np.uint8)
+        cv2.putText(canvas, text["text"], (pad, pad + th), font, 4.0, 255,
                     thickness, cv2.LINE_AA)
-        gh, gw = glyph.shape
+        rows, cols = np.nonzero(canvas > 127)
+        ink = canvas[rows.min():rows.max() + 1,
+                     cols.min():cols.max() + 1] > 127
+        per_m = ink.shape[0] / text["height"]  # Ink pixels per metre.
+        half = np.array([ink.shape[1], ink.shape[0]]) / per_m / 2.0
         right = np.asarray(text["right"], float)
         up = np.asarray(text["up"], float)
-        center = (np.asarray(text["center"], float) - (x0, y0)) / self.res
-        # Glyph (col, row) -> mask (i, j): rows run down, against `up`.
-        linear = np.column_stack([right, -up])
-        offset = center - linear @ np.array([gw / 2.0, (pad + th / 2.0)])
-        cv2.warpAffine(glyph, np.column_stack([linear, offset]),
-                       (mask.shape[1], mask.shape[0]), dst=mask,
-                       flags=cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_TRANSPARENT)
+        center = np.asarray(text["center"], float)
+        # The mask cells under the text's box, sampled at their centres.
+        reach = np.abs(right) * half[0] + np.abs(up) * half[1]
+        i0, j0 = np.floor((center - reach - (x0, y0)) / self.res).astype(int)
+        i1, j1 = np.ceil((center + reach - (x0, y0)) / self.res).astype(int)
+        i0, j0 = max(i0, 0), max(j0, 0)
+        i1, j1 = min(i1, mask.shape[1]), min(j1, mask.shape[0])
+        jj, ii = np.mgrid[j0:j1, i0:i1]
+        d = np.stack([x0 + (ii + 0.5) * self.res - center[0],
+                      y0 + (jj + 0.5) * self.res - center[1]], axis=-1)
+        col = np.floor((d @ right + half[0]) * per_m).astype(int)
+        row = np.floor((half[1] - d @ up) * per_m).astype(int)
+        inside = ((col >= 0) & (col < ink.shape[1]) & (row >= 0)
+                  & (row < ink.shape[0]))
+        hit = np.zeros(inside.shape, bool)
+        hit[inside] = ink[row[inside], col[inside]]
+        mask[j0:j1, i0:i1] |= hit.astype(np.uint8)
 
     def painted(self, points: np.ndarray, level: np.ndarray) -> np.ndarray:
         """Whether each floor point lies on painted text."""
