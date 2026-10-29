@@ -32,6 +32,9 @@
 
 namespace gr {
 
+// Identity of masks without one and of points never covered by a mask.
+inline constexpr int kNoIdentity = -1;
+
 struct IdentityConfig {
   double max_range = 15.0;
   double point_spacing = 0.05;  // Splat size of the carrier points (m).
@@ -59,7 +62,7 @@ struct IdentityConfig {
 struct MaskRecord {
   int view = 0;
   int mask = 0;  // Mask id within the view.
-  int identity = -1;
+  int identity = kNoIdentity;
   int points = 0;  // Carrier points covered.
   int pixels = 0;
   double mean_range = 0.0;  // m
@@ -76,14 +79,14 @@ class IdentityAssociator {
   IdentityAssociator(IdentityAssociator&&) = default;
   IdentityAssociator& operator=(IdentityAssociator&&) = default;
 
-  // Adds one view. `masks` is a camera-sized H x W image of mask ids (-1 =
-  // none). Returns the records of the view's masks.
+  // Adds one view. `masks` is a camera-sized H x W image of mask ids
+  // (negative: none). Returns the records of the view's masks.
   std::vector<MaskRecord> AddView(const CameraModel& camera,
                                   const CameraExposure& exposure,
                                   const int32_t* masks);
 
   struct Result {
-    std::vector<int> point_identity;      // -1 = never covered by a mask.
+    std::vector<int> point_identity;      // kNoIdentity: never covered.
     std::vector<float> point_confidence;  // Winning share of the votes.
     std::vector<MaskRecord> masks;        // Every mask of every view.
     int num_identities = 0;
@@ -99,8 +102,8 @@ class IdentityAssociator {
   int NewIdentity();
   // Merges the identities into the smallest root; returns it.
   int Merge(const std::vector<int>& roots);
-  bool CannotLink(int a, int b) const;
-  // Root identity with the most votes of a point, -1 without votes.
+  bool CannotLink(int first, int second) const;
+  // Root identity with the most votes of a point, kNoIdentity without votes.
   int CurrentIdentity(size_t point) const;
   void Vote(size_t point, int identity);
 

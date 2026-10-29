@@ -24,8 +24,8 @@ ZBuffer::ZBuffer(const CameraModel& camera, const CameraExposure& exposure,
   const size_t num_pixels =
       static_cast<size_t>(result_.width) * static_cast<size_t>(result_.height);
   result_.depth.assign(num_pixels, std::numeric_limits<float>::infinity());
-  result_.label.assign(num_pixels, -1);
-  result_.index.assign(num_pixels, -1);
+  result_.label.assign(num_pixels, RenderResult::kEmpty);
+  result_.index.assign(num_pixels, RenderResult::kEmpty);
 }
 
 void ZBuffer::Splat(const Vec3& point_world, int label, int index) {
@@ -43,18 +43,16 @@ void ZBuffer::Splat(const Vec3& point_world, int label, int index) {
       v - radius >= result_.height) {
     return;
   }
-  const float range_f = static_cast<float>(range);
-  for (int dv = -radius; dv <= radius; ++dv) {
-    const int vv = v + dv;
-    if (vv < 0 || vv >= result_.height) continue;
-    for (int du = -radius; du <= radius; ++du) {
-      const int uu = u + du;
-      if (uu < 0 || uu >= result_.width) continue;
+  const float range_float = static_cast<float>(range);
+  for (int row = v - radius; row <= v + radius; ++row) {
+    if (row < 0 || row >= result_.height) continue;
+    for (int column = u - radius; column <= u + radius; ++column) {
+      if (column < 0 || column >= result_.width) continue;
       const size_t pixel =
-          static_cast<size_t>(vv) * static_cast<size_t>(result_.width) +
-          static_cast<size_t>(uu);
-      if (range_f < result_.depth[pixel]) {
-        result_.depth[pixel] = range_f;
+          static_cast<size_t>(row) * static_cast<size_t>(result_.width) +
+          static_cast<size_t>(column);
+      if (range_float < result_.depth[pixel]) {
+        result_.depth[pixel] = range_float;
         result_.label[pixel] = label;
         result_.index[pixel] = index;
       }
@@ -70,9 +68,10 @@ RenderResult RenderPoints(const CameraModel& camera,
                           double max_range) {
   ZBuffer buffer(camera, exposure, point_spacing, min_radius, max_radius,
                  min_range, max_range);
-  for (size_t n = 0; n < points_world.size(); ++n) {
-    buffer.Splat(points_world[n], n < labels.size() ? labels[n] : -1,
-                 static_cast<int>(n));
+  for (size_t point = 0; point < points_world.size(); ++point) {
+    buffer.Splat(points_world[point],
+                 point < labels.size() ? labels[point] : RenderResult::kEmpty,
+                 static_cast<int>(point));
   }
   return buffer.TakeResult();
 }
@@ -106,15 +105,13 @@ std::vector<float> RenderSurfaceDepth(const CameraModel& camera,
         mean_radius,
         std::clamp(static_cast<int>(std::lround(focal * point_spacing / range)),
                    min_radius, max_radius));
-    for (int dv = -radius; dv <= radius; ++dv) {
-      const int vv = v + dv;
-      if (vv < 0 || vv >= height) continue;
-      for (int du = -radius; du <= radius; ++du) {
-        const int uu = u + du;
-        if (uu < 0 || uu >= width) continue;
+    for (int row = v - radius; row <= v + radius; ++row) {
+      if (row < 0 || row >= height) continue;
+      for (int column = u - radius; column <= u + radius; ++column) {
+        if (column < 0 || column >= width) continue;
         const size_t pixel =
-            static_cast<size_t>(vv) * static_cast<size_t>(width) +
-            static_cast<size_t>(uu);
+            static_cast<size_t>(row) * static_cast<size_t>(width) +
+            static_cast<size_t>(column);
         const double first = nearest.depth[pixel];
         if (!std::isfinite(first) ||
             range > first + abs_tol + rel_tol * first) {
@@ -126,8 +123,10 @@ std::vector<float> RenderSurfaceDepth(const CameraModel& camera,
     }
   }
   std::vector<float> out(num_pixels, std::numeric_limits<float>::quiet_NaN());
-  for (size_t i = 0; i < num_pixels; ++i) {
-    if (count[i] > 0) out[i] = static_cast<float>(sum[i] / count[i]);
+  for (size_t pixel = 0; pixel < num_pixels; ++pixel) {
+    if (count[pixel] > 0) {
+      out[pixel] = static_cast<float>(sum[pixel] / count[pixel]);
+    }
   }
   return out;
 }
@@ -138,40 +137,41 @@ VisibilityResult ProjectVisibility(const CameraModel& camera,
                                    const std::vector<float>& depth,
                                    double abs_tol, double rel_tol) {
   VisibilityResult out;
-  const size_t n = query_world.size();
-  out.uv = RowMatX2d::Constant(static_cast<Eigen::Index>(n), 2,
+  const size_t count = query_world.size();
+  out.uv = RowMatX2d::Constant(static_cast<Eigen::Index>(count), kPlaneDim,
                                std::numeric_limits<double>::quiet_NaN());
-  out.in_image.assign(n, 0);
-  out.visible.assign(n, 0);
-  out.range.assign(n, std::numeric_limits<double>::quiet_NaN());
+  out.in_image.assign(count, 0);
+  out.visible.assign(count, 0);
+  out.range.assign(count, std::numeric_limits<double>::quiet_NaN());
   const bool test_depth =
       !depth.empty() &&
       depth.size() == static_cast<size_t>(camera.width()) *
                           static_cast<size_t>(camera.height());
-  for (size_t m = 0; m < n; ++m) {
+  for (size_t query = 0; query < count; ++query) {
     const std::optional<CameraExposure::Projection> projection =
-        exposure.Project(camera, query_world[m]);
+        exposure.Project(camera, query_world[query]);
     if (!projection) {
-      out.range[m] = (query_world[m] - exposure.center()).norm();
+      out.range[query] = (query_world[query] - exposure.center()).norm();
       continue;
     }
     const double range = projection->point_camera.norm();
-    out.range[m] = range;
+    out.range[query] = range;
     const std::optional<Vec2> uv = projection->uv;
-    out.uv.row(static_cast<Eigen::Index>(m)) = uv->transpose();
+    out.uv.row(static_cast<Eigen::Index>(query)) = uv->transpose();
     if (!camera.InImage(*uv)) continue;
-    out.in_image[m] = 1;
+    out.in_image[query] = 1;
     if (!test_depth) {
-      out.visible[m] = 1;
+      out.visible[query] = 1;
       continue;
     }
     const size_t pixel = static_cast<size_t>(static_cast<int>(uv->y())) *
                              static_cast<size_t>(camera.width()) +
                          static_cast<size_t>(static_cast<int>(uv->x()));
-    const float d = depth[pixel];
-    if (!std::isfinite(d) ||
-        range <= static_cast<double>(d) * (1.0 + rel_tol) + abs_tol) {
-      out.visible[m] = 1;
+    const float surface_range = depth[pixel];
+    if (!std::isfinite(surface_range) ||
+        range <=
+            static_cast<double>(surface_range) * (1.0 + rel_tol) + abs_tol) {
+      out.visible[query] = 1;
     }
   }
   return out;
@@ -179,8 +179,9 @@ VisibilityResult ProjectVisibility(const CameraModel& camera,
 
 PointCloudIndex::PointCloudIndex(Points points, double bucket)
     : points_(std::move(points)), bucket_(bucket) {
-  for (size_t i = 0; i < points_.size(); ++i) {
-    buckets_[CellOf(points_[i], bucket_)].push_back(static_cast<int>(i));
+  for (size_t point = 0; point < points_.size(); ++point) {
+    buckets_[CellOf(points_[point], bucket_)].push_back(
+        static_cast<int>(point));
   }
 }
 
@@ -188,16 +189,20 @@ template <typename Accept>
 std::vector<int> PointCloudIndex::Search(const Vec2& center, double radius,
                                          Accept&& accept) const {
   std::vector<int> out;
-  const int x0 = static_cast<int>(std::floor((center.x() - radius) / bucket_));
-  const int x1 = static_cast<int>(std::floor((center.x() + radius) / bucket_));
-  const int y0 = static_cast<int>(std::floor((center.y() - radius) / bucket_));
-  const int y1 = static_cast<int>(std::floor((center.y() + radius) / bucket_));
-  for (int bx = x0; bx <= x1; ++bx) {
-    for (int by = y0; by <= y1; ++by) {
-      const auto it = buckets_.find({bx, by});
-      if (it == buckets_.end()) continue;
-      for (int i : it->second) {
-        if (accept(points_[static_cast<size_t>(i)])) out.push_back(i);
+  const int first_x =
+      static_cast<int>(std::floor((center.x() - radius) / bucket_));
+  const int last_x =
+      static_cast<int>(std::floor((center.x() + radius) / bucket_));
+  const int first_y =
+      static_cast<int>(std::floor((center.y() - radius) / bucket_));
+  const int last_y =
+      static_cast<int>(std::floor((center.y() + radius) / bucket_));
+  for (int bucket_x = first_x; bucket_x <= last_x; ++bucket_x) {
+    for (int bucket_y = first_y; bucket_y <= last_y; ++bucket_y) {
+      const auto found = buckets_.find({bucket_x, bucket_y});
+      if (found == buckets_.end()) continue;
+      for (int point : found->second) {
+        if (accept(points_[static_cast<size_t>(point)])) out.push_back(point);
       }
     }
   }
@@ -207,16 +212,17 @@ std::vector<int> PointCloudIndex::Search(const Vec2& center, double radius,
 
 std::vector<int> PointCloudIndex::RadiusSearch(const Vec3& center,
                                                double radius) const {
-  const double r2 = radius * radius;
-  return Search(center.head<2>(), radius,
-                [&](const Vec3& p) { return (p - center).squaredNorm() < r2; });
+  const double squared_radius = radius * radius;
+  return Search(center.head<2>(), radius, [&](const Vec3& point) {
+    return (point - center).squaredNorm() < squared_radius;
+  });
 }
 
 std::vector<int> PointCloudIndex::RadiusSearchXy(const Vec2& center,
                                                  double radius) const {
-  const double r2 = radius * radius;
-  return Search(center, radius, [&](const Vec3& p) {
-    return (p.head<2>() - center).squaredNorm() < r2;
+  const double squared_radius = radius * radius;
+  return Search(center, radius, [&](const Vec3& point) {
+    return (point.head<2>() - center).squaredNorm() < squared_radius;
   });
 }
 

@@ -11,62 +11,82 @@ namespace gr {
 namespace {
 
 constexpr float kInfinity = std::numeric_limits<float>::infinity();
+constexpr double kFullTurn = 2.0 * kPi;
+constexpr double kDegreesPerTurn = 2.0 * kDegreesPerHalfTurn;
+// Returns closer than this (m) are noise; returns beyond this many times the
+// voting range still occlude.
+constexpr double kMinReturnRange = 1e-3;
+constexpr double kOccluderRangeFactor = 1.5;
+// Map points closer than this (m) to the sensor do not vote.
+constexpr double kMinPointRange = 1.0;
+// The minimum is taken over the bins this many steps around a bin.
+constexpr int kNeighbourhoodRadius = 1;
 
 // Spherical range image of a sweep: the nearest return per bin and the
-// minimum over each bin's 3x3 neighbourhood.
+// minimum over each bin's neighbourhood.
 class RangeImage {
  public:
   RangeImage(const Points& sweep, const RangeImageSpec& spec, double max_range)
       : spec_(spec),
-        width_(
-            std::max(1, static_cast<int>(std::ceil(360.0 / spec.az_res_deg)))),
+        width_(std::max(1, static_cast<int>(std::ceil(kDegreesPerTurn /
+                                                      spec.az_res_deg)))),
         height_(std::max(
             1, static_cast<int>(std::ceil((spec.el_max_deg - spec.el_min_deg) /
                                           spec.el_res_deg)))),
         nearest_(static_cast<size_t>(width_) * static_cast<size_t>(height_),
                  kInfinity),
         neighbourhood_min_(nearest_.size(), kInfinity) {
-    for (const Vec3& p : sweep) {
-      const double r = p.norm();
-      if (r < 1e-3 || r > max_range * 1.5) continue;
-      int u = 0;
-      int v = 0;
-      if (!Bin(p, r, u, v)) continue;
-      float& cell = nearest_[Index(u, v)];
-      cell = std::min(cell, static_cast<float>(r));
+    for (const Vec3& point : sweep) {
+      const double range = point.norm();
+      if (range < kMinReturnRange || range > max_range * kOccluderRangeFactor) {
+        continue;
+      }
+      int column = 0;
+      int row = 0;
+      if (!Bin(point, range, column, row)) continue;
+      float& cell = nearest_[Index(column, row)];
+      cell = std::min(cell, static_cast<float>(range));
     }
-    // Conservative 3x3 minimum over measured neighbours: "seen through"
-    // requires every measured neighbour to be farther, which avoids false
-    // votes at object silhouettes. Empty bins (between beams) carry no
+    // Conservative neighbourhood minimum over measured neighbours: "seen
+    // through" requires every measured neighbour to be farther, which avoids
+    // false votes at object silhouettes. Empty bins (between beams) carry no
     // information.
-    for (int v = 0; v < height_; ++v) {
-      for (int u = 0; u < width_; ++u) {
-        float m = kInfinity;
-        for (int dv = -1; dv <= 1; ++dv) {
-          const int vv = v + dv;
-          if (vv < 0 || vv >= height_) continue;
-          for (int du = -1; du <= 1; ++du) {
-            m = std::min(m, nearest_[Index((u + du + width_) % width_, vv)]);
+    for (int row = 0; row < height_; ++row) {
+      for (int column = 0; column < width_; ++column) {
+        float minimum = kInfinity;
+        for (int dv = -kNeighbourhoodRadius; dv <= kNeighbourhoodRadius;
+             ++dv) {
+          const int neighbour_row = row + dv;
+          if (neighbour_row < 0 || neighbour_row >= height_) continue;
+          for (int du = -kNeighbourhoodRadius; du <= kNeighbourhoodRadius;
+               ++du) {
+            // Azimuth wraps around.
+            const int neighbour_column = (column + du + width_) % width_;
+            minimum = std::min(
+                minimum, nearest_[Index(neighbour_column, neighbour_row)]);
           }
         }
-        neighbourhood_min_[Index(u, v)] = m;
+        neighbourhood_min_[Index(column, row)] = minimum;
       }
     }
   }
 
-  // Bin of a point at range r (sensor frame); false outside the elevations.
-  bool Bin(const Vec3& p, double r, int& u, int& v) const {
-    const double azimuth = std::atan2(p.y(), p.x()) + kPi;
+  // Bin (`column` by azimuth, `row` by elevation) of a point at `range`
+  // (sensor frame); false outside the elevations.
+  bool Bin(const Vec3& point, double range, int& column, int& row) const {
+    const double azimuth = std::atan2(point.y(), point.x()) + kPi;
     const double elevation =
-        std::asin(std::clamp(p.z() / r, -1.0, 1.0)) / (kPi / 180.0);
-    u = std::min(width_ - 1, static_cast<int>(azimuth / (2.0 * kPi) * width_));
-    v = static_cast<int>(
+        std::asin(std::clamp(point.z() / range, -1.0, 1.0)) /
+        (kPi / kDegreesPerHalfTurn);
+    column =
+        std::min(width_ - 1, static_cast<int>(azimuth / kFullTurn * width_));
+    row = static_cast<int>(
         std::floor((elevation - spec_.el_min_deg) / spec_.el_res_deg));
-    return v >= 0 && v < height_;
+    return row >= 0 && row < height_;
   }
-  size_t Index(int u, int v) const {
-    return static_cast<size_t>(v) * static_cast<size_t>(width_) +
-           static_cast<size_t>(u);
+  size_t Index(int column, int row) const {
+    return static_cast<size_t>(row) * static_cast<size_t>(width_) +
+           static_cast<size_t>(column);
   }
   float nearest(size_t index) const { return nearest_[index]; }
   float neighbourhood_min(size_t index) const {
@@ -94,13 +114,13 @@ VisibilityVoter::VisibilityVoter(const Points& map, const Points& normals,
 }
 
 const std::vector<int>& VisibilityVoter::SeenCounts(int session) const {
-  const auto it = counts_.find(session);
-  return it == counts_.end() ? zeros_ : it->second.seen;
+  const auto counts = counts_.find(session);
+  return counts == counts_.end() ? zeros_ : counts->second.seen;
 }
 
 const std::vector<int>& VisibilityVoter::ThroughCounts(int session) const {
-  const auto it = counts_.find(session);
-  return it == counts_.end() ? zeros_ : it->second.through;
+  const auto counts = counts_.find(session);
+  return counts == counts_.end() ? zeros_ : counts->second.through;
 }
 
 std::vector<int> VisibilityVoter::Sessions() const {
@@ -123,42 +143,43 @@ void VisibilityVoter::AddSweep(const Pose& world_from_lidar,
   const Vec3& origin = world_from_lidar.translation;
 
   // Map buckets within reach of the sensor.
-  std::vector<const std::vector<int>*> todo;
+  std::vector<const std::vector<int>*> buckets_in_reach;
   const int reach =
       static_cast<int>(std::ceil(options.max_range / bucket_size_));
   const CellKey center = CellOf(origin, bucket_size_);
   for (int dx = -reach; dx <= reach; ++dx) {
     for (int dy = -reach; dy <= reach; ++dy) {
-      const auto it = buckets_.find({center.x + dx, center.y + dy});
-      if (it != buckets_.end()) todo.push_back(&it->second);
+      const auto bucket = buckets_.find({center.x + dx, center.y + dy});
+      if (bucket != buckets_.end()) buckets_in_reach.push_back(&bucket->second);
     }
   }
+  const int64_t bucket_count = static_cast<int64_t>(buckets_in_reach.size());
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
-  for (int64_t b = 0; b < static_cast<int64_t>(todo.size()); ++b) {
+  for (int64_t bucket = 0; bucket < bucket_count; ++bucket) {
     // Each map point lives in exactly one bucket: no write conflicts.
-    for (int i : *todo[static_cast<size_t>(b)]) {
-      const size_t ii = static_cast<size_t>(i);
-      const Vec3 p = lidar_from_world * map_[ii];
-      const double r = p.norm();
-      if (r < 1.0 || r > options.max_range) continue;
-      int u = 0;
-      int v = 0;
-      if (!image.Bin(p, r, u, v)) continue;
-      const size_t index = image.Index(u, v);
-      const float own = image.nearest(index);
-      if (!std::isfinite(own)) continue;  // No return there: no evidence.
-      const double margin = options.margin_abs + options.margin_rel * r;
-      if (std::abs(own - r) <= margin) {
-        ++counts.seen[ii];
+    for (int point_index : *buckets_in_reach[static_cast<size_t>(bucket)]) {
+      const size_t index = static_cast<size_t>(point_index);
+      const Vec3 point = lidar_from_world * map_[index];
+      const double range = point.norm();
+      if (range < kMinPointRange || range > options.max_range) continue;
+      int column = 0;
+      int row = 0;
+      if (!image.Bin(point, range, column, row)) continue;
+      const size_t bin = image.Index(column, row);
+      const float measured = image.nearest(bin);
+      if (!std::isfinite(measured)) continue;  // No return there: no evidence.
+      const double margin = options.margin_abs + options.margin_rel * range;
+      if (std::abs(measured - range) <= margin) {
+        ++counts.seen[index];
         continue;
       }
       // Occluded: something at or before the point.
-      if (image.neighbourhood_min(index) <= r + margin) continue;
-      const Vec3 direction = (map_[ii] - origin) / r;
-      if (std::abs(normals_[ii].dot(direction)) < options.min_cos) continue;
-      ++counts.through[ii];
+      if (image.neighbourhood_min(bin) <= range + margin) continue;
+      const Vec3 direction = (map_[index] - origin) / range;
+      if (std::abs(normals_[index].dot(direction)) < options.min_cos) continue;
+      ++counts.through[index];
     }
   }
 }

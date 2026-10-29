@@ -14,7 +14,8 @@
 namespace gr {
 namespace {
 
-// Gauss-Newton normal equations accumulated over correspondences.
+// Gauss-Newton normal equations accumulated over correspondences: J^T J,
+// J^T r, the sum of squared residuals and the number of residuals.
 struct NormalEquations {
   Mat6 jtj = Mat6::Zero();
   Vec6 jtr = Vec6::Zero();
@@ -39,6 +40,24 @@ struct CachedPlane {
 
 using PlaneCache = std::unordered_map<VoxelKey, CachedPlane, VoxelKeyHash>;
 
+// Radii up to this much beyond the largest one are still tried (m).
+constexpr double kRadiusTolerance = 1e-9;
+// Residual models are cached per cell of half the plane radius.
+constexpr double kCacheCellsPerRadius = 2.0;
+// Positions of SelfAdjointEigenSolver's eigenvalues (ascending).
+constexpr int kSmallest = 0;
+constexpr int kMiddle = 1;
+constexpr int kLargest = 2;
+// Neighbourhoods with a smaller largest eigenvalue (m^2) have no spread.
+constexpr double kMinSpread = 1e-12;
+// AlignMultiScale: the source is downsampled to half the gate, the robust
+// kernel is a third of it, and the final statistics use a gate of two
+// voxels when the schedule is empty. Its maps keep 30 points per voxel.
+constexpr double kSourceVoxelDivisor = 2.0;
+constexpr double kKernelDivisor = 3.0;
+constexpr double kDefaultFinestGateVoxels = 2.0;
+constexpr int kMultiScalePointsPerVoxel = 30;
+
 // Residual model of the map around `point`: grows the neighbourhood until it
 // is planar, because sparse sweeps sample flat surfaces as rings that are far
 // apart and small radii see only lines.
@@ -47,7 +66,7 @@ CachedPlane ClassifyNeighbourhood(const VoxelHashMap& map, const Vec3& point,
                                   const IcpOptions& options) {
   CachedPlane plane;
   const double max_radius = std::max(plane_radius, options.max_plane_radius);
-  for (double radius = plane_radius; radius <= max_radius + 1e-9;
+  for (double radius = plane_radius; radius <= max_radius + kRadiusTolerance;
        radius *= 2.0) {
     const std::optional<VoxelHashMap::LocalPlane> local = map.FitLocalPlane(
         point, radius, options.min_plane_points, options.exclude_frame);
@@ -85,98 +104,107 @@ constexpr int kBlockSize = 256;
 // cache, too, is the same for any number of threads.
 NormalEquations Linearize(const Points& source, const VoxelHashMap& map,
                           const Pose& pose, const IcpOptions& options,
-                          bool robust, PlaneCache& cache) {
-  const int n = static_cast<int>(source.size());
-  const double k = options.kernel;
+                          bool robust, PlaneCache* cache) {
+  const int point_count = static_cast<int>(source.size());
+  const double kernel = options.kernel;
   const double plane_radius =
       options.plane_radius > 0.0 ? options.plane_radius : map.voxel_size();
-  const double inv_cache_cell = 2.0 / plane_radius;
-  const bool parallel = options.parallel;
-  auto weight = [&](double r2) {
+  const double inverse_cache_cell = kCacheCellsPerRadius / plane_radius;
+  [[maybe_unused]] const bool parallel = options.parallel;
+  // Geman-McClure: k^2 / (k + r^2)^2.
+  auto weight = [&](double squared_residual) {
     if (!robust) return 1.0;
-    const double s = k + r2;
-    return (k * k) / (s * s);
+    const double denominator = kernel + squared_residual;
+    return (kernel * kernel) / (denominator * denominator);
   };
-  std::vector<Vec3> world(static_cast<size_t>(n));
+  std::vector<Vec3> world(static_cast<size_t>(point_count));
   std::vector<std::optional<VoxelHashMap::Neighbor>> nearest(
-      static_cast<size_t>(n));
+      static_cast<size_t>(point_count));
   std::vector<VoxelKey> keys(options.point_to_plane ? world.size() : 0);
   std::vector<uint8_t> cached(keys.size(), 0);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (parallel)
 #endif
-  for (int i = 0; i < n; ++i) {
-    const size_t u = static_cast<size_t>(i);
-    world[u] = pose * source[u];
-    nearest[u] = map.Nearest(world[u], options.max_corr_dist,
-                             options.exclude_frame, options.max_search_voxels);
-    if (!nearest[u] || keys.empty()) continue;
-    keys[u] = VoxelOf(nearest[u]->point, inv_cache_cell);
-    cached[u] = cache.count(keys[u]) > 0;
+  for (int signed_index = 0; signed_index < point_count; ++signed_index) {
+    const size_t index = static_cast<size_t>(signed_index);
+    world[index] = pose * source[index];
+    nearest[index] =
+        map.Nearest(world[index], options.max_corr_dist, options.exclude_frame,
+                    options.max_search_voxels);
+    if (!nearest[index] || keys.empty()) continue;
+    keys[index] = VoxelOf(nearest[index]->point, inverse_cache_cell);
+    cached[index] = cache->count(keys[index]) > 0;
   }
   if (!keys.empty()) {
     std::vector<std::pair<VoxelKey, Vec3>> fresh;
     std::unordered_set<VoxelKey, VoxelKeyHash> seen;
-    for (size_t u = 0; u < keys.size(); ++u) {
-      if (!nearest[u] || cached[u]) continue;
-      if (seen.insert(keys[u]).second) {
-        fresh.emplace_back(keys[u], nearest[u]->point);
+    for (size_t index = 0; index < keys.size(); ++index) {
+      if (!nearest[index] || cached[index]) continue;
+      if (seen.insert(keys[index]).second) {
+        fresh.emplace_back(keys[index], nearest[index]->point);
       }
     }
     std::vector<CachedPlane> planes(fresh.size());
     const int num_fresh = static_cast<int>(fresh.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 16) if (parallel)
+    constexpr int kClassifyChunk = 16;  // Neighbourhoods per work chunk.
+#pragma omp parallel for schedule(dynamic, kClassifyChunk) if (parallel)
 #endif
-    for (int f = 0; f < num_fresh; ++f) {
-      const size_t v = static_cast<size_t>(f);
-      planes[v] =
-          ClassifyNeighbourhood(map, fresh[v].second, plane_radius, options);
+    for (int signed_cell = 0; signed_cell < num_fresh; ++signed_cell) {
+      const size_t cell = static_cast<size_t>(signed_cell);
+      planes[cell] =
+          ClassifyNeighbourhood(map, fresh[cell].second, plane_radius, options);
     }
-    for (size_t v = 0; v < fresh.size(); ++v) {
-      cache.emplace(fresh[v].first, planes[v]);
+    for (size_t cell = 0; cell < fresh.size(); ++cell) {
+      cache->emplace(fresh[cell].first, planes[cell]);
     }
   }
-  auto accumulate = [&](size_t u, NormalEquations& acc) {
-    if (!nearest[u]) return;
-    const Vec3& world_point = world[u];
-    Eigen::Matrix<double, 3, 6> jacobian;
-    jacobian.block<3, 3>(0, 0) = Mat3::Identity();
-    jacobian.block<3, 3>(0, 3) = -Hat(world_point);
+  auto accumulate = [&](size_t index, NormalEquations& sums) {
+    if (!nearest[index]) return;
+    const Vec3& world_point = world[index];
+    // d(world point) / d(left perturbation [t, phi]).
+    Eigen::Matrix<double, kSpaceDim, kPoseDim> jacobian;
+    jacobian.block<kSpaceDim, kSpaceDim>(0, kTranslationOffset) =
+        Mat3::Identity();
+    jacobian.block<kSpaceDim, kSpaceDim>(0, kRotationOffset) =
+        -Hat(world_point);
     if (options.point_to_plane) {
-      const CachedPlane& plane = cache.at(keys[u]);
+      const CachedPlane& plane = cache->at(keys[index]);
       if (plane.type == ResidualType::kSkip) return;
       if (plane.type == ResidualType::kPointToPlane) {
-        const double r = plane.normal.dot(world_point - plane.centroid);
-        const Eigen::Matrix<double, 1, 6> jp =
+        const double residual = plane.normal.dot(world_point - plane.centroid);
+        const Eigen::Matrix<double, 1, kPoseDim> plane_jacobian =
             plane.normal.transpose() * jacobian;
-        const double w = weight(r * r);
-        acc.jtj.noalias() += w * jp.transpose() * jp;
-        acc.jtr.noalias() += w * jp.transpose() * r;
-        acc.sse += r * r;
-        acc.count += 1;
+        const double residual_weight = weight(residual * residual);
+        sums.jtj.noalias() +=
+            residual_weight * plane_jacobian.transpose() * plane_jacobian;
+        sums.jtr.noalias() +=
+            residual_weight * plane_jacobian.transpose() * residual;
+        sums.sse += residual * residual;
+        sums.count += 1;
         return;
       }
     }
     const double point_scale =
         options.point_to_plane ? options.point_weight : 1.0;
     if (point_scale <= 0.0) return;
-    const Vec3 r = world_point - nearest[u]->point;
-    const double w = point_scale * weight(r.squaredNorm());
-    acc.jtj.noalias() += w * jacobian.transpose() * jacobian;
-    acc.jtr.noalias() += w * jacobian.transpose() * r;
-    acc.sse += r.squaredNorm();
-    acc.count += 1;
+    const Vec3 residual = world_point - nearest[index]->point;
+    const double residual_weight = point_scale * weight(residual.squaredNorm());
+    sums.jtj.noalias() += residual_weight * jacobian.transpose() * jacobian;
+    sums.jtr.noalias() += residual_weight * jacobian.transpose() * residual;
+    sums.sse += residual.squaredNorm();
+    sums.count += 1;
   };
-  const int num_blocks = (n + kBlockSize - 1) / kBlockSize;
+  const int num_blocks = (point_count + kBlockSize - 1) / kBlockSize;
   std::vector<NormalEquations> blocks(static_cast<size_t>(num_blocks));
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (parallel)
 #endif
-  for (int b = 0; b < num_blocks; ++b) {
-    const int end = std::min(n, (b + 1) * kBlockSize);
-    for (int i = b * kBlockSize; i < end; ++i) {
-      accumulate(static_cast<size_t>(i), blocks[static_cast<size_t>(b)]);
+  for (int block = 0; block < num_blocks; ++block) {
+    const int end = std::min(point_count, (block + 1) * kBlockSize);
+    for (int index = block * kBlockSize; index < end; ++index) {
+      accumulate(static_cast<size_t>(index),
+                 blocks[static_cast<size_t>(block)]);
     }
   }
   NormalEquations total;
@@ -189,34 +217,35 @@ NormalEquations Linearize(const Points& source, const VoxelHashMap& map,
 VoxelHashMap::VoxelHashMap(double voxel_size, double max_distance,
                            int max_points_per_voxel)
     : voxel_size_(voxel_size),
-      inv_voxel_size_(1.0 / voxel_size),
+      inverse_voxel_size_(1.0 / voxel_size),
       max_distance_(max_distance),
       max_points_per_voxel_(max_points_per_voxel) {}
 
 size_t VoxelHashMap::CountPoints() const {
-  size_t n = 0;
-  for (const auto& [key, block] : map_) n += block.points.size();
-  return n;
+  size_t count = 0;
+  for (const auto& [key, block] : map_) count += block.points.size();
+  return count;
 }
 
 void VoxelHashMap::AddPoints(const Points& points, int frame_id) {
-  for (const Vec3& p : points) {
-    Block& block = map_[VoxelOf(p, inv_voxel_size_)];
+  for (const Vec3& point : points) {
+    Block& block = map_[VoxelOf(point, inverse_voxel_size_)];
     if (static_cast<int>(block.points.size()) < max_points_per_voxel_) {
-      block.points.push_back(p);
+      block.points.push_back(point);
       block.frames.push_back(frame_id);
     }
   }
 }
 
 void VoxelHashMap::RemoveFar(const Vec3& origin) {
-  const double max2 = max_distance_ * max_distance_;
-  for (auto it = map_.begin(); it != map_.end();) {
-    if (it->second.points.empty() ||
-        (it->second.points.front() - origin).squaredNorm() > max2) {
-      it = map_.erase(it);
+  const double squared_max_distance = max_distance_ * max_distance_;
+  for (auto voxel = map_.begin(); voxel != map_.end();) {
+    if (voxel->second.points.empty() ||
+        (voxel->second.points.front() - origin).squaredNorm() >
+            squared_max_distance) {
+      voxel = map_.erase(voxel);
     } else {
-      ++it;
+      ++voxel;
     }
   }
 }
@@ -233,25 +262,26 @@ Points VoxelHashMap::PointCloud() const {
 std::optional<VoxelHashMap::Neighbor> VoxelHashMap::Nearest(
     const Vec3& query, double max_distance, int exclude_frame,
     int max_search_voxels) const {
-  const VoxelKey center = VoxelOf(query, inv_voxel_size_);
-  const int reach =
-      std::clamp(static_cast<int>(std::ceil(max_distance * inv_voxel_size_)), 1,
-                 std::max(1, max_search_voxels));
+  const VoxelKey center = VoxelOf(query, inverse_voxel_size_);
+  const int reach = std::clamp(
+      static_cast<int>(std::ceil(max_distance * inverse_voxel_size_)), 1,
+      std::max(1, max_search_voxels));
   double best = max_distance * max_distance;
   std::optional<Neighbor> nearest;
   for (int dx = -reach; dx <= reach; ++dx) {
     for (int dy = -reach; dy <= reach; ++dy) {
       for (int dz = -reach; dz <= reach; ++dz) {
-        const auto it =
+        const auto voxel =
             map_.find({center.x + dx, center.y + dy, center.z + dz});
-        if (it == map_.end()) continue;
-        const Block& block = it->second;
+        if (voxel == map_.end()) continue;
+        const Block& block = voxel->second;
         for (size_t k = 0; k < block.points.size(); ++k) {
           if (exclude_frame >= 0 && block.frames[k] == exclude_frame) continue;
-          const double d2 = (block.points[k] - query).squaredNorm();
-          if (d2 < best) {
-            best = d2;
-            nearest = Neighbor{block.points[k], d2};
+          const double squared_distance =
+              (block.points[k] - query).squaredNorm();
+          if (squared_distance < best) {
+            best = squared_distance;
+            nearest = Neighbor{block.points[k], squared_distance};
           }
         }
       }
@@ -262,45 +292,47 @@ std::optional<VoxelHashMap::Neighbor> VoxelHashMap::Nearest(
 
 std::optional<VoxelHashMap::LocalPlane> VoxelHashMap::FitLocalPlane(
     const Vec3& query, double radius, int min_points, int exclude_frame) const {
-  const VoxelKey center = VoxelOf(query, inv_voxel_size_);
+  const VoxelKey center = VoxelOf(query, inverse_voxel_size_);
   const int reach =
-      std::max(1, static_cast<int>(std::ceil(radius * inv_voxel_size_)));
-  const double r2 = radius * radius;
+      std::max(1, static_cast<int>(std::ceil(radius * inverse_voxel_size_)));
+  const double squared_radius = radius * radius;
   Vec3 sum = Vec3::Zero();
   Mat3 outer = Mat3::Zero();
-  int n = 0;
+  int count = 0;
   for (int dx = -reach; dx <= reach; ++dx) {
     for (int dy = -reach; dy <= reach; ++dy) {
       for (int dz = -reach; dz <= reach; ++dz) {
-        const auto it =
+        const auto voxel =
             map_.find({center.x + dx, center.y + dy, center.z + dz});
-        if (it == map_.end()) continue;
-        const Block& block = it->second;
+        if (voxel == map_.end()) continue;
+        const Block& block = voxel->second;
         for (size_t k = 0; k < block.points.size(); ++k) {
           if (exclude_frame >= 0 && block.frames[k] == exclude_frame) continue;
-          const Vec3& p = block.points[k];
-          if ((p - query).squaredNorm() > r2) continue;
-          sum += p;
-          outer.noalias() += p * p.transpose();
-          ++n;
+          const Vec3& point = block.points[k];
+          if ((point - query).squaredNorm() > squared_radius) continue;
+          sum += point;
+          outer.noalias() += point * point.transpose();
+          ++count;
         }
       }
     }
   }
-  if (n < min_points) return std::nullopt;
+  if (count < min_points) return std::nullopt;
   LocalPlane plane;
-  plane.centroid = sum / n;
+  plane.centroid = sum / count;
   const Mat3 covariance =
-      outer / n - plane.centroid * plane.centroid.transpose();
+      outer / count - plane.centroid * plane.centroid.transpose();
   Eigen::SelfAdjointEigenSolver<Mat3> solver(covariance);
   if (solver.info() != Eigen::Success) return std::nullopt;
-  const Vec3 eigenvalues = solver.eigenvalues();  // Ascending.
-  if (eigenvalues[2] <= 1e-12) return std::nullopt;
-  plane.normal = solver.eigenvectors().col(0).normalized();
+  const Vec3 eigenvalues = solver.eigenvalues();
+  if (eigenvalues[kLargest] <= kMinSpread) return std::nullopt;
+  plane.normal = solver.eigenvectors().col(kSmallest).normalized();
   plane.planarity =
-      (eigenvalues[1] - std::max(eigenvalues[0], 0.0)) / eigenvalues[2];
-  plane.linearity = (eigenvalues[2] - eigenvalues[1]) / eigenvalues[2];
-  plane.thickness = std::sqrt(std::max(eigenvalues[0], 0.0));
+      (eigenvalues[kMiddle] - std::max(eigenvalues[kSmallest], 0.0)) /
+      eigenvalues[kLargest];
+  plane.linearity =
+      (eigenvalues[kLargest] - eigenvalues[kMiddle]) / eigenvalues[kLargest];
+  plane.thickness = std::sqrt(std::max(eigenvalues[kSmallest], 0.0));
   return plane;
 }
 
@@ -311,27 +343,31 @@ IcpResult AlignToMap(const Points& source, const VoxelHashMap& map,
   if (source.empty() || map.empty()) return result;
   PlaneCache cache;
   for (int iteration = 0; iteration < options.max_iters; ++iteration) {
-    const NormalEquations eq =
-        Linearize(source, map, result.pose, options, true, cache);
+    const NormalEquations equations =
+        Linearize(source, map, result.pose, options, true, &cache);
     result.iterations = iteration + 1;
-    if (eq.count < 6) break;
-    const Vec6 dx = eq.jtj.ldlt().solve(-eq.jtr);
-    if (!dx.allFinite()) break;
-    result.pose = Pose(So3Exp(dx.tail<3>()), dx.head<3>()) * result.pose;
+    // Fewer residuals than pose degrees of freedom constrain nothing.
+    if (equations.count < kPoseDim) break;
+    const Vec6 step = equations.jtj.ldlt().solve(-equations.jtr);
+    if (!step.allFinite()) break;
+    result.pose = Pose(So3Exp(step.segment<kSpaceDim>(kRotationOffset)),
+                       step.segment<kSpaceDim>(kTranslationOffset)) *
+                  result.pose;
     result.pose.Normalize();
-    if (dx.norm() < options.conv_eps) {
+    if (step.norm() < options.conv_eps) {
       result.converged = true;
       break;
     }
   }
-  const NormalEquations final_eq =
-      Linearize(source, map, result.pose, options, false, cache);
-  result.inliers = final_eq.count;
-  result.fitness =
-      static_cast<double>(final_eq.count) / static_cast<double>(source.size());
-  result.rmse =
-      final_eq.count > 0 ? std::sqrt(final_eq.sse / final_eq.count) : 0.0;
-  result.hessian = final_eq.jtj;
+  const NormalEquations final_equations =
+      Linearize(source, map, result.pose, options, false, &cache);
+  result.inliers = final_equations.count;
+  result.fitness = static_cast<double>(final_equations.count) /
+                   static_cast<double>(source.size());
+  result.rmse = final_equations.count > 0
+                    ? std::sqrt(final_equations.sse / final_equations.count)
+                    : 0.0;
+  result.hessian = final_equations.jtj;
   return result;
 }
 
@@ -344,21 +380,24 @@ IcpResult AlignMultiScale(const Points& source, const Points& target,
   options.parallel = parallel;
   Pose pose = initial_guess;
   for (double gate : schedule) {
-    VoxelHashMap map(std::max(base_voxel, gate), 1e9, 30);
+    VoxelHashMap map(std::max(base_voxel, gate), VoxelHashMap::kUnbounded,
+                     kMultiScalePointsPerVoxel);
     map.AddPoints(target);
-    const Points coarse =
-        VoxelDownsample(source, std::max(base_voxel, gate / 2.0));
+    const Points coarse = VoxelDownsample(
+        source, std::max(base_voxel, gate / kSourceVoxelDivisor));
     options.max_corr_dist = gate;
-    options.kernel = gate / 3.0;
+    options.kernel = gate / kKernelDivisor;
     options.max_iters = max_iterations;
     pose = AlignToMap(coarse, map, pose, options).pose;
   }
-  const double finest = schedule.empty() ? 2.0 * base_voxel : schedule.back();
-  VoxelHashMap map(base_voxel, 1e9, 30);
+  const double finest = schedule.empty() ? kDefaultFinestGateVoxels * base_voxel
+                                         : schedule.back();
+  VoxelHashMap map(base_voxel, VoxelHashMap::kUnbounded,
+                   kMultiScalePointsPerVoxel);
   map.AddPoints(target);
   options.max_corr_dist = finest;
-  options.kernel = finest / 3.0;
-  options.max_iters = 0;
+  options.kernel = finest / kKernelDivisor;
+  options.max_iters = 0;  // Statistics only.
   return AlignToMap(source, map, pose, options);
 }
 

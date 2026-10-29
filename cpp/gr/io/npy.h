@@ -16,10 +16,10 @@
 namespace gr {
 
 struct NpyArray {
-  char kind = 'f';    // 'f' float, 'i' signed, 'u' unsigned, 'b' bool.
-  int item_size = 8;  // Bytes per element.
-  std::vector<int64_t> shape;  // Empty: a scalar.
-  std::vector<uint8_t> data;   // Little-endian, C order.
+  char kind = 'f';  // 'f' float, 'i' signed, 'u' unsigned, 'b' bool.
+  int item_size = sizeof(double);  // Bytes per element.
+  std::vector<int64_t> shape;      // Empty: a scalar.
+  std::vector<uint8_t> data;       // Little-endian, C order.
 
   int64_t size() const;  // Number of elements.
   int64_t rows() const { return shape.empty() ? 1 : shape[0]; }
@@ -39,8 +39,7 @@ struct NpyArray {
                            std::vector<int64_t> shape);
   // Any arithmetic element type: <f8, <i2, <u1, ... as its C++ type.
   template <typename T>
-  static NpyArray Of(const std::vector<T>& values,
-                     std::vector<int64_t> shape);
+  static NpyArray Of(const std::vector<T>& values, std::vector<int64_t> shape);
   // float16, rounded to nearest even (numpy's astype(np.float16)).
   static NpyArray FromHalfs(const std::vector<float>& values,
                             std::vector<int64_t> shape);
@@ -54,18 +53,20 @@ NpyArray NpyArray::Of(const std::vector<T>& values,
                       std::vector<int64_t> shape) {
   static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>,
                 "NpyArray::Of: arithmetic element types (not bool)");
-  NpyArray a;
-  a.kind = std::is_floating_point_v<T> ? 'f'
-           : std::is_signed_v<T>       ? 'i'
-                                       : 'u';
-  a.item_size = static_cast<int>(sizeof(T));
-  a.shape = std::move(shape);
-  if (a.size() != static_cast<int64_t>(values.size())) {
+  NpyArray array;
+  array.kind = std::is_floating_point_v<T> ? 'f'
+               : std::is_signed_v<T>       ? 'i'
+                                           : 'u';
+  array.item_size = static_cast<int>(sizeof(T));
+  array.shape = std::move(shape);
+  if (array.size() != static_cast<int64_t>(values.size())) {
     throw std::runtime_error("NpyArray::Of: shape mismatch");
   }
-  a.data.resize(values.size() * sizeof(T));
-  if (!values.empty()) std::memcpy(a.data.data(), values.data(), a.data.size());
-  return a;
+  array.data.resize(values.size() * sizeof(T));
+  if (!values.empty()) {
+    std::memcpy(array.data.data(), values.data(), array.data.size());
+  }
+  return array;
 }
 
 // Member name (without .npy) -> array.

@@ -33,13 +33,26 @@ std::vector<T> Flat(const py::object& image, int& width, int& height,
   return std::vector<T>(array.data(), array.data() + array.size());
 }
 
+// Fields of the Python tuples the bindings take.
+constexpr size_t kTrafficEdgeFields = 5;  // (a, b, level, drivable, points)
+constexpr size_t kArrowFields = 3;        // (level, center, direction)
+constexpr size_t kPathFields = 2;         // (level, points)
+constexpr size_t kSignFields = 4;         // (level, xy, kind, facing)
+constexpr size_t kLaneSlotFields = 4;     // (row, corners, z, width)
+constexpr size_t kWallFields = 3;         // (p0, p1, thickness)
+constexpr size_t kLayerSlotFields = 2;    // (index, corners)
+// Sign facings shorter than this have no direction.
+constexpr double kMinFacingNorm = 1e-9;
+// cv2.fillPoly takes at most this many fractional bits (XY_SHIFT).
+constexpr int kMaxFractionBits = 16;
+
 py::array_t<double> Vec2Array(const std::vector<Vec2>& points) {
   py::array_t<double> out({static_cast<py::ssize_t>(points.size()),
-                           py::ssize_t{2}});
-  auto o = out.mutable_unchecked<2>();
+                           py::ssize_t{kPlaneDim}});
+  auto rows = out.mutable_unchecked<2>();
   for (size_t i = 0; i < points.size(); ++i) {
-    o(static_cast<py::ssize_t>(i), 0) = points[i].x();
-    o(static_cast<py::ssize_t>(i), 1) = points[i].y();
+    rows(static_cast<py::ssize_t>(i), 0) = points[i].x();
+    rows(static_cast<py::ssize_t>(i), 1) = points[i].y();
   }
   return out;
 }
@@ -84,68 +97,79 @@ void BindNav(py::module_& m) {
       [](const py::list& edges, const py::list& arrows,
          const TrafficConfig& config, const py::list& paths,
          const py::list& signs) {
-        std::vector<TrafficEdge> e;
+        std::vector<TrafficEdge> traffic_edges;
         for (const py::handle& item : edges) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 5,
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kTrafficEdgeFields,
                   "edges are (a, b, level, drivable, (M, 2) points)");
-          e.push_back({t[0].cast<int>(), t[1].cast<int>(), t[2].cast<int>(),
-                       t[3].cast<bool>(), PolylineFrom(t[4])});
+          traffic_edges.push_back({tuple[0].cast<int>(), tuple[1].cast<int>(),
+                                   tuple[2].cast<int>(), tuple[3].cast<bool>(),
+                                   PolylineFrom(tuple[4])});
         }
-        std::vector<TrafficArrow> a;
+        std::vector<TrafficArrow> traffic_arrows;
         for (const py::handle& item : arrows) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 3, "arrows are (level, center, direction)");
-          a.push_back({t[0].cast<int>(), t[1].cast<Vec2>(),
-                       t[2].cast<Vec2>().normalized()});
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kArrowFields,
+                  "arrows are (level, center, direction)");
+          traffic_arrows.push_back({tuple[0].cast<int>(), tuple[1].cast<Vec2>(),
+                       tuple[2].cast<Vec2>().normalized()});
         }
-        std::vector<DrivenPath> d;
+        std::vector<DrivenPath> driven_paths;
         for (const py::handle& item : paths) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 2, "paths are (level, (N, 2) points)");
-          d.push_back({t[0].cast<int>(), PolylineFrom(t[1])});
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kPathFields,
+                  "paths are (level, (N, 2) points)");
+          driven_paths.push_back(
+              {tuple[0].cast<int>(), PolylineFrom(tuple[1])});
         }
-        std::vector<TrafficSign> s;
+        std::vector<TrafficSign> traffic_signs;
         for (const py::handle& item : signs) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 4,
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kSignFields,
                   "signs are (level, xy, 'no_entry' | 'one_way', facing)");
           TrafficSign sign;
-          sign.level = t[0].cast<int>();
-          sign.xy = t[1].cast<Vec2>();
-          const std::string kind = t[2].cast<std::string>();
+          sign.level = tuple[0].cast<int>();
+          sign.xy = tuple[1].cast<Vec2>();
+          const std::string kind = tuple[2].cast<std::string>();
           Require(kind == "no_entry" || kind == "one_way",
                   "sign kinds are no_entry and one_way");
           sign.kind = kind == "no_entry" ? TrafficSign::Kind::kNoEntry
                                          : TrafficSign::Kind::kOneWay;
-          if (!t[3].is_none()) {
-            const Vec2 facing = t[3].cast<Vec2>();
-            if (facing.norm() > 1e-9) sign.facing = facing.normalized();
+          if (!tuple[3].is_none()) {
+            const Vec2 facing = tuple[3].cast<Vec2>();
+            if (facing.norm() > kMinFacingNorm) {
+              sign.facing = facing.normalized();
+            }
           }
-          s.push_back(sign);
+          traffic_signs.push_back(sign);
         }
         const std::vector<ArrowAssignment> assigned =
-            AssignArrows(e, a, config);
+            AssignArrows(traffic_edges, traffic_arrows, config);
         int count = 0;
-        for (const ArrowAssignment& x : assigned) count += x.edge >= 0;
+        for (const ArrowAssignment& assignment : assigned) {
+          count += assignment.edge != ArrowAssignment::kNoEdge;
+        }
         static const char* const kVerdict[] = {
             "two-way", "two-way (one lane seen)", "unknown (one arrow)",
             "one-way", "one-way (driven)", "one-way (sign)",
             "two-way (conflicting evidence)"};
         py::list corridors;
-        for (const Corridor& c : DecideTraffic(e, a, config, d, s)) {
+        for (const Corridor& corridor :
+             DecideTraffic(traffic_edges, traffic_arrows, config, driven_paths,
+                           traffic_signs)) {
           py::list steps;
-          for (const CorridorStep& s : c.steps) {
-            steps.append(py::make_tuple(s.edge, s.forward));
+          for (const CorridorStep& step : corridor.steps) {
+            steps.append(py::make_tuple(step.edge, step.forward));
           }
           corridors.append(py::dict(
-              "steps"_a = steps, "level"_a = c.level, "length"_a = c.length,
-              "arrows"_a = c.arrows, "passes_along"_a = c.passes_along,
-              "passes_against"_a = c.passes_against,
-              "no_entry_signs"_a = c.no_entry_signs,
-              "one_way_signs"_a = c.one_way_signs,
-              "verdict"_a = kVerdict[static_cast<int>(c.verdict)],
-              "travel"_a = c.travel));
+              "steps"_a = steps, "level"_a = corridor.level,
+              "length"_a = corridor.length, "arrows"_a = corridor.arrows,
+              "passes_along"_a = corridor.passes_along,
+              "passes_against"_a = corridor.passes_against,
+              "no_entry_signs"_a = corridor.no_entry_signs,
+              "one_way_signs"_a = corridor.one_way_signs,
+              "verdict"_a = kVerdict[static_cast<int>(corridor.verdict)],
+              "travel"_a = corridor.travel));
         }
         return py::make_tuple(count, corridors);
       },
@@ -185,18 +209,20 @@ void BindNav(py::module_& m) {
          const py::list& drives) {
         Require(navigable.ndim() == 2, "navigable is an (H, W) mask");
         Require(res > 0.0, "res must be positive");
-        std::vector<LaneSlot> s;
+        std::vector<LaneSlot> lane_slots;
         for (const py::handle& item : slots) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 4, "slots are (row, (4, 2) corners, z, width)");
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kLaneSlotFields,
+                  "slots are (row, (4, 2) corners, z, width)");
           LaneSlot slot;
-          slot.row = t[0].cast<std::string>();
-          const std::vector<Vec2> corners = PolylineFrom(t[1]);
-          Require(corners.size() == 4, "a slot has four corners");
-          for (int k = 0; k < 4; ++k) slot.corners[k] = corners[k];
-          slot.z = t[2].cast<double>();
-          slot.width = t[3].cast<double>();
-          s.push_back(slot);
+          slot.row = tuple[0].cast<std::string>();
+          const std::vector<Vec2> corners = PolylineFrom(tuple[1]);
+          Require(corners.size() == kParkingSlotCorners,
+                  "a slot has four corners");
+          std::copy(corners.begin(), corners.end(), slot.corners.begin());
+          slot.z = tuple[2].cast<double>();
+          slot.width = tuple[3].cast<double>();
+          lane_slots.push_back(slot);
         }
         const auto mask =
             py::array_t<uint8_t, py::array::c_style | py::array::forcecast>(
@@ -208,26 +234,29 @@ void BindNav(py::module_& m) {
         for (const py::handle& item : skeleton) {
           lines.push_back(PolylineFrom(item));
         }
-        std::vector<LaneWall> w;
+        std::vector<LaneWall> lane_walls;
         for (const py::handle& item : walls) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 3, "walls are (p0, p1, thickness)");
-          w.push_back({t[0].cast<Vec2>(), t[1].cast<Vec2>(),
-                       t[2].cast<double>()});
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kWallFields, "walls are (p0, p1, thickness)");
+          lane_walls.push_back({tuple[0].cast<Vec2>(), tuple[1].cast<Vec2>(),
+                       tuple[2].cast<double>()});
         }
-        std::vector<std::vector<Vec2>> d;
-        for (const py::handle& item : drives) d.push_back(PolylineFrom(item));
+        std::vector<std::vector<Vec2>> drive_paths;
+        for (const py::handle& item : drives)
+          drive_paths.push_back(PolylineFrom(item));
         LanePlan plan;
         {
           py::gil_scoped_release release;
-          plan = PlanLanes(s, cells, frame, lines, config, w, d);
+          plan = PlanLanes(lane_slots, cells, frame, lines, config, lane_walls,
+                           drive_paths);
         }
         py::list lanes;
         for (const auto& lane : plan.lanes) {
-          RowMatX2d xy(2, 2);
-          xy.row(0) = lane[0].transpose();
-          xy.row(1) = lane[1].transpose();
-          lanes.append(xy);
+          RowMatX2d ends(kLineEnds, kPlaneDim);
+          for (int end = 0; end < kLineEnds; ++end) {
+            ends.row(end) = lane[end].transpose();
+          }
+          lanes.append(ends);
         }
         return py::dict("rows"_a = plan.rows, "walls"_a = plan.walls,
                         "drives"_a = plan.drives,
@@ -247,15 +276,15 @@ void BindNav(py::module_& m) {
       "covered_by_lanes",
       [](const py::list& edges, const py::list& lanes,
          const LaneConfig& config) {
-        std::vector<std::array<Vec2, 2>> l;
+        std::vector<LaneLine> lane_ends;
         for (const py::handle& item : lanes) {
-          const std::vector<Vec2> p = PolylineFrom(item);
-          Require(p.size() == 2, "a lane is (2, 2)");
-          l.push_back({p[0], p[1]});
+          const std::vector<Vec2> ends = PolylineFrom(item);
+          Require(ends.size() == kLineEnds, "a lane is (2, 2)");
+          lane_ends.push_back({ends[0], ends[1]});
         }
         std::vector<bool> out;
         for (const py::handle& item : edges) {
-          out.push_back(CoveredByLanes(PolylineFrom(item), l, config));
+          out.push_back(CoveredByLanes(PolylineFrom(item), lane_ends, config));
         }
         return out;
       },
@@ -288,19 +317,20 @@ void BindNav(py::module_& m) {
         const int width = static_cast<int>(flags.shape(1));
         std::vector<uint8_t> cells(flags.data(),
                                    flags.data() + flags.size());
-        for (uint8_t& c : cells) c = c != 0;
+        for (uint8_t& cell : cells) cell = cell != 0;
         std::vector<FloorArrow> arrows;
         {
           py::gil_scoped_release release;
           arrows = DetectArrows(cells, width, height, res, x0, y0, config);
         }
         py::list out;
-        for (const FloorArrow& a : arrows) {
+        for (const FloorArrow& arrow : arrows) {
           out.append(py::dict(
-              "center"_a = a.center, "direction"_a = a.direction,
-              "tail"_a = a.tail, "tip"_a = a.tip, "length"_a = a.length,
-              "shaft_width"_a = a.shaft_width, "head_width"_a = a.head_width,
-              "area"_a = a.area, "cells"_a = ToArray(a.cells)));
+              "center"_a = arrow.center, "direction"_a = arrow.direction,
+              "tail"_a = arrow.tail, "tip"_a = arrow.tip,
+              "length"_a = arrow.length, "shaft_width"_a = arrow.shaft_width,
+              "head_width"_a = arrow.head_width, "area"_a = arrow.area,
+              "cells"_a = ToArray(arrow.cells)));
         }
         return out;
       },
@@ -314,14 +344,14 @@ void BindNav(py::module_& m) {
       [](const py::object& sources) {
         int width = 0;
         int height = 0;
-        const std::vector<uint8_t> s =
+        const std::vector<uint8_t> source_cells =
             Flat<uint8_t, U8Image>(sources, width, height, "sources");
-        std::vector<float> d;
+        std::vector<float> distance;
         {
           py::gil_scoped_release release;
-          d = DistanceTransform(s, width, height);
+          distance = DistanceTransform(source_cells, width, height);
         }
-        return ToImage(d, height, width);
+        return ToImage(distance, height, width);
       },
       "sources"_a,
       "(H, W) float32: Euclidean distance in cells to the nearest nonzero "
@@ -332,12 +362,12 @@ void BindNav(py::module_& m) {
       [](const py::object& mask) {
         int width = 0;
         int height = 0;
-        const std::vector<uint8_t> s =
+        const std::vector<uint8_t> mask_cells =
             Flat<uint8_t, U8Image>(mask, width, height, "mask");
         std::vector<uint8_t> out;
         {
           py::gil_scoped_release release;
-          out = ThinMask(s, width, height);
+          out = ThinMask(mask_cells, width, height);
         }
         return ToImage(out, height, width);
       },
@@ -348,12 +378,12 @@ void BindNav(py::module_& m) {
       [](const py::object& mask) {
         int width = 0;
         int height = 0;
-        const std::vector<uint8_t> s =
+        const std::vector<uint8_t> mask_cells =
             Flat<uint8_t, U8Image>(mask, width, height, "mask");
         std::vector<uint8_t> out;
         {
           py::gil_scoped_release release;
-          out = Skeletonize(s, width, height);
+          out = Skeletonize(mask_cells, width, height);
         }
         return ToImage(out, height, width);
       },
@@ -368,11 +398,11 @@ void BindNav(py::module_& m) {
          int value) {
         Require(image.ndim() == 2, "image must be (H, W) int32");
         Require(res > 0.0, "res must be positive");
-        const Eigen::MatrixXd p = polygon.cast<Eigen::MatrixXd>();
-        Require(p.cols() >= 2, "polygon must be (N, 2+)");
+        const Eigen::MatrixXd vertices = polygon.cast<Eigen::MatrixXd>();
+        Require(vertices.cols() >= kPlaneDim, "polygon must be (N, 2+)");
         std::vector<Vec2> corners;
-        for (Eigen::Index k = 0; k < p.rows(); ++k) {
-          corners.emplace_back(p(k, 0), p(k, 1));
+        for (Eigen::Index vertex = 0; vertex < vertices.rows(); ++vertex) {
+          corners.emplace_back(vertices(vertex, 0), vertices(vertex, 1));
         }
         Grid2D grid;
         grid.x0 = x0;
@@ -394,15 +424,16 @@ void BindNav(py::module_& m) {
          double max_area) {
         int width = 0;
         int height = 0;
-        const std::vector<uint8_t> k =
+        const std::vector<uint8_t> known_cells =
             Flat<uint8_t, U8Image>(known, width, height, "known");
-        int w2 = 0;
-        int h2 = 0;
-        const std::vector<uint8_t> o =
-            Flat<uint8_t, U8Image>(obstacles, w2, h2, "obstacles");
-        Require(w2 == width && h2 == height,
+        int obstacles_width = 0;
+        int obstacles_height = 0;
+        const std::vector<uint8_t> obstacle_cells = Flat<uint8_t, U8Image>(
+            obstacles, obstacles_width, obstacles_height, "obstacles");
+        Require(obstacles_width == width && obstacles_height == height,
                 "known and obstacles must have the same shape");
-        const Mask out = FillHoles(k, o, width, height, res, max_area);
+        const Mask out = FillHoles(known_cells, obstacle_cells, width, height,
+                                   res, max_area);
         py::array_t<bool> image({height, width});
         std::copy(out.begin(), out.end(), image.mutable_data());
         return image;
@@ -433,7 +464,7 @@ void BindNav(py::module_& m) {
          const py::object& observations, const std::vector<int>& vehicle,
          const std::vector<int>& low, const std::vector<int>& overhead,
          int unlabeled, const std::vector<double>& z, const py::list& grids,
-         const py::list& ramps, int lv, const py::list& slots,
+         const py::list& ramps, int selected_level, const py::list& slots,
          const py::object& path_xy, double x0, double y0, double res,
          int width, int height_cells, const LayerConfig& config) {
         const Points points = PointsFrom(xyz);
@@ -443,37 +474,40 @@ void BindNav(py::module_& m) {
         const Points normal = PointsFrom(normals);
         const std::vector<uint8_t> label = VectorOf<uint8_t>(labels);
         const std::vector<uint16_t> seen = VectorOf<uint16_t>(observations);
-        const size_t n = points.size();
-        Require(levels.size() == n && heights.size() == n &&
-                    label.size() == n &&
-                    (moving.empty() || moving.size() == n) &&
-                    (normal.empty() || normal.size() == n) &&
-                    (seen.empty() || seen.size() == n),
+        const size_t count = points.size();
+        Require(levels.size() == count && heights.size() == count &&
+                    label.size() == count &&
+                    (moving.empty() || moving.size() == count) &&
+                    (normal.empty() || normal.size() == count) &&
+                    (seen.empty() || seen.size() == count),
                 "one level, height and label (and dynamic flag, normal, "
                 "observation count) per point");
         const LevelModel model = LevelModelFrom(z, grids, ramps);
-        RequireIndex(lv >= 0 && lv < model.num_levels(),
+        RequireIndex(selected_level >= 0 && selected_level < model.num_levels(),
                      "level out of range");
         Require(res > 0.0 && width >= 0 && height_cells >= 0, "invalid grid");
         std::vector<LayerSlot> slot_list;
         for (const py::handle& item : slots) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 2, "slots are (index, corners) tuples");
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kLayerSlotFields,
+                  "slots are (index, corners) tuples");
           LayerSlot slot;
-          slot.index = t[0].cast<int>();
-          const Eigen::MatrixXd c = t[1].cast<Eigen::MatrixXd>();
-          Require(c.cols() >= 2, "slot corners must be (N, 2+)");
-          for (Eigen::Index k = 0; k < c.rows(); ++k) {
-            slot.corners.emplace_back(c(k, 0), c(k, 1));
+          slot.index = tuple[0].cast<int>();
+          const Eigen::MatrixXd corner_rows = tuple[1].cast<Eigen::MatrixXd>();
+          Require(corner_rows.cols() >= kPlaneDim,
+                  "slot corners must be (N, 2+)");
+          for (Eigen::Index row = 0; row < corner_rows.rows(); ++row) {
+            slot.corners.emplace_back(corner_rows(row, 0), corner_rows(row, 1));
           }
           slot_list.push_back(std::move(slot));
         }
         std::vector<Vec2> path;
         if (!path_xy.is_none()) {
-          const Eigen::MatrixXd p = path_xy.cast<Eigen::MatrixXd>();
-          Require(p.rows() == 0 || p.cols() >= 2, "path_xy must be (N, 2+)");
-          for (Eigen::Index k = 0; k < p.rows(); ++k) {
-            path.emplace_back(p(k, 0), p(k, 1));
+          const Eigen::MatrixXd path_rows = path_xy.cast<Eigen::MatrixXd>();
+          Require(path_rows.rows() == 0 || path_rows.cols() >= kPlaneDim,
+                  "path_xy must be (N, 2+)");
+          for (Eigen::Index row = 0; row < path_rows.rows(); ++row) {
+            path.emplace_back(path_rows(row, 0), path_rows(row, 1));
           }
         }
         LayerPoints input;
@@ -498,12 +532,12 @@ void BindNav(py::module_& m) {
         LevelLayers layers;
         {
           py::gil_scoped_release release;
-          layers = ComputeLevelLayers(input, classes, model, lv, slot_list,
-                                      path, grid, config);
+          layers = ComputeLevelLayers(input, classes, model, selected_level,
+                                      slot_list, path, grid, config);
         }
-        const auto mask = [&](const Mask& m) {
+        const auto mask = [&](const Mask& layer_mask) {
           py::array_t<bool> image({height_cells, width});
-          std::copy(m.begin(), m.end(), image.mutable_data());
+          std::copy(layer_mask.begin(), layer_mask.end(), image.mutable_data());
           return image;
         };
         py::array floor_z =
@@ -533,15 +567,17 @@ void BindNav(py::module_& m) {
       [](py::array_t<int32_t, py::array::c_style> image,
          const py::object& vertices, int shift, int value) {
         Require(image.ndim() == 2, "image must be (H, W) int32");
-        Require(shift >= 0 && shift <= 16, "shift must be in [0, 16]");
-        const auto v =
+        Require(shift >= 0 && shift <= kMaxFractionBits,
+                "shift must be in [0, 16]");
+        const auto vertex_rows =
             py::array_t<int64_t, py::array::c_style |
                                      py::array::forcecast>::ensure(vertices);
-        Require(v && v.ndim() == 2 && v.shape(1) == 2,
+        Require(vertex_rows && vertex_rows.ndim() == 2 &&
+                    vertex_rows.shape(1) == kPlaneDim,
                 "vertices must be (N, 2) integers");
         std::vector<std::pair<int64_t, int64_t>> points;
-        for (py::ssize_t k = 0; k < v.shape(0); ++k) {
-          points.emplace_back(v.at(k, 0), v.at(k, 1));
+        for (py::ssize_t row = 0; row < vertex_rows.shape(0); ++row) {
+          points.emplace_back(vertex_rows.at(row, 0), vertex_rows.at(row, 1));
         }
         const int height = static_cast<int>(image.shape(0));
         const int width = static_cast<int>(image.shape(1));
@@ -558,20 +594,20 @@ void BindNav(py::module_& m) {
       [](const py::object& skeleton, double min_spur) {
         int width = 0;
         int height = 0;
-        const std::vector<uint8_t> s =
+        const std::vector<uint8_t> skeleton_cells =
             Flat<uint8_t, U8Image>(skeleton, width, height, "skeleton");
         SkeletonGraph graph;
         {
           py::gil_scoped_release release;
-          graph = ExtractSkeletonGraph(s, width, height, min_spur);
+          graph = ExtractSkeletonGraph(skeleton_cells, width, height, min_spur);
         }
         py::list edges;
-        for (const SkeletonEdge& e : graph.edges) {
+        for (const SkeletonEdge& skeleton_edge : graph.edges) {
           py::dict edge;
-          edge["a"] = e.a;
-          edge["b"] = e.b;
-          edge["cells"] = Vec2Array(e.cells);
-          edge["length"] = e.length;
+          edge["a"] = skeleton_edge.start_node;
+          edge["b"] = skeleton_edge.end_node;
+          edge["cells"] = Vec2Array(skeleton_edge.cells);
+          edge["length"] = skeleton_edge.length;
           edges.append(edge);
         }
         py::dict out;
@@ -586,11 +622,11 @@ void BindNav(py::module_& m) {
   m.def(
       "simplify_polyline",
       [](const Eigen::Ref<const RowMatX2d>& points, double tolerance) {
-        std::vector<Vec2> p(static_cast<size_t>(points.rows()));
+        std::vector<Vec2> polyline(static_cast<size_t>(points.rows()));
         for (Eigen::Index i = 0; i < points.rows(); ++i) {
-          p[static_cast<size_t>(i)] = points.row(i).transpose();
+          polyline[static_cast<size_t>(i)] = points.row(i).transpose();
         }
-        return Vec2Array(SimplifyPolyline(p, tolerance));
+        return Vec2Array(SimplifyPolyline(polyline, tolerance));
       },
       "points"_a, "tolerance"_a, "Douglas-Peucker simplification.");
 
@@ -602,12 +638,12 @@ void BindNav(py::module_& m) {
            "num_nodes"_a)
       .def(
           "add_edge",
-          [](RouteGraph& graph, int a, int b, double cost, bool one_way) {
-            RequireIndex(a >= 0 && a < graph.num_nodes() && b >= 0 &&
-                             b < graph.num_nodes(),
+          [](RouteGraph& graph, int from, int to, double cost, bool one_way) {
+            RequireIndex(from >= 0 && from < graph.num_nodes() && to >= 0 &&
+                             to < graph.num_nodes(),
                          "node out of range");
             Require(cost >= 0.0, "cost must be non-negative");
-            return graph.AddEdge(a, b, cost, one_way);
+            return graph.AddEdge(from, to, cost, one_way);
           },
           "a"_a, "b"_a, "cost"_a, "one_way"_a = false)
       .def(
@@ -642,19 +678,19 @@ void BindNav(py::module_& m) {
          const Eigen::Vector2i& goal) {
         int width = 0;
         int height = 0;
-        const std::vector<float> c =
+        const std::vector<float> cell_costs =
             Flat<float, F32Image>(cost, width, height, "cost");
         std::vector<Eigen::Vector2i> path;
         {
           py::gil_scoped_release release;
-          path = GridAStar(c, width, height, start, goal);
+          path = GridAStar(cell_costs, width, height, start, goal);
         }
         py::array_t<int> out({static_cast<py::ssize_t>(path.size()),
-                              py::ssize_t{2}});
-        auto o = out.mutable_unchecked<2>();
+                              py::ssize_t{kPlaneDim}});
+        auto rows = out.mutable_unchecked<2>();
         for (size_t i = 0; i < path.size(); ++i) {
-          o(static_cast<py::ssize_t>(i), 0) = path[i].x();
-          o(static_cast<py::ssize_t>(i), 1) = path[i].y();
+          rows(static_cast<py::ssize_t>(i), 0) = path[i].x();
+          rows(static_cast<py::ssize_t>(i), 1) = path[i].y();
         }
         return out;
       },
@@ -666,16 +702,19 @@ void BindNav(py::module_& m) {
       "object_footprints",
       [](const Eigen::Ref<const Eigen::MatrixXd>& xy, double cell,
          int min_points) {
-        Require(xy.rows() == 0 || xy.cols() >= 2, "expected (N, 2) points");
+        Require(xy.rows() == 0 || xy.cols() >= kPlaneDim,
+                "expected (N, 2) points");
         Require(cell > 0.0, "cell must be positive");
         std::vector<Vec2> points;
-        for (Eigen::Index r = 0; r < xy.rows(); ++r) {
-          points.emplace_back(xy(r, 0), xy(r, 1));
+        for (Eigen::Index row = 0; row < xy.rows(); ++row) {
+          points.emplace_back(xy(row, 0), xy(row, 1));
         }
         py::list out;
-        for (const Footprint& f : ObjectFootprints(points, cell, min_points)) {
-          out.append(py::dict("min"_a = f.min, "max"_a = f.max,
-                              "center"_a = f.center, "points"_a = f.points));
+        for (const Footprint& footprint :
+             ObjectFootprints(points, cell, min_points)) {
+          out.append(py::dict("min"_a = footprint.min, "max"_a = footprint.max,
+                              "center"_a = footprint.center,
+                              "points"_a = footprint.points));
         }
         return out;
       },
@@ -686,18 +725,21 @@ void BindNav(py::module_& m) {
   m.def(
       "edges_at_footprints",
       [](const py::list& footprints, const py::list& edges, double margin) {
-        std::vector<Footprint> f;
+        std::vector<Footprint> footprint_boxes;
         for (const py::handle& item : footprints) {
-          const auto t = item.cast<std::tuple<Vec2, Vec2>>();
+          const auto [min_corner, max_corner] =
+              item.cast<std::tuple<Vec2, Vec2>>();
           Footprint footprint;
-          footprint.min = std::get<0>(t);
-          footprint.max = std::get<1>(t);
-          f.push_back(footprint);
+          footprint.min = min_corner;
+          footprint.max = max_corner;
+          footprint_boxes.push_back(footprint);
         }
-        std::vector<std::vector<Vec2>> e;
-        for (const py::handle& item : edges) e.push_back(PolylineFrom(item));
+        std::vector<std::vector<Vec2>> edge_lines;
+        for (const py::handle& item : edges)
+          edge_lines.push_back(PolylineFrom(item));
         py::list out;
-        for (const FootprintEdge& hit : EdgesAtFootprints(f, e, margin)) {
+        for (const FootprintEdge& hit :
+             EdgesAtFootprints(footprint_boxes, edge_lines, margin)) {
           out.append(py::make_tuple(hit.footprint, hit.edge, hit.along,
                                     hit.distance));
         }

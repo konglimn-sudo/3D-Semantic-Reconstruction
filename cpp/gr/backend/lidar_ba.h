@@ -33,8 +33,8 @@ struct LidarBaConfig {
   // vehicle garages unchanged.
   double min_range = 5.0;
   double max_range = 30.0;
-  double voxel = 1.0;        // Root voxel of the octree (m).
-  int max_depth = 2;         // Subdivisions below the root (1 m -> 0.25 m).
+  double voxel = 1.0;  // Root voxel of the octree (m).
+  int max_depth = 2;   // Subdivisions below the root (1 m -> 0.25 m).
   // A voxel is a plane candidate if sqrt(l_min) of all its points is below
   // `max_thickness` (m) and sqrt(l_mid) / voxel size above `min_extent` (the
   // points spread across the voxel, not along a line). The plane is then

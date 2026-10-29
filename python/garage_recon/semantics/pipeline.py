@@ -97,9 +97,10 @@ class SemanticsPipeline:
         with np.load(self.out / "labels.npz") as z:
             return z["labels"]
 
-    def point_map(self):
-        """Point map with the dynamic mask refined by object-level reasoning."""
-        point_map = self.recon.point_map()
+    def point_map(self, fields=None):
+        """Point map with the dynamic mask refined by object-level reasoning;
+        only the `fields` asked for (all if None) are read."""
+        point_map = self.recon.point_map(fields=fields)
         with np.load(self.out / "labels.npz") as z:
             if "dynamic" in z:
                 point_map.dynamic = z["dynamic"]
@@ -168,7 +169,9 @@ class SemanticsPipeline:
     # ------------------------------------------------------------- stages
     def stage_structure(self) -> None:
         """Floors, ceilings, walls, columns (grid and axis labels)."""
-        point_map, levels = self.recon.point_map(), self.recon.levels()
+        point_map = self.recon.point_map(fields=(
+            "normals", "height", "level", "on_ramp", "dynamic"))
+        levels = self.recon.levels()
         paths = [self.recon.vehicle_poses(d)[1][:, :2, 3]
                  for d in self.recon.datasets]
         result = structure_lib.extract_structure(point_map, levels, paths,
@@ -244,17 +247,18 @@ class SemanticsPipeline:
         recon = self.recon
         keyframes = recon.keyframes()
         poses = recon.kf_poses(keyframes)
-        point_map, levels = recon.point_map(), recon.levels()
+        point_map = recon.point_map(fields=(
+            "height", "level", "dynamic", "dynamic_kind", "trip", "normals"))
+        levels = recon.levels()
         with np.load(self.out / "labels.npz") as z:
             labels = z["structure"].copy()
         yaw, _, _ = self.structure()
-        static_points = ~point_map.dynamic
-        index = objects4d.VoxelLabelIndex(point_map.xyz[static_points],
-                                          labels[static_points], 0.1)
+        structure = ~point_map.dynamic & np.isin(
+            labels, list(taxonomy.STRUCTURE_IDS))
         slots = self.slots() if (self.out / "slots.json").exists() else []
         tracks, static, moving, moving_points = objects4d.run_objects(
-            keyframes, poses, levels, index, point_map, labels, yaw,
-            self.paths_by_level(), self.cfg, slots, self.log)
+            keyframes, poses, levels, point_map.xyz[structure], point_map,
+            labels, yaw, self.paths_by_level(), self.cfg, slots, self.log)
         dynamic = point_map.dynamic | moving_points
         labels[moving_points] = taxonomy.cid("vehicle_moving")
         directory = self.out / "objects"
@@ -318,7 +322,7 @@ class SemanticsPipeline:
         np.savez_compressed(self.out / "labels.npz", **stored)
         # Lights and signs hang overhead: the clearance the objects stage
         # wrote is redone with them.
-        point_map = self.point_map()
+        point_map = self.point_map(("dynamic", "height", "level"))
         for path in sorted((self.recon.work / "bev").glob("level_*.npz")):
             grid, rasters = bev.load_bev(path)
             rasters["clearance"] = clearance_raster(point_map,
@@ -334,7 +338,7 @@ class SemanticsPipeline:
         recon = self.recon
         keyframes = recon.keyframes()
         pose_set = recon.pose_set()
-        point_map = self.point_map()
+        point_map = self.point_map(("dynamic",))
         labels = self.labels()
         static = ~point_map.dynamic
         timeline = box_timeline(*self.boxes(), keyframes.stamp, keyframes.trip)
@@ -370,7 +374,7 @@ class SemanticsPipeline:
         recon = self.recon
         keyframes = recon.keyframes()
         pose_set = recon.pose_set()
-        point_map = self.point_map()
+        point_map = self.point_map(("dynamic",))
         labels = self.labels()
         static = ~point_map.dynamic
         slots, segments = self.slots(), self.markings()
@@ -479,7 +483,7 @@ class SemanticsPipeline:
 
     def _carriers(self) -> tuple[np.ndarray, np.ndarray]:
         """(static map point indices, their carrier subset indices)."""
-        point_map = self.point_map()
+        point_map = self.point_map(("dynamic",))
         static = np.nonzero(~point_map.dynamic)[0]
         carriers = language_field.carrier_points(
             point_map.xyz[static], float(self.cfg.identities.carrier_voxel))
@@ -492,7 +496,7 @@ class SemanticsPipeline:
             return
         keys = self._frame_keys()
         _, carriers = self._carriers()
-        point_map = self.point_map()
+        point_map = self.point_map(("normals",))
         normals = (None if point_map.normals is None
                    else point_map.normals[carriers].astype(np.float64))
         result = language_field.associate(
@@ -541,7 +545,7 @@ class SemanticsPipeline:
         carrier_labels = np.where(carrier_identity >= 0,
                                   lookup[np.maximum(carrier_identity, 0)],
                                   taxonomy.UNLABELED)
-        point_map = self.point_map()
+        point_map = self.point_map(("dynamic",))
         xyz = point_map.xyz[carriers]
         # Every point lies within a voxel diagonal of its voxel's carrier.
         reach = 2.0 * float(self.cfg.identities.carrier_voxel)
@@ -659,7 +663,8 @@ class SemanticsPipeline:
     def stage_export(self) -> None:
         """LAS / PLY, GeoJSON and Lanelet2 deliverables."""
         recon = self.recon
-        point_map, levels = self.point_map(), recon.levels()
+        point_map = self.point_map(("dynamic", "height", "level", "intensity"))
+        levels = recon.levels()
         labels = self.labels()
         directory = self.out / "export"
         directory.mkdir(exist_ok=True)

@@ -27,15 +27,16 @@ py::dict GridToDict(const FloorGrid& grid) {
 }
 
 py::dict RampToDict(const Ramp& ramp) {
-  RowMatX2d polygon(static_cast<Eigen::Index>(ramp.polygon.size()), 2);
-  for (size_t k = 0; k < ramp.polygon.size(); ++k) {
-    polygon.row(static_cast<Eigen::Index>(k)) = ramp.polygon[k].transpose();
+  RowMatX2d polygon(static_cast<Eigen::Index>(ramp.polygon.size()),
+                    kPlaneDim);
+  for (size_t vertex = 0; vertex < ramp.polygon.size(); ++vertex) {
+    polygon.row(static_cast<Eigen::Index>(vertex)) =
+        ramp.polygon[vertex].transpose();
   }
   return py::dict("level_from"_a = ramp.level_from,
                   "level_to"_a = ramp.level_to, "plane"_a = ramp.plane,
                   "polygon"_a = polygon, "slope"_a = ramp.slope);
 }
-
 
 // The point_map.npz arrays BevPoints refers to (kept alive by the caller).
 struct BevArrays {
@@ -68,11 +69,11 @@ BevArrays BevArraysFrom(const py::object& xyz, const py::object& intensity,
   out.dynamic = VectorOf<uint8_t>(dynamic);
   out.height = VectorOf<float>(height);
   out.normals = PointsFrom(normals);
-  const size_t n = out.xyz.size();
-  Require(out.level.size() == n && out.height.size() == n &&
-              (out.intensity.empty() || out.intensity.size() == n) &&
-              (out.dynamic.empty() || out.dynamic.size() == n) &&
-              (out.normals.empty() || out.normals.size() == n),
+  const size_t count = out.xyz.size();
+  Require(out.level.size() == count && out.height.size() == count &&
+              (out.intensity.empty() || out.intensity.size() == count) &&
+              (out.dynamic.empty() || out.dynamic.size() == count) &&
+              (out.normals.empty() || out.normals.size() == count),
           "one level, height (and intensity, dynamic, normal) per point");
   return out;
 }
@@ -98,9 +99,9 @@ py::array FloorHeightsArray(const FloorHeights& heights, const Grid2D& grid) {
 
 py::dict LevelsToDict(const LevelModel& model) {
   py::list grids;
-  for (const FloorGrid& g : model.grids) grids.append(GridToDict(g));
+  for (const FloorGrid& grid : model.grids) grids.append(GridToDict(grid));
   py::list ramps;
-  for (const Ramp& r : model.ramps) ramps.append(RampToDict(r));
+  for (const Ramp& ramp : model.ramps) ramps.append(RampToDict(ramp));
   return py::dict("z"_a = model.z, "ceiling"_a = model.ceiling,
                   "grids"_a = grids, "ramps"_a = ramps);
 }
@@ -108,18 +109,19 @@ py::dict LevelsToDict(const LevelModel& model) {
 // The point_map.npz arrays of a chunk (static_map.PointMap dtypes), plus
 // its order key.
 py::dict ChunkToDict(const MapChunk& chunk) {
-  const py::ssize_t n = static_cast<py::ssize_t>(chunk.size());
-  py::array_t<float> normals({n, static_cast<py::ssize_t>(3)});
+  const py::ssize_t count = static_cast<py::ssize_t>(chunk.size());
+  py::array_t<float> normals({count, static_cast<py::ssize_t>(kSpaceDim)});
   float* data = normals.mutable_data();
   for (size_t i = 0; i < chunk.size(); ++i) {
-    for (int c = 0; c < 3; ++c) {
-      data[3 * i + static_cast<size_t>(c)] =
-          static_cast<float>(chunk.normals[i][c]);
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      data[kSpaceDim * i + static_cast<size_t>(axis)] =
+          static_cast<float>(chunk.normals[i][axis]);
     }
   }
   std::vector<bool> dynamic(chunk.size());
   for (size_t i = 0; i < chunk.size(); ++i) {
-    dynamic[i] = chunk.dynamic_kind[i] > 0;
+    dynamic[i] =
+        chunk.dynamic_kind[i] != static_cast<uint8_t>(DynamicKind::kStatic);
   }
   std::vector<bool> on_ramp(chunk.on_ramp.begin(), chunk.on_ramp.end());
   py::dict out("xyz"_a = PointsToArray(chunk.xyz),
@@ -144,12 +146,14 @@ void BindMapping(py::module_& m) {
   m.def(
       "level_grid",
       [](const py::object& xyz, const py::object& level,
-         const py::object& dynamic, int lv, double res, double margin) {
+         const py::object& dynamic, int selected_level, double res,
+         double margin) {
         Require(res > 0.0, "res must be positive");
         const BevArrays arrays =
             BevArraysFrom(xyz, py::none(), level, dynamic,
                           py::array_t<float>(py::len(level)), py::none());
-        const Grid2D grid = LevelGrid(arrays.View(), lv, res, margin);
+        const Grid2D grid =
+            LevelGrid(arrays.View(), selected_level, res, margin);
         Require(grid.width > 0, "no static points on this level");
         return py::make_tuple(grid.x0, grid.y0, grid.width, grid.height);
       },
@@ -230,22 +234,18 @@ void BindMapping(py::module_& m) {
           vehicle_paths.push_back(
               PointsFrom(py::reinterpret_borrow<py::object>(path)));
         }
-        const Points p = ToPoints(xyz);
-        const Points n = ToPoints(normals);
+        const Points cloud = ToPoints(xyz);
+        const Points point_normals = ToPoints(normals);
         std::exception_ptr log_error;
         const Logger logger = MakeLogger(log, &log_error);
         LevelModel model;
         {
           py::gil_scoped_release release;
-          model = DetectLevels(vehicle_paths, p, n, config, logger);
+          model =
+              DetectLevels(vehicle_paths, cloud, point_normals, config, logger);
         }
         RethrowIfSet(log_error);
-        py::list grids;
-        for (const FloorGrid& g : model.grids) grids.append(GridToDict(g));
-        py::list ramps;
-        for (const Ramp& r : model.ramps) ramps.append(RampToDict(r));
-        return py::dict("z"_a = model.z, "ceiling"_a = model.ceiling,
-                        "grids"_a = grids, "ramps"_a = ramps);
+        return LevelsToDict(model);
       },
       "paths"_a, "xyz"_a, "normals"_a, "config"_a = LevelConfig(),
       "log"_a = py::none(),
@@ -340,11 +340,11 @@ void BindMapping(py::module_& m) {
         const LevelModel model = LevelModelFrom(z, grids, ramps);
         Require(model.grids.empty() || model.grids.size() == model.z.size(),
                 "one grid per level (or none)");
-        const Points p = ToPoints(xyz);
+        const Points cloud = ToPoints(xyz);
         LevelAssignment out;
         {
           py::gil_scoped_release release;
-          out = AssignLevels(model, p);
+          out = AssignLevels(model, cloud);
         }
         py::array_t<bool> on_ramp(
             static_cast<py::ssize_t>(out.on_ramp.size()));

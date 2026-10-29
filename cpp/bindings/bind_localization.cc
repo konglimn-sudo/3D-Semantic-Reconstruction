@@ -34,16 +34,16 @@ py::dict PlacementToDict(const Placement& placement) {
 
 const char* const kStatus[] = {"initializing", "tracking", "lost"};
 
-py::dict ResultToDict(const LocalizationResult& r) {
+py::dict ResultToDict(const LocalizationResult& result) {
   return py::dict(
-      "status"_a = kStatus[static_cast<int>(r.status)],
-      "T"_a = r.pose.Matrix(), "registered"_a = r.registered,
-      "initialized"_a = r.initialized, "fitness"_a = r.fitness,
-      "rmse"_a = r.rmse, "degenerate_t"_a = r.degenerate_t,
-      "degenerate_r"_a = r.degenerate_r,
-      "min_eigen_ratio_t"_a = r.min_eigen_ratio_t, "step_t"_a = r.step_t,
-      "step_r"_a = r.step_r, "covariance"_a = r.covariance,
-      "failures"_a = r.failures);
+      "status"_a = kStatus[static_cast<int>(result.status)],
+      "T"_a = result.pose.Matrix(), "registered"_a = result.registered,
+      "initialized"_a = result.initialized, "fitness"_a = result.fitness,
+      "rmse"_a = result.rmse, "degenerate_t"_a = result.degenerate_t,
+      "degenerate_r"_a = result.degenerate_r,
+      "min_eigen_ratio_t"_a = result.min_eigen_ratio_t,
+      "step_t"_a = result.step_t, "step_r"_a = result.step_r,
+      "covariance"_a = result.covariance, "failures"_a = result.failures);
 }
 
 // A TripLocalizer with the Python logger it calls (kept alive and at a fixed
@@ -55,10 +55,56 @@ struct PyTripLocalizer {
 };
 
 std::vector<Vec2> Xy(const Eigen::MatrixXd& points) {
-  Require(points.rows() == 0 || points.cols() >= 2, "expected (M, 2) points");
+  Require(points.rows() == 0 || points.cols() >= kPlaneDim,
+          "expected (M, 2) points");
   std::vector<Vec2> out;
-  for (Eigen::Index r = 0; r < points.rows(); ++r) {
-    out.emplace_back(points(r, 0), points(r, 1));
+  for (Eigen::Index row = 0; row < points.rows(); ++row) {
+    out.emplace_back(points(row, 0), points(row, 1));
+  }
+  return out;
+}
+
+// Route edges as [(level, kind, (M, 2) points)].
+std::vector<NavEdge> NavEdgesFrom(const py::list& edges) {
+  std::vector<NavEdge> out;
+  for (const py::handle& item : edges) {
+    const auto [level, kind, points] =
+        item.cast<std::tuple<int, std::string, Eigen::MatrixXd>>();
+    out.push_back({level, kind, Xy(points)});
+  }
+  return out;
+}
+
+// Slots as [(level, slot_id, (K, 2) corners)].
+std::vector<NavSlot> NavSlotsFrom(const py::list& slots) {
+  std::vector<NavSlot> out;
+  for (const py::handle& item : slots) {
+    const auto [level, slot_id, corners] =
+        item.cast<std::tuple<int, std::string, Eigen::MatrixXd>>();
+    out.push_back({level, slot_id, Xy(corners)});
+  }
+  return out;
+}
+
+// Floor heights as [(level, x0, y0, res, floor_z (H, W))].
+std::vector<FloorHeights> FloorHeightsFrom(const py::list& floors) {
+  std::vector<FloorHeights> out;
+  for (const py::handle& item : floors) {
+    const auto [level, x0, y0, res, z] =
+        item.cast<std::tuple<int, double, double, double, Eigen::MatrixXd>>();
+    FloorHeights floor;
+    floor.level = level;
+    floor.x0 = x0;
+    floor.y0 = y0;
+    floor.res = res;
+    floor.height = static_cast<int>(z.rows());
+    floor.width = static_cast<int>(z.cols());
+    for (Eigen::Index row = 0; row < z.rows(); ++row) {
+      for (Eigen::Index column = 0; column < z.cols(); ++column) {
+        floor.z.push_back(z(row, column));
+      }
+    }
+    out.push_back(std::move(floor));
   }
   return out;
 }
@@ -85,12 +131,13 @@ void BindLocalization(py::module_& m) {
       [](const PointsIn& source, const PointsIn& reference,
          const PlacementConfig& config) {
         Require(config.voxel > 0.0, "voxel must be positive");
-        const Points s = ToPoints(source);
-        const Points r = ToPoints(reference);
+        const Points source_points = ToPoints(source);
+        const Points reference_points = ToPoints(reference);
         Placement placement;
         {
           py::gil_scoped_release release;
-          placement = PlaceGravityAligned(s, r, config);
+          placement =
+              PlaceGravityAligned(source_points, reference_points, config);
         }
         return PlacementToDict(placement);
       },
@@ -152,17 +199,17 @@ void BindLocalization(py::module_& m) {
           [](Localizer& localizer, const PointsIn& points,
              const py::object& times, double stamp,
              const Mat4& odom_from_sensor) {
-            const Points p = ToPoints(points);
-            const std::vector<double> t = ToDoubleVector(times);
-            Require(t.empty() || t.size() == p.size(),
+            const Points cloud = ToPoints(points);
+            const std::vector<double> point_times = ToDoubleVector(times);
+            Require(point_times.empty() || point_times.size() == cloud.size(),
                     "times must be empty or match the points");
-            LocalizationResult r;
+            LocalizationResult result;
             {
               py::gil_scoped_release release;
-              r = localizer.Process(p, t, stamp,
+              result = localizer.Process(cloud, point_times, stamp,
                                     Pose::FromMatrix(odom_from_sensor));
             }
-            return ResultToDict(r);
+            return ResultToDict(result);
           },
           "points"_a, "times"_a, "stamp"_a, "T_odom_sensor"_a,
           "One sweep (sensor frame) with its odometry pose: dict of status "
@@ -170,13 +217,15 @@ void BindLocalization(py::module_& m) {
           "initialized, fitness, rmse, degenerate_t / _r, min_eigen_ratio_t, "
           "step_t (m) / step_r (deg), "
           "covariance (6x6, [t, phi]), failures.")
-      .def_property_readonly(
-          "T_map_odom",
-          [](const Localizer& l) { return l.map_from_odom().Matrix(); })
-      .def_property_readonly("last_placement",
-                             [](const Localizer& l) {
-                               return PlacementToDict(l.last_placement());
+      .def_property_readonly("T_map_odom",
+                             [](const Localizer& localizer) {
+                               return localizer.map_from_odom().Matrix();
                              })
+      .def_property_readonly(
+          "last_placement",
+          [](const Localizer& localizer) {
+            return PlacementToDict(localizer.last_placement());
+          })
       .def_property_readonly("placement_attempts",
                              &Localizer::placement_attempts)
       .def_property_readonly("travelled", &Localizer::travelled)
@@ -235,27 +284,28 @@ void BindLocalization(py::module_& m) {
              const py::object& intensity, const py::object& times,
              double stamp, int index, bool last,
              bool localize) -> py::object {
-            const Points p = ToPoints(points);
-            const std::vector<float> i = ToFloatVector(intensity);
-            const std::vector<double> t = ToDoubleVector(times);
-            Require(t.empty() || t.size() == p.size(),
+            const Points cloud = ToPoints(points);
+            const std::vector<float> point_intensity = ToFloatVector(intensity);
+            const std::vector<double> point_times = ToDoubleVector(times);
+            Require(point_times.empty() || point_times.size() == cloud.size(),
                     "times must be empty or match the points");
-            std::optional<SweepLocalization> s;
+            std::optional<SweepLocalization> localized;
             {
               py::gil_scoped_release release;
-              s = self.localizer->Process(p, i, t, stamp, index, last,
-                                          localize);
+              localized =
+                  self.localizer->Process(cloud, point_intensity, point_times,
+                                          stamp, index, last, localize);
             }
             RethrowIfSet(self.log_error);
-            if (!s) return py::none();
-            py::dict out = ResultToDict(s->result);
-            out["index"] = s->index;
-            out["stamp"] = s->stamp;
-            out["T_map_vehicle"] = s->map_from_vehicle.Matrix();
-            out["T_odom_vehicle"] = s->odom_from_vehicle.Matrix();
-            out["sigma_t"] = s->sigma_t;
-            out["sigma_yaw_deg"] = s->sigma_yaw_deg;
-            out["ms"] = s->ms;
+            if (!localized) return py::none();
+            py::dict out = ResultToDict(localized->result);
+            out["index"] = localized->index;
+            out["stamp"] = localized->stamp;
+            out["T_map_vehicle"] = localized->map_from_vehicle.Matrix();
+            out["T_odom_vehicle"] = localized->odom_from_vehicle.Matrix();
+            out["sigma_t"] = localized->sigma_t;
+            out["sigma_yaw_deg"] = localized->sigma_yaw_deg;
+            out["ms"] = localized->ms;
             return std::move(out);
           },
           "points"_a, "intensity"_a, "times"_a, "stamp"_a, "index"_a,
@@ -265,24 +315,27 @@ void BindLocalization(py::module_& m) {
           "T_map_vehicle, T_odom_vehicle, sigma_t, sigma_yaw_deg, ms.")
       .def("summary",
            [](const PyTripLocalizer& self) {
-             const TripLocalizationSummary s = self.localizer->Summary();
-             const bool tracked = s.first_tracked >= 0;
+             const TripLocalizationSummary summary = self.localizer->Summary();
+             const bool tracked = summary.first_tracked !=
+                                  TripLocalizationSummary::kNeverTracked;
              const auto optional = [&](double value) -> py::object {
                return tracked ? py::cast(value) : py::none();
              };
              return py::dict(
-                 "sweeps"_a = s.sweeps,
-                 "first_tracked"_a = tracked ? py::cast(s.first_tracked)
-                                             : py::none(),
-                 "init_time_s"_a = optional(s.init_time_s),
-                 "init_distance_m"_a = optional(s.init_distance_m),
-                 "placement_attempts"_a = s.placement_attempts,
-                 "tracked"_a = s.tracked, "registered"_a = s.registered,
+                 "sweeps"_a = summary.sweeps,
+                 "first_tracked"_a =
+                     tracked ? py::cast(summary.first_tracked) : py::none(),
+                 "init_time_s"_a = optional(summary.init_time_s),
+                 "init_distance_m"_a = optional(summary.init_distance_m),
+                 "placement_attempts"_a = summary.placement_attempts,
+                 "tracked"_a = summary.tracked,
+                 "registered"_a = summary.registered,
                  "registered_share_of_tracked"_a =
-                     optional(s.registered_share_of_tracked),
-                 "lost_sweeps"_a = s.lost_sweeps,
-                 "degenerate_share"_a = optional(s.degenerate_share),
-                 "ms_median"_a = s.ms_median, "ms_p95"_a = s.ms_p95);
+                     optional(summary.registered_share_of_tracked),
+                 "lost_sweeps"_a = summary.lost_sweeps,
+                 "degenerate_share"_a = optional(summary.degenerate_share),
+                 "ms_median"_a = summary.ms_median,
+                 "ms_p95"_a = summary.ms_p95);
            })
       .def_property_readonly("map_size",
                              [](const PyTripLocalizer& self) {
@@ -323,11 +376,11 @@ void BindLocalization(py::module_& m) {
           "add_sweep",
           [](ChangeDetector& detector, const PointsIn& sweep,
              const Mat4& map_from_sensor, double stamp) {
-            const Points p = ToPoints(sweep);
+            const Points sweep_points = ToPoints(sweep);
             const Pose pose = Pose::FromMatrix(map_from_sensor);
             py::gil_scoped_release release;
-            detector.AddSweep(TransformPoints(p, pose), pose.translation,
-                              stamp);
+            detector.AddSweep(TransformPoints(sweep_points, pose),
+                              pose.translation, stamp);
           },
           "sweep"_a, "T_map_sensor"_a, "stamp"_a,
           "One localized sweep (sensor frame) with its pose in the map.")
@@ -337,48 +390,22 @@ void BindLocalization(py::module_& m) {
           [](const ChangeDetector& detector, const py::list& edges,
              const py::list& slots, const py::list& floors,
              double half_width) {
-            std::vector<NavEdge> e;
-            for (const py::handle& item : edges) {
-              const auto t = item.cast<
-                  std::tuple<int, std::string, Eigen::MatrixXd>>();
-              e.push_back({std::get<0>(t), std::get<1>(t),
-                           Xy(std::get<2>(t))});
-            }
-            std::vector<NavSlot> s;
-            for (const py::handle& item : slots) {
-              const auto t = item.cast<
-                  std::tuple<int, std::string, Eigen::MatrixXd>>();
-              s.push_back({std::get<0>(t), std::get<1>(t),
-                           Xy(std::get<2>(t))});
-            }
-            std::vector<FloorHeights> f;
-            for (const py::handle& item : floors) {
-              const auto t = item.cast<std::tuple<int, double, double,
-                                                  double, Eigen::MatrixXd>>();
-              FloorHeights floor;
-              floor.level = std::get<0>(t);
-              floor.x0 = std::get<1>(t);
-              floor.y0 = std::get<2>(t);
-              floor.res = std::get<3>(t);
-              const Eigen::MatrixXd& z = std::get<4>(t);
-              floor.height = static_cast<int>(z.rows());
-              floor.width = static_cast<int>(z.cols());
-              for (Eigen::Index r = 0; r < z.rows(); ++r) {
-                for (Eigen::Index c = 0; c < z.cols(); ++c) {
-                  floor.z.push_back(z(r, c));
-                }
-              }
-              f.push_back(std::move(floor));
-            }
+            const std::vector<NavEdge> nav_edges = NavEdgesFrom(edges);
+            const std::vector<NavSlot> nav_slots = NavSlotsFrom(slots);
+            const std::vector<FloorHeights> floor_heights =
+                FloorHeightsFrom(floors);
             py::list out;
-            for (const MapChange& c :
-                 AssessChanges(detector.Clusters(), e, s, f, half_width)) {
+            for (const MapChange& change :
+                 AssessChanges(detector.Clusters(), nav_edges, nav_slots,
+                               floor_heights, half_width)) {
               out.append(py::dict(
-                  "added"_a = c.cluster.added,
-                  "level"_a = c.level ? py::cast(*c.level) : py::none(),
-                  "center"_a = c.cluster.center, "min"_a = c.cluster.min,
-                  "max"_a = c.cluster.max, "voxels"_a = c.cluster.voxels,
-                  "edges"_a = c.edges));
+                  "added"_a = change.cluster.added,
+                  "level"_a =
+                      change.level ? py::cast(*change.level) : py::none(),
+                  "center"_a = change.cluster.center,
+                  "min"_a = change.cluster.min, "max"_a = change.cluster.max,
+                  "voxels"_a = change.cluster.voxels,
+                  "edges"_a = change.edges));
             }
             return out;
           },
@@ -404,15 +431,15 @@ void BindLocalization(py::module_& m) {
   const auto slots_from = [](const py::list& slots) {
     std::vector<SlotGeometry> out;
     for (const py::handle& item : slots) {
-      const auto t = item.cast<
+      const auto [slot_id, level, corner_rows, z] = item.cast<
           std::tuple<std::string, int, Eigen::MatrixXd, double>>();
-      const std::vector<Vec2> corners = Xy(std::get<2>(t));
-      Require(corners.size() == 4, "a slot has four corners");
+      const std::vector<Vec2> corners = Xy(corner_rows);
+      Require(corners.size() == kSlotCorners, "a slot has four corners");
       SlotGeometry slot;
-      slot.slot_id = std::get<0>(t);
-      slot.level = std::get<1>(t);
+      slot.slot_id = slot_id;
+      slot.level = level;
       std::copy(corners.begin(), corners.end(), slot.corners.begin());
-      slot.z = std::get<3>(t);
+      slot.z = z;
       out.push_back(slot);
     }
     return out;
@@ -430,27 +457,27 @@ void BindLocalization(py::module_& m) {
                        double stamp, const PointsIn& sweep,
                        const Mat4& map_from_sensor,
                        const SlotStateConfig& config) {
-            const std::vector<SlotGeometry> s = slots_from(slots);
-            Require(s.size() == tracker.entries().size(),
+            const std::vector<SlotGeometry> slot_geometry = slots_from(slots);
+            Require(slot_geometry.size() == tracker.entries().size(),
                     "the tracker was made for other slots");
-            const Points p = ToPoints(sweep);
+            const Points sweep_points = ToPoints(sweep);
             const Pose pose = Pose::FromMatrix(map_from_sensor);
             py::gil_scoped_release release;
-            tracker.Update(stamp,
-                           ObserveSlots(TransformPoints(p, pose),
-                                        pose.translation, s, config));
+            tracker.Update(
+                stamp, ObserveSlots(TransformPoints(sweep_points, pose),
+                                    pose.translation, slot_geometry, config));
           },
           "slots"_a, "stamp"_a, "sweep"_a, "T_map_sensor"_a, "config"_a,
           "One localized sweep (sensor frame) with its pose in the map.")
       .def("states", [](const SlotStateTracker& tracker) {
         static const char* const kState[] = {"unknown", "free", "occupied"};
         py::list out;
-        for (const SlotStateTracker::Entry& e : tracker.entries()) {
-          out.append(py::dict(
-              "state"_a = kState[static_cast<int>(e.state)],
-              "stamp"_a = e.state == SlotState::kUnknown ? py::none()
-                                                         : py::cast(e.stamp),
-              "observations"_a = e.observations));
+        for (const SlotStateTracker::Entry& entry : tracker.entries()) {
+          out.append(py::dict("state"_a = kState[static_cast<int>(entry.state)],
+                              "stamp"_a = entry.state == SlotState::kUnknown
+                                              ? py::none()
+                                              : py::cast(entry.stamp),
+                              "observations"_a = entry.observations));
         }
         return out;
       });
@@ -459,52 +486,24 @@ void BindLocalization(py::module_& m) {
       "nav_position",
       [](const Mat4& map_from_vehicle, const py::list& edges,
          const py::list& slots, const py::list& floors) -> py::dict {
-        std::vector<NavEdge> e;
-        for (const py::handle& item : edges) {
-          const auto t = item.cast<
-              std::tuple<int, std::string, Eigen::MatrixXd>>();
-          e.push_back({std::get<0>(t), std::get<1>(t), Xy(std::get<2>(t))});
-        }
-        std::vector<NavSlot> s;
-        for (const py::handle& item : slots) {
-          const auto t = item.cast<
-              std::tuple<int, std::string, Eigen::MatrixXd>>();
-          s.push_back({std::get<0>(t), std::get<1>(t), Xy(std::get<2>(t))});
-        }
-        std::vector<FloorHeights> f;
-        for (const py::handle& item : floors) {
-          const auto t = item.cast<std::tuple<int, double, double, double,
-                                              Eigen::MatrixXd>>();
-          FloorHeights floor;
-          floor.level = std::get<0>(t);
-          floor.x0 = std::get<1>(t);
-          floor.y0 = std::get<2>(t);
-          floor.res = std::get<3>(t);
-          const Eigen::MatrixXd& z = std::get<4>(t);
-          floor.height = static_cast<int>(z.rows());
-          floor.width = static_cast<int>(z.cols());
-          for (Eigen::Index r = 0; r < z.rows(); ++r) {
-            for (Eigen::Index c = 0; c < z.cols(); ++c) {
-              floor.z.push_back(z(r, c));
-            }
-          }
-          f.push_back(std::move(floor));
-        }
-        const NavPosition p =
-            Where(Pose::FromMatrix(map_from_vehicle), e, s, f);
+        const NavPosition position =
+            Where(Pose::FromMatrix(map_from_vehicle), NavEdgesFrom(edges),
+                  NavSlotsFrom(slots), FloorHeightsFrom(floors));
         py::object edge = py::none();
-        if (p.edge) {
-          edge = py::dict("edge"_a = p.edge->edge, "kind"_a = p.edge->kind,
-                          "distance"_a = p.edge->distance,
-                          "along"_a = p.edge->along,
-                          "lateral"_a = p.edge->lateral,
-                          "heading_rel_deg"_a = p.edge->heading_rel_deg);
+        if (position.edge) {
+          const EdgePosition& on_edge = *position.edge;
+          edge = py::dict("edge"_a = on_edge.edge, "kind"_a = on_edge.kind,
+                          "distance"_a = on_edge.distance,
+                          "along"_a = on_edge.along,
+                          "lateral"_a = on_edge.lateral,
+                          "heading_rel_deg"_a = on_edge.heading_rel_deg);
         }
         return py::dict(
-            "xyz"_a = p.xyz, "yaw_deg"_a = p.yaw_deg,
-            "level"_a = p.level ? py::cast(*p.level) : py::none(),
+            "xyz"_a = position.xyz, "yaw_deg"_a = position.yaw_deg,
+            "level"_a = position.level ? py::cast(*position.level)
+                                       : py::none(),
             "edge"_a = edge,
-            "slot"_a = p.slot ? py::cast(*p.slot) : py::none());
+            "slot"_a = position.slot ? py::cast(*position.slot) : py::none());
       },
       "T_map_vehicle"_a, "edges"_a, "slots"_a, "floors"_a,
       "Where a vehicle is on the route graph. edges: [(level, kind, (M, 2))], "

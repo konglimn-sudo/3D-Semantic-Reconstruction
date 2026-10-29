@@ -23,15 +23,14 @@
 // the rig's rotation: a correction term); r is estimated with a weak
 // prior (`lever_arm_sigma`) on the rig's value, which only bounds it: under
 // a steady turn its horizontal part looks like an accelerometer bias, and a
-// car turning about one axis does not observe its height. g_W is the gravity of the odometry
-// frame (its tilt is
-// estimated: the odometry may not start levelled); dt within
-// `max_time_offset`. Levenberg-Marquardt with a Huber loss on each window's
-// gyro and accelerometer residual (scaled by `gyro_sigma`, `accel_sigma`).
-// The standard deviations come from the normal matrix at the solution: a
-// car turns about one axis, so the yaw of R is fixed by the accelerations
-// alone and the accelerometer scales by the tilts the trip saw; large
-// values mean "not observed by this trip".
+// car turning about one axis does not observe its height. g_W is the gravity of
+// the odometry frame (its tilt is estimated: the odometry may not start
+// levelled); dt within `max_time_offset`. Levenberg-Marquardt with a Huber loss
+// on each window's gyro and accelerometer residual (scaled by `gyro_sigma`,
+// `accel_sigma`). The standard deviations come from the normal matrix at the
+// solution: a car turns about one axis, so the yaw of R is fixed by the
+// accelerations alone and the accelerometer scales by the tilts the trip saw;
+// large values mean "not observed by this trip".
 
 #ifndef GARAGE_RECON_GR_CALIBRATION_LIDAR_IMU_H_
 #define GARAGE_RECON_GR_CALIBRATION_LIDAR_IMU_H_
@@ -52,12 +51,12 @@ struct LidarImuConfig {
   double max_time_offset = 0.1;  // s
   bool estimate_lever_arm = true;
   double lever_arm_sigma = 1.0;  // m, prior on the rig's lever arm.
-  double gyro_sigma = 0.01;   // rad/s
-  double accel_sigma = 0.1;   // m/s^2
-  double huber = 3.0;         // In sigmas.
+  double gyro_sigma = 0.01;      // rad/s
+  double accel_sigma = 0.1;      // m/s^2
+  double huber = 3.0;            // In sigmas.
   int max_iterations = 50;
   double tolerance = 1e-7;  // Relative cost decrease that ends the solve.
-  double gravity = 9.80665;
+  double gravity = kStandardGravity;  // m/s^2
 };
 
 struct LidarImuResult {
@@ -67,8 +66,8 @@ struct LidarImuResult {
   Vec3 gyro_bias = Vec3::Zero();
   Vec3 accel_bias = Vec3::Zero();
   Vec3 accel_scale = Vec3::Ones();
-  Vec3 gravity_world = Vec3(0.0, 0.0, -9.80665);
-  double time_offset = 0.0;  // s: IMU time = LiDAR time + offset.
+  Vec3 gravity_world = Vec3(0.0, 0.0, -kStandardGravity);
+  double time_offset = 0.0;       // s: IMU time = LiDAR time + offset.
   Vec3 lever_arm = Vec3::Zero();  // The IMU origin in LiDAR axes (m).
   // Standard deviations: rotation about the LiDAR axes (deg), biases,
   // scales (1).
@@ -81,6 +80,9 @@ struct LidarImuResult {
   double gyro_rms = 0.0;   // rad/s
   double accel_rms = 0.0;  // m/s^2
 };
+
+// CalibrateLidarImu needs at least this many poses and IMU samples.
+inline constexpr size_t kMinLidarImuSamples = 3;
 
 // `world_from_lidar` at `stamps` (ascending); `imu` in the IMU's own axes
 // (ImuSamples::FromRows with an identity rotation). `initial` is the rig's

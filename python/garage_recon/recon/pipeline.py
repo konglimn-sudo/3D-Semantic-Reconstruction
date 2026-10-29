@@ -116,10 +116,13 @@ class ReconPipeline:
         trip = self.pose_set().trips[self.pose_set().index(data.trip_id)]
         return trip.knot_stamps, trip.knot_poses
 
-    def point_map(self, bounds=None) -> static_map.PointMap:
-        """The map (built in one piece or in tiles); `bounds` (x0, y0, x1,
-        y1) loads only the tiles that touch it."""
-        return static_map.load_point_map(self.work / "map", bounds)
+    def point_map(self, bounds=None, fields=None, level=None,
+                  with_index: bool = False):
+        """The map (built in one piece or in tiles), or only the tiles that
+        touch `bounds` (x0, y0, x1, y1), the `fields` asked for, the points
+        of `level` (static_map.load_point_map)."""
+        return static_map.load_point_map(self.work / "map", bounds, fields,
+                                         level, with_index)
 
     def levels(self) -> levels_lib.LevelModel:
         return levels_lib.LevelModel.load(self.work / "map")
@@ -259,8 +262,12 @@ class ReconPipeline:
 
     def stage_bev(self) -> None:
         """Per-level rasters (intensity, heights)."""
-        point_map, levels = self.point_map(), self.levels()
+        levels = self.levels()
         for lv in range(levels.n):
+            # One level at a time: its rasters only use its own points.
+            point_map = self.point_map(
+                fields=("intensity", "level", "dynamic", "height", "normals"),
+                level=lv)
             grid = bev.level_grid(point_map, lv, float(self.cfg.bev.res),
                                   float(self.cfg.bev.margin))
             rasters = bev.level_rasters(point_map, levels, grid, self.cfg)

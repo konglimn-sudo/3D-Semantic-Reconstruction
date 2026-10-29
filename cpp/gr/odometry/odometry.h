@@ -28,14 +28,16 @@ Points DeskewConstantVelocity(const Points& points,
                               const Vec3& linear_velocity);
 
 struct OdometryConfig {
-  double max_range = 60.0;
-  double min_range = 1.0;
-  double voxel_size = 0.5;
+  double max_range = 60.0;  // m; returns beyond are dropped.
+  double min_range = 1.0;   // m; returns closer are dropped (the vehicle).
+  double voxel_size = 0.5;  // m, of the local map.
   int max_points_per_voxel = 20;
+  // m: the correspondence threshold before the motion model has samples.
   double initial_threshold = 1.0;
+  // m: deviations from the motion model below this do not adapt it.
   double min_motion_th = 0.1;
   int max_icp_iters = 50;
-  double icp_conv = 1e-4;
+  double icp_conv = 1e-4;  // ICP stops when an update moves less (m / rad).
   bool deskew = true;
   bool use_wheel_prior = true;  // Wheel speed + gyro prior when available.
   // Without wheel speed: gyro rotation and the velocity of the last two
@@ -119,12 +121,12 @@ class OdometryPipeline {
   // keyframes. `external_pose` (world_from_lidar) replaces the registration.
   // `fill_sweep` returns the motion-compensated sweep of every frame, not
   // only of keyframes (for map localization).
-  OdometryFrame Process(
-      const Points& points, const std::vector<float>& intensity,
-      const std::vector<double>& times, double stamp,
-      bool force_keyframe = false,
-      const std::optional<Pose>& external_pose = std::nullopt,
-      bool fill_sweep = false);
+  OdometryFrame Process(const Points& points,
+                        const std::vector<float>& intensity,
+                        const std::vector<double>& times, double stamp,
+                        bool force_keyframe = false,
+                        const std::optional<Pose>& external_pose = std::nullopt,
+                        bool fill_sweep = false);
 
   const std::vector<Pose>& poses() const { return poses_; }
   const std::vector<double>& stamps() const { return stamps_; }
@@ -141,7 +143,7 @@ class OdometryPipeline {
   void FillKeyframe(const Points& points, const std::vector<float>& intensity,
                     const std::vector<double>& times, double stamp,
                     std::optional<Points> imu_deskewed,
-                    OdometryFrame& frame) const;
+                    OdometryFrame* frame) const;
 
   OdometryConfig config_;
   KeyframeConfig keyframe_config_;

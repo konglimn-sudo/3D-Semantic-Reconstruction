@@ -1,4 +1,5 @@
-# Build, tests and packaging on every push and pull request.
+# Build, tests and packaging on every push and pull request. Python package
+# versions are pinned in .github/constraints.txt.
 name: ci
 
 on:
@@ -9,6 +10,8 @@ jobs:
   linux:
     name: Linux (GCC, C++ and Python tests)
     runs-on: ubuntu-24.04
+    env:
+      PIP_CONSTRAINT: ${{ github.workspace }}/.github/constraints.txt
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -60,6 +63,8 @@ jobs:
   wheel:
     name: Python wheel
     runs-on: ubuntu-24.04
+    env:
+      PIP_CONSTRAINT: ${{ github.workspace }}/.github/constraints.txt
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

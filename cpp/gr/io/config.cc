@@ -7,6 +7,11 @@ namespace {
 
 #include "gr/io/config_tables.inc"
 
+// nav.vehicle where the configuration leaves it out (default_config.yaml):
+// the width (m) and the lateral safety margin (m).
+constexpr double kDefaultVehicleWidth = 1.9;
+constexpr double kDefaultVehicleMargin = 0.3;
+
 // Sets the leaves of `table` (under `path` of `out`) that `user` does not.
 void SetUnlessGiven(const Value& table, const Value& user,
                     std::vector<std::string>* path, Value* out) {
@@ -16,8 +21,8 @@ void SetUnlessGiven(const Value& table, const Value& user,
       SetUnlessGiven(value, user, path, out);
     } else {
       const Value* given = &user;
-      for (const std::string& k : *path) {
-        given = given->Find(k);
+      for (const std::string& key_part : *path) {
+        given = given->Find(key_part);
         if (given == nullptr) break;
       }
       if (given == nullptr || given->is_null()) {
@@ -39,9 +44,9 @@ void SetUnlessGiven(const Value& table, const Value& user,
 
 Value ApplyImuGrade(const Value& config, const Value& user) {
   const Value& grade = config["imu_grade"];
-  if (grade.is_null() || (config["imu_grade_applied"].kind() ==
-                              Value::Kind::kBool &&
-                          config["imu_grade_applied"].AsBool())) {
+  if (grade.is_null() ||
+      (config["imu_grade_applied"].kind() == Value::Kind::kBool &&
+       config["imu_grade_applied"].AsBool())) {
     return config;
   }
   const Value* table = config["imu_grades"].Find(grade.AsString());
@@ -153,10 +158,11 @@ LidarImuConfig LidarImuConfigFrom(const Value& config) {
 
 double CorridorHalfWidth(const Value& config) {
   const Value& vehicle = config["nav"]["vehicle"];
-  const double width =
-      vehicle["width"].is_null() ? 1.9 : vehicle["width"].AsDouble();
-  const double margin =
-      vehicle["margin"].is_null() ? 0.3 : vehicle["margin"].AsDouble();
+  const double width = vehicle["width"].is_null() ? kDefaultVehicleWidth
+                                                  : vehicle["width"].AsDouble();
+  const double margin = vehicle["margin"].is_null()
+                            ? kDefaultVehicleMargin
+                            : vehicle["margin"].AsDouble();
   return 0.5 * width + margin;
 }
 

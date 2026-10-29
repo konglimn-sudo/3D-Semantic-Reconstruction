@@ -8,11 +8,18 @@
 namespace gr {
 namespace {
 
+// Fixed-point iterations that look for the row a point lands on.
 constexpr int kMaxRowIterations = 4;
+// Poses whose translations and rotation matrices differ by less than this
+// (squared norm) are the same: the exposure is a global shutter.
+constexpr double kSamePoseSquaredTolerance = 1e-24;
+// The pose of the exposure as a whole is the one halfway through it.
+constexpr double kMiddleOfExposure = 0.5;
 
 bool SamePose(const Pose& a, const Pose& b) {
-  return (a.translation - b.translation).squaredNorm() < 1e-24 &&
-         (a.rotation - b.rotation).squaredNorm() < 1e-24;
+  return (a.translation - b.translation).squaredNorm() <
+             kSamePoseSquaredTolerance &&
+         (a.rotation - b.rotation).squaredNorm() < kSamePoseSquaredTolerance;
 }
 
 }  // namespace
@@ -30,14 +37,14 @@ CameraExposure::CameraExposure(const Pose& world_from_first_row,
     return;
   }
   camera_from_world_.reserve(static_cast<size_t>(height));
-  const double last = static_cast<double>(height - 1);
+  const double last_row = static_cast<double>(height - 1);
   for (int row = 0; row < height; ++row) {
     camera_from_world_.push_back(
-        Interpolate(world_from_first_row, world_from_last_row, row / last)
+        Interpolate(world_from_first_row, world_from_last_row, row / last_row)
             .Inverse());
   }
   world_from_center_ =
-      Interpolate(world_from_first_row, world_from_last_row, 0.5);
+      Interpolate(world_from_first_row, world_from_last_row, kMiddleOfExposure);
 }
 
 const Pose& CameraExposure::CameraFromWorld(int row) const {
@@ -47,7 +54,7 @@ const Pose& CameraExposure::CameraFromWorld(int row) const {
 
 std::optional<CameraExposure::Projection> CameraExposure::Project(
     const CameraModel& camera, const Vec3& point_world) const {
-  int row = rows() / 2;
+  int row = rows() / 2;  // Start in the middle.
   Projection projection;
   for (int iteration = 0; iteration < kMaxRowIterations; ++iteration) {
     projection.point_camera = CameraFromWorld(row) * point_world;
@@ -55,10 +62,10 @@ std::optional<CameraExposure::Projection> CameraExposure::Project(
     if (!uv) return std::nullopt;
     projection.uv = *uv;
     if (!rolling()) break;
-    const int next =
+    const int landing_row =
         std::clamp(static_cast<int>(std::floor(uv->y())), 0, rows() - 1);
-    if (next == row) break;
-    row = next;
+    if (landing_row == row) break;
+    row = landing_row;
   }
   return projection;
 }

@@ -1,6 +1,6 @@
 #include "gr/core/voxel.h"
 
-#include <unordered_map>
+#include <unordered_set>
 
 namespace gr {
 
@@ -14,12 +14,14 @@ std::vector<int> VoxelDownsampleIndices(const Points& points,
     }
     return indices;
   }
-  const double inv = 1.0 / voxel_size;
-  std::unordered_map<VoxelKey, int, VoxelKeyHash> seen;
-  seen.reserve(points.size() / 2 + 1);
-  indices.reserve(points.size() / 2 + 1);
+  // Room for one voxel per two points; more voxels grow the containers.
+  constexpr size_t kPointsPerVoxelGuess = 2;
+  const double inverse_voxel_size = 1.0 / voxel_size;
+  std::unordered_set<VoxelKey, VoxelKeyHash> occupied;
+  occupied.reserve(points.size() / kPointsPerVoxelGuess + 1);
+  indices.reserve(points.size() / kPointsPerVoxelGuess + 1);
   for (size_t i = 0; i < points.size(); ++i) {
-    if (seen.emplace(VoxelOf(points[i], inv), static_cast<int>(i)).second) {
+    if (occupied.insert(VoxelOf(points[i], inverse_voxel_size)).second) {
       indices.push_back(static_cast<int>(i));
     }
   }
@@ -30,7 +32,7 @@ Points VoxelDownsample(const Points& points, double voxel_size) {
   const std::vector<int> indices = VoxelDownsampleIndices(points, voxel_size);
   Points out;
   out.reserve(indices.size());
-  for (int i : indices) out.push_back(points[static_cast<size_t>(i)]);
+  for (int index : indices) out.push_back(points[static_cast<size_t>(index)]);
   return out;
 }
 

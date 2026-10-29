@@ -39,7 +39,7 @@ struct MarkingSegment {
   bool lane = false;  // Lane marking, else parking line.
   double confidence = 1.0;
   // p0 / p1 measured on the floor image with observed floor beyond them.
-  bool end_ok[2] = {false, false};
+  bool end_ok[kSegmentEnds] = {false, false};
 
   double length() const { return (p1 - p0).norm(); }
 };
@@ -57,8 +57,8 @@ struct RasterFrame {
 // Merges segments that are parallel (within `merge_angle`), on one line
 // (both ends of the other within `merge_offset` of it) and at most
 // `merge_gap` apart along it; each segment absorbs every partner it finds.
-std::vector<MarkingSegment> MergeCollinear(std::vector<MarkingSegment> segs,
-                                           const MarkingConfig& config);
+std::vector<MarkingSegment> MergeCollinear(
+    std::vector<MarkingSegment> segments, const MarkingConfig& config);
 
 // Line segments of a paint mask (merged and filtered). `skeleton` is the
 // mask's skeleton when the caller has one; empty: Skeletonize (scikit-image's
@@ -69,25 +69,32 @@ std::vector<MarkingSegment> VectorizeMarkings(
     const MarkingConfig& config, int level,
     const std::vector<uint8_t>& skeleton = {});
 
-// Paint lies on the floor: at least half of each side of the line, offset
-// by half its width plus `offset`, must be observed floor.
-bool BothSidesObserved(const MarkingSegment& seg,
+// Defaults of BothSidesObserved: the sides are sampled this far (m) beyond
+// the paint's edge, and this share of each must be observed floor.
+inline constexpr double kDefaultSideOffset = 0.2;
+inline constexpr double kDefaultMinObservedShare = 0.5;
+
+// Paint lies on the floor: at least `min_fraction` of each side of the line,
+// offset by half its width plus `offset`, must be observed floor.
+bool BothSidesObserved(const MarkingSegment& segment,
                        const std::vector<uint8_t>& floor,
-                       const RasterFrame& frame, double offset = 0.2,
-                       double min_fraction = 0.5);
+                       const RasterFrame& frame,
+                       double offset = kDefaultSideOffset,
+                       double min_fraction = kDefaultMinObservedShare);
 
 // Parking and lane lines follow the column grid (angle mod 90 deg).
-bool GridAligned(const MarkingSegment& seg, double yaw, double max_angle_deg);
+bool GridAligned(const MarkingSegment& segment, double yaw,
+                 double max_angle_deg);
 
 // Re-measures the segments in place on the first image that works; returns
 // how many were refined. Others keep the skeleton geometry, ends unreliable.
-int RefineSegments(std::vector<MarkingSegment>& segs,
+int RefineSegments(std::vector<MarkingSegment>& segments,
                    const std::vector<const FloorImage*>& images,
                    const LineFitConfig& config = {});
 
 // Long lines along the driven path of their level are lane markings
 // (`paths` maps a level to the vehicle positions on it).
-void ClassifyMarkings(std::vector<MarkingSegment>& segs,
+void ClassifyMarkings(std::vector<MarkingSegment>& segments,
                       const std::map<int, std::vector<Vec2>>& paths,
                       const MarkingConfig& config);
 

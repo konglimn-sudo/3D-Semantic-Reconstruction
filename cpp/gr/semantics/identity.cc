@@ -9,6 +9,24 @@
 #include "gr/core/check.h"
 
 namespace gr {
+namespace {
+
+// The carrier z-buffer: splats of kMinSplatRadius to kMaxSplatRadius pixels,
+// points from kMinRenderRange (m) to the range plus kRangeSlack (m).
+constexpr int kMinSplatRadius = 1;
+constexpr int kMaxSplatRadius = 3;
+constexpr double kMinRenderRange = 0.1;
+constexpr double kRangeSlack = 1e-6;
+// Directions of shorter vectors have no meaning.
+constexpr double kMinNorm = 1e-9;
+// Points facing the camera at most this cosine are facing away or edge-on;
+// the grazing tolerance divides by at least kMinToleranceCos.
+constexpr double kMinCosIncidence = 0.05;
+constexpr double kMinToleranceCos = 0.15;
+// Every covered point casts one vote.
+constexpr float kVoteWeight = 1.0f;
+
+}  // namespace
 
 IdentityAssociator::IdentityAssociator(Points points, Points normals,
                                        const IdentityConfig& config)
@@ -51,21 +69,21 @@ int IdentityAssociator::Merge(const std::vector<int>& roots) {
   return target;
 }
 
-bool IdentityAssociator::CannotLink(int a, int b) const {
-  a = Find(a);
-  b = Find(b);
-  for (int other : cannot_link_[static_cast<size_t>(a)]) {
-    if (Find(other) == b) return true;
+bool IdentityAssociator::CannotLink(int first, int second) const {
+  first = Find(first);
+  second = Find(second);
+  for (int other : cannot_link_[static_cast<size_t>(first)]) {
+    if (Find(other) == second) return true;
   }
   return false;
 }
 
 int IdentityAssociator::CurrentIdentity(size_t point) const {
-  int best = -1;
+  int best = kNoIdentity;
   float best_votes = 0.0f;
   const std::vector<std::pair<int, float>>& votes = votes_[point];
-  for (size_t a = 0; a < votes.size(); ++a) {
-    const int root = Find(votes[a].first);
+  for (const std::pair<int, float>& candidate : votes) {
+    const int root = Find(candidate.first);
     float total = 0.0f;
     for (const std::pair<int, float>& entry : votes) {
       if (Find(entry.first) == root) total += entry.second;
@@ -82,11 +100,11 @@ void IdentityAssociator::Vote(size_t point, int identity) {
   std::vector<std::pair<int, float>>& votes = votes_[point];
   for (std::pair<int, float>& entry : votes) {
     if (Find(entry.first) == identity) {
-      entry.second += 1.0f;
+      entry.second += kVoteWeight;
       return;
     }
   }
-  votes.emplace_back(identity, 1.0f);
+  votes.emplace_back(identity, kVoteWeight);
 }
 
 std::vector<MaskRecord> IdentityAssociator::AddView(
@@ -95,11 +113,12 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
   const int view = num_views_++;
   const Vec3& center = exposure.center();
   const std::vector<int> candidates =
-      index_.RadiusSearch(center, config_.max_range + 1e-6);
-  ZBuffer buffer(camera, exposure, config_.point_spacing, 1, 3, 0.1,
-                 config_.max_range);
-  for (int i : candidates) {
-    buffer.Splat(index_.points()[static_cast<size_t>(i)], -1, i);
+      index_.RadiusSearch(center, config_.max_range + kRangeSlack);
+  ZBuffer buffer(camera, exposure, config_.point_spacing, kMinSplatRadius,
+                 kMaxSplatRadius, kMinRenderRange, config_.max_range);
+  for (int candidate : candidates) {
+    buffer.Splat(index_.points()[static_cast<size_t>(candidate)],
+                 RenderResult::kEmpty, candidate);
   }
   const RenderResult& render = buffer.result();
   const int height = render.height;
@@ -128,8 +147,8 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
   // from mask boundaries). Visible points are also counted per identity.
   std::vector<std::pair<int, int>> pairs;
   std::map<int, int> visible_by_identity;
-  for (int i : candidates) {
-    const Vec3& point = index_.points()[static_cast<size_t>(i)];
+  for (int candidate : candidates) {
+    const Vec3& point = index_.points()[static_cast<size_t>(candidate)];
     const std::optional<CameraExposure::Projection> projection =
         exposure.Project(camera, point);
     if (!projection || !camera.InImage(projection->uv)) continue;
@@ -143,35 +162,36 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
     if (!normals_.empty()) {
       const Vec3 to_camera = center - point;
       const double cos_incidence =
-          normals_[static_cast<size_t>(i)].dot(to_camera) /
-          std::max(to_camera.norm(), 1e-9);
-      if (cos_incidence <= 0.05) continue;  // Facing away or edge-on.
+          normals_[static_cast<size_t>(candidate)].dot(to_camera) /
+          std::max(to_camera.norm(), kMinNorm);
+      if (cos_incidence <= kMinCosIncidence) continue;
       tolerance += config_.grazing_pixels * range /
-                   (camera.focal() * std::max(cos_incidence, 0.15));
+                   (camera.focal() * std::max(cos_incidence, kMinToleranceCos));
     }
     if (std::isfinite(depth) &&
         range > depth * (1.0 + config_.depth_rel_tol) + tolerance) {
       continue;  // Occluded.
     }
-    const int owner = CurrentIdentity(static_cast<size_t>(i));
-    if (owner >= 0) ++visible_by_identity[owner];
+    const int owner = CurrentIdentity(static_cast<size_t>(candidate));
+    if (owner != kNoIdentity) ++visible_by_identity[owner];
     const int mask = mask_at(y, x);
     if (mask < 0) continue;
     bool uniform = true;
-    for (int dy = -config_.boundary; dy <= config_.boundary && uniform; ++dy) {
-      for (int dx = -config_.boundary; dx <= config_.boundary && uniform;
-           ++dx) {
-        uniform = mask_at(y + dy, x + dx) == mask;
+    for (int row_offset = -config_.boundary;
+         row_offset <= config_.boundary && uniform; ++row_offset) {
+      for (int column_offset = -config_.boundary;
+           column_offset <= config_.boundary && uniform; ++column_offset) {
+        uniform = mask_at(y + row_offset, x + column_offset) == mask;
       }
     }
-    if (uniform) pairs.emplace_back(mask, i);
+    if (uniform) pairs.emplace_back(mask, candidate);
   }
   std::sort(pairs.begin(), pairs.end());
 
   // Decide every mask's identity before any of them votes.
   struct Decision {
     int mask = 0;
-    int identity = -1;
+    int identity = kNoIdentity;
     size_t first = 0;  // Range of the mask's points in `pairs`.
     size_t last = 0;
   };
@@ -187,7 +207,7 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
       const size_t point = static_cast<size_t>(pairs[end].second);
       range_sum += (index_.points()[point] - center).norm();
       const int owner = CurrentIdentity(point);
-      if (owner >= 0) {
+      if (owner != kNoIdentity) {
         ++owners[owner];
         ++known;
       }
@@ -197,7 +217,7 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
     record.points = static_cast<int>(end - begin);
     record.mean_range = range_sum / static_cast<double>(end - begin);
     if (record.points >= config_.min_mask_points) {
-      int identity = -1;
+      int identity = kNoIdentity;
       const double needed =
           std::max<double>(config_.min_common_points,
                            config_.min_known_fraction * record.points);
@@ -228,7 +248,7 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
           identity = group.size() > 1 ? Merge(group) : group.front();
         }
       }
-      if (identity < 0) identity = NewIdentity();
+      if (identity == kNoIdentity) identity = NewIdentity();
       decisions.push_back({mask, identity, begin, end});
     }
     begin = end;
@@ -241,18 +261,18 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
   }
   std::sort(roots.begin(), roots.end());
   roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
-  for (size_t a = 0; a < roots.size(); ++a) {
-    for (size_t b = a + 1; b < roots.size(); ++b) {
-      if (CannotLink(roots[a], roots[b])) continue;
-      cannot_link_[static_cast<size_t>(roots[a])].push_back(roots[b]);
-      cannot_link_[static_cast<size_t>(roots[b])].push_back(roots[a]);
+  for (size_t first = 0; first < roots.size(); ++first) {
+    for (size_t second = first + 1; second < roots.size(); ++second) {
+      if (CannotLink(roots[first], roots[second])) continue;
+      cannot_link_[static_cast<size_t>(roots[first])].push_back(roots[second]);
+      cannot_link_[static_cast<size_t>(roots[second])].push_back(roots[first]);
     }
   }
   for (const Decision& decision : decisions) {
     const int root = Find(decision.identity);
     by_mask[decision.mask].identity = root;
-    for (size_t p = decision.first; p < decision.last; ++p) {
-      Vote(static_cast<size_t>(pairs[p].second), root);
+    for (size_t pair = decision.first; pair < decision.last; ++pair) {
+      Vote(static_cast<size_t>(pairs[pair].second), root);
     }
   }
 
@@ -270,36 +290,40 @@ std::vector<MaskRecord> IdentityAssociator::AddView(
 IdentityAssociator::Result IdentityAssociator::Finish() const {
   // Final roots, renumbered 0..K-1 in ascending root order.
   std::map<int, int> renumber;
-  std::vector<int> point_root(votes_.size(), -1);
-  for (size_t i = 0; i < votes_.size(); ++i) {
-    point_root[i] = CurrentIdentity(i);
-    if (point_root[i] >= 0) renumber.emplace(point_root[i], 0);
+  std::vector<int> point_root(votes_.size(), kNoIdentity);
+  for (size_t point = 0; point < votes_.size(); ++point) {
+    point_root[point] = CurrentIdentity(point);
+    if (point_root[point] != kNoIdentity) {
+      renumber.emplace(point_root[point], 0);
+    }
   }
   for (const MaskRecord& record : records_) {
-    if (record.identity >= 0) renumber.emplace(Find(record.identity), 0);
+    if (record.identity != kNoIdentity) {
+      renumber.emplace(Find(record.identity), 0);
+    }
   }
   int next = 0;
   for (auto& [root, number] : renumber) number = next++;
 
   Result result;
   result.num_identities = next;
-  result.point_identity.assign(votes_.size(), -1);
+  result.point_identity.assign(votes_.size(), kNoIdentity);
   result.point_confidence.assign(votes_.size(), 0.0f);
-  for (size_t i = 0; i < votes_.size(); ++i) {
-    const int root = point_root[i];
-    if (root < 0) continue;
+  for (size_t point = 0; point < votes_.size(); ++point) {
+    const int root = point_root[point];
+    if (root == kNoIdentity) continue;
     float total = 0.0f;
     float winner = 0.0f;
-    for (const std::pair<int, float>& entry : votes_[i]) {
+    for (const std::pair<int, float>& entry : votes_[point]) {
       total += entry.second;
       if (Find(entry.first) == root) winner += entry.second;
     }
-    result.point_identity[i] = renumber.find(root)->second;
-    result.point_confidence[i] = total > 0.0f ? winner / total : 0.0f;
+    result.point_identity[point] = renumber.find(root)->second;
+    result.point_confidence[point] = total > 0.0f ? winner / total : 0.0f;
   }
   result.masks = records_;
   for (MaskRecord& record : result.masks) {
-    if (record.identity >= 0) {
+    if (record.identity != kNoIdentity) {
       record.identity = renumber.find(Find(record.identity))->second;
     }
   }

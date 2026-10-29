@@ -14,45 +14,45 @@
 
 namespace gr {
 
-// Walks the voxels of an (nx, ny, nz) grid along a ray given in grid units
-// (origin `o`, unit direction `d`) up to parameter `t_end`. `visit(i, j, k)` is
-// called for voxels inside the grid; returning false stops the walk.
+// Walks the voxels of a grid of `size` voxels along a ray given in grid units
+// (`origin`, unit `direction`) up to parameter `t_end`. `visit(x, y, z)` is
+// called for the voxels inside the grid; returning false stops the walk.
 template <typename Visit>
-void TraverseGrid(const Vec3& o, const Vec3& d, double t_end, int nx, int ny,
-                  int nz, Visit&& visit) {
+void TraverseGrid(const Vec3& origin, const Vec3& direction, double t_end,
+                  const Eigen::Vector3i& size, Visit&& visit) {
   constexpr double kInf = std::numeric_limits<double>::infinity();
-  int ijk[3] = {static_cast<int>(std::floor(o.x())),
-                static_cast<int>(std::floor(o.y())),
-                static_cast<int>(std::floor(o.z()))};
-  const int dims[3] = {nx, ny, nz};
-  int step[3];
-  double t_max[3];
-  double t_delta[3];
-  for (int a = 0; a < 3; ++a) {
-    if (d[a] > 0.0) {
-      step[a] = 1;
-      t_max[a] = (ijk[a] + 1 - o[a]) / d[a];
-      t_delta[a] = 1.0 / d[a];
-    } else if (d[a] < 0.0) {
-      step[a] = -1;
-      t_max[a] = (ijk[a] - o[a]) / d[a];
-      t_delta[a] = -1.0 / d[a];
+  int cell[kSpaceDim];
+  int step[kSpaceDim];
+  double t_max[kSpaceDim];    // Ray parameter of the next voxel boundary.
+  double t_delta[kSpaceDim];  // Ray parameter between two boundaries.
+  for (int axis = 0; axis < kSpaceDim; ++axis) {
+    cell[axis] = static_cast<int>(std::floor(origin[axis]));
+    if (direction[axis] > 0.0) {
+      step[axis] = 1;
+      t_max[axis] = (cell[axis] + 1 - origin[axis]) / direction[axis];
+      t_delta[axis] = 1.0 / direction[axis];
+    } else if (direction[axis] < 0.0) {
+      step[axis] = -1;
+      t_max[axis] = (cell[axis] - origin[axis]) / direction[axis];
+      t_delta[axis] = -1.0 / direction[axis];
     } else {
-      step[a] = 0;
-      t_max[a] = kInf;
-      t_delta[a] = kInf;
+      step[axis] = 0;
+      t_max[axis] = kInf;
+      t_delta[axis] = kInf;
     }
   }
   while (true) {
-    const bool inside = ijk[0] >= 0 && ijk[1] >= 0 && ijk[2] >= 0 &&
-                        ijk[0] < dims[0] && ijk[1] < dims[1] &&
-                        ijk[2] < dims[2];
-    if (inside && !visit(ijk[0], ijk[1], ijk[2])) return;
-    int axis = 0;
-    if (t_max[1] < t_max[axis]) axis = 1;
-    if (t_max[2] < t_max[axis]) axis = 2;
+    bool inside = true;
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      inside = inside && cell[axis] >= 0 && cell[axis] < size[axis];
+    }
+    if (inside && !visit(cell[0], cell[1], cell[2])) return;
+    int axis = 0;  // The axis whose boundary comes first.
+    for (int other = 1; other < kSpaceDim; ++other) {
+      if (t_max[other] < t_max[axis]) axis = other;
+    }
     if (t_max[axis] > t_end) return;
-    ijk[axis] += step[axis];
+    cell[axis] += step[axis];
     t_max[axis] += t_delta[axis];
   }
 }
@@ -64,9 +64,12 @@ class FreeSpaceCarver {
  public:
   // Grids larger than kMaxVoxels voxels are a precondition violation.
   static constexpr int64_t kMaxVoxels = 800000000;
+  // Rays stop this far (m) before their endpoint, so that the surface they
+  // hit is not carved.
+  static constexpr double kDefaultEndpointMargin = 0.2;
 
   FreeSpaceCarver(const Vec3& min_bound, const Vec3& max_bound, double voxel,
-                  double endpoint_margin = 0.2);
+                  double endpoint_margin = kDefaultEndpointMargin);
   FreeSpaceCarver(const FreeSpaceCarver&) = default;
   FreeSpaceCarver& operator=(const FreeSpaceCarver&) = default;
 
@@ -84,30 +87,29 @@ class FreeSpaceCarver {
   // Hit / miss counters of the voxel containing each point (0 outside).
   Counts Query(const Points& points) const;
 
-  // Dense (nx, ny, nz) flags, x-major: 1 where a voxel was traversed by at
+  // Dense flags over dims(), x-major: 1 where a voxel was traversed by at
   // least `min_misses` rays and holds at most `max_hits` endpoints.
   std::vector<uint8_t> FreeMask(int min_misses, int max_hits) const;
   const Vec3& min_bound() const { return min_bound_; }
 
-  Eigen::Vector3i dims() const { return {nx_, ny_, nz_}; }
+  // Voxels along x, y and z.
+  const Eigen::Vector3i& dims() const { return size_; }
   double voxel() const { return voxel_; }
 
  private:
   std::optional<Eigen::Vector3i> IndexOf(const Vec3& point) const;
-  size_t Linear(int i, int j, int k) const {
-    return (static_cast<size_t>(i) * static_cast<size_t>(ny_) +
-            static_cast<size_t>(j)) *
-               static_cast<size_t>(nz_) +
-           static_cast<size_t>(k);
+  size_t Linear(int x, int y, int z) const {
+    return (static_cast<size_t>(x) * static_cast<size_t>(size_.y()) +
+            static_cast<size_t>(y)) *
+               static_cast<size_t>(size_.z()) +
+           static_cast<size_t>(z);
   }
 
   Vec3 min_bound_;
   double voxel_;
-  double inv_voxel_;
+  double inverse_voxel_;
   double margin_;
-  int nx_;
-  int ny_;
-  int nz_;
+  Eigen::Vector3i size_;
   std::vector<uint16_t> hits_;
   std::vector<uint16_t> misses_;
 };

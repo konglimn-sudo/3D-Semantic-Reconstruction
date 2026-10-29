@@ -34,15 +34,15 @@ RunState& State() {
 // Escapes the data of a GitHub Actions workflow command.
 std::string EscapeCommandData(const std::string& text) {
   std::string out;
-  for (const char c : text) {
-    if (c == '%') {
+  for (const char character : text) {
+    if (character == '%') {
       out += "%25";
-    } else if (c == '\r') {
+    } else if (character == '\r') {
       out += "%0D";
-    } else if (c == '\n') {
+    } else if (character == '\n') {
       out += "%0A";
     } else {
-      out += c;
+      out += character;
     }
   }
   return out;
@@ -98,7 +98,7 @@ int RunAllTests() {
   }
   std::printf("%zu/%zu tests passed\n", state.tests.size() - failed,
               state.tests.size());
-  return failed == 0 ? 0 : 1;
+  return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 }  // namespace gr::testing

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -11,51 +12,84 @@
 namespace gr {
 namespace {
 
+// Every grid axis has at least this many voxels.
+constexpr int kMinVoxelsPerAxis = 1;
+// A voxel's centre, in voxels from its corner.
+constexpr double kVoxelCentre = 0.5;
+// The vote buffer is reserved for one vote per kPointsPerVoxelEstimate
+// points plus kVoteReserveSlack.
+constexpr size_t kPointsPerVoxelEstimate = 8;
+constexpr size_t kVoteReserveSlack = 16;
+// Label of static points beyond the label list.
+constexpr int kMissingLabel = 0;
+// Labels must fit the uint8 grid.
+constexpr int kMaxLabel = std::numeric_limits<uint8_t>::max();
+// A box has 2^3 corners; bounds start this far out (m).
+constexpr int kBoxCorners = 8;
+constexpr double kUnboundedCoordinate = 1e18;
+// LiDAR rays shorter than this (voxels) have no direction.
+constexpr double kMinRayLength = 1e-9;
+// Camera rays go through pixel centres, every `camera_pixel_stride` (at least
+// kMinPixelStride) pixels.
+constexpr int kMinPixelStride = 1;
+constexpr double kPixelCentre = 0.5;
+// Static points are fetched this far (m) beyond the grid's xy corners.
+constexpr double kStaticSearchMargin = 1.0;
+
 // Voxel grid geometry of an OccupancyConfig.
 class Grid {
  public:
   explicit Grid(const OccupancyConfig& config)
-      : min_bound_(config.min_bound), voxel_(config.voxel), inv_(1.0 / voxel_) {
-    const Vec3 extent = (config.max_bound - config.min_bound) * inv_;
-    nx_ = std::max(1, static_cast<int>(std::round(extent.x())));
-    ny_ = std::max(1, static_cast<int>(std::round(extent.y())));
-    nz_ = std::max(1, static_cast<int>(std::round(extent.z())));
+      : min_bound_(config.min_bound),
+        voxel_(config.voxel),
+        inverse_voxel_(1.0 / voxel_) {
+    const Vec3 extent = (config.max_bound - config.min_bound) * inverse_voxel_;
+    nx_ = std::max(kMinVoxelsPerAxis,
+                   static_cast<int>(std::round(extent.x())));
+    ny_ = std::max(kMinVoxelsPerAxis,
+                   static_cast<int>(std::round(extent.y())));
+    nz_ = std::max(kMinVoxelsPerAxis,
+                   static_cast<int>(std::round(extent.z())));
   }
 
   int nx() const { return nx_; }
   int ny() const { return ny_; }
   int nz() const { return nz_; }
+  Eigen::Vector3i dims() const { return Eigen::Vector3i(nx_, ny_, nz_); }
   size_t size() const {
     return static_cast<size_t>(nx_) * static_cast<size_t>(ny_) *
            static_cast<size_t>(nz_);
   }
-  size_t Linear(int i, int j, int k) const {
-    return (static_cast<size_t>(i) * static_cast<size_t>(ny_) +
-            static_cast<size_t>(j)) *
+  size_t Linear(int x, int y, int z) const {
+    return (static_cast<size_t>(x) * static_cast<size_t>(ny_) +
+            static_cast<size_t>(y)) *
                static_cast<size_t>(nz_) +
-           static_cast<size_t>(k);
+           static_cast<size_t>(z);
   }
   // Continuous grid coordinates of an ego-frame point.
-  Vec3 ToGrid(const Vec3& point) const { return (point - min_bound_) * inv_; }
-  Vec3 VoxelCenter(int i, int j, int k) const {
-    return min_bound_ + (Vec3(i, j, k) + Vec3::Constant(0.5)) * voxel_;
+  Vec3 ToGrid(const Vec3& point) const {
+    return (point - min_bound_) * inverse_voxel_;
+  }
+  Vec3 VoxelCenter(int x, int y, int z) const {
+    return min_bound_ +
+           (Vec3(x, y, z) + Vec3::Constant(kVoxelCentre)) * voxel_;
   }
   std::optional<Eigen::Vector3i> IndexOf(const Vec3& point) const {
-    const Vec3 g = ToGrid(point);
-    const Eigen::Vector3i ijk(static_cast<int>(std::floor(g.x())),
-                              static_cast<int>(std::floor(g.y())),
-                              static_cast<int>(std::floor(g.z())));
-    if (ijk.x() < 0 || ijk.y() < 0 || ijk.z() < 0 || ijk.x() >= nx_ ||
-        ijk.y() >= ny_ || ijk.z() >= nz_) {
+    const Vec3 grid_point = ToGrid(point);
+    const Eigen::Vector3i index(static_cast<int>(std::floor(grid_point.x())),
+                                static_cast<int>(std::floor(grid_point.y())),
+                                static_cast<int>(std::floor(grid_point.z())));
+    if (index.x() < 0 || index.y() < 0 || index.z() < 0 ||
+        index.x() >= nx_ || index.y() >= ny_ || index.z() >= nz_) {
       return std::nullopt;
     }
-    return ijk;
+    return index;
   }
 
  private:
   Vec3 min_bound_;
   double voxel_;
-  double inv_;
+  double inverse_voxel_;
   int nx_;
   int ny_;
   int nz_;
@@ -66,36 +100,42 @@ void VoteStaticLabels(const Grid& grid, const OccupancyConfig& config,
                       const Pose& ego_from_world, const Points& static_world,
                       const std::vector<int>& static_labels,
                       std::vector<uint8_t>& semantics) {
+  // (voxel, label) per point.
   std::vector<std::pair<uint32_t, uint8_t>> votes;
-  votes.reserve(static_world.size() / 8 + 16);
-  for (size_t m = 0; m < static_world.size(); ++m) {
-    const int label = m < static_labels.size() ? static_labels[m] : 0;
-    if (label == config.free_label || label < 0 || label > 255) continue;
-    const auto ijk = grid.IndexOf(ego_from_world * static_world[m]);
-    if (!ijk) continue;
+  votes.reserve(static_world.size() / kPointsPerVoxelEstimate +
+                kVoteReserveSlack);
+  for (size_t point = 0; point < static_world.size(); ++point) {
+    const int label =
+        point < static_labels.size() ? static_labels[point] : kMissingLabel;
+    if (label == config.free_label || label < 0 || label > kMaxLabel) {
+      continue;
+    }
+    const auto index = grid.IndexOf(ego_from_world * static_world[point]);
+    if (!index) continue;
     votes.emplace_back(
-        static_cast<uint32_t>(grid.Linear(ijk->x(), ijk->y(), ijk->z())),
+        static_cast<uint32_t>(grid.Linear(index->x(), index->y(), index->z())),
         static_cast<uint8_t>(label));
   }
   std::sort(votes.begin(), votes.end());
-  for (size_t a = 0; a < votes.size();) {
-    size_t b = a;
-    uint8_t best_label = votes[a].second;
+  for (size_t voxel_start = 0; voxel_start < votes.size();) {
+    const uint32_t voxel = votes[voxel_start].first;
+    size_t label_start = voxel_start;
+    uint8_t best_label = votes[voxel_start].second;
     size_t best_count = 0;
-    while (b < votes.size() && votes[b].first == votes[a].first) {
-      size_t c = b;
-      while (c < votes.size() && votes[c].first == votes[a].first &&
-             votes[c].second == votes[b].second) {
-        ++c;
+    while (label_start < votes.size() && votes[label_start].first == voxel) {
+      size_t label_end = label_start;
+      while (label_end < votes.size() && votes[label_end].first == voxel &&
+             votes[label_end].second == votes[label_start].second) {
+        ++label_end;
       }
-      if (c - b > best_count) {
-        best_count = c - b;
-        best_label = votes[b].second;
+      if (label_end - label_start > best_count) {
+        best_count = label_end - label_start;
+        best_label = votes[label_start].second;
       }
-      b = c;
+      label_start = label_end;
     }
-    semantics[votes[a].first] = best_label;
-    a = b;
+    semantics[voxel] = best_label;
+    voxel_start = label_start;
   }
 }
 
@@ -106,33 +146,39 @@ void RasterizeBoxes(const Grid& grid, const std::vector<OrientedBox>& boxes,
     const Mat3 rotation =
         Eigen::AngleAxisd(box.yaw, Vec3::UnitZ()).toRotationMatrix();
     const Vec3 half = 0.5 * box.size;
-    Vec3 lo = Vec3::Constant(1e18);
-    Vec3 hi = Vec3::Constant(-1e18);
-    for (int c = 0; c < 8; ++c) {
-      const Vec3 corner(c & 1 ? half.x() : -half.x(),
-                        c & 2 ? half.y() : -half.y(),
-                        c & 4 ? half.z() : -half.z());
+    Vec3 lower = Vec3::Constant(kUnboundedCoordinate);
+    Vec3 upper = Vec3::Constant(-kUnboundedCoordinate);
+    for (int corner_index = 0; corner_index < kBoxCorners; ++corner_index) {
+      // Bit `axis` of the corner index: the positive side along that axis.
+      Vec3 corner;
+      for (int axis = 0; axis < kSpaceDim; ++axis) {
+        corner[axis] =
+            corner_index & (1 << axis) ? half[axis] : -half[axis];
+      }
       const Vec3 world = box.center + rotation * corner;
-      lo = lo.cwiseMin(world);
-      hi = hi.cwiseMax(world);
+      lower = lower.cwiseMin(world);
+      upper = upper.cwiseMax(world);
     }
-    const Vec3 glo = grid.ToGrid(lo);
-    const Vec3 ghi = grid.ToGrid(hi);
-    const auto first = [](double g) {
-      return std::max(0, static_cast<int>(std::floor(g)));
+    const Vec3 grid_lower = grid.ToGrid(lower);
+    const Vec3 grid_upper = grid.ToGrid(upper);
+    const auto first = [](double coordinate) {
+      return std::max(0, static_cast<int>(std::floor(coordinate)));
     };
-    const auto last = [](double g, int n) {
-      return std::min(n - 1, static_cast<int>(std::floor(g)));
+    const auto last = [](double coordinate, int count) {
+      return std::min(count - 1, static_cast<int>(std::floor(coordinate)));
     };
-    for (int i = first(glo.x()); i <= last(ghi.x(), grid.nx()); ++i) {
-      for (int j = first(glo.y()); j <= last(ghi.y(), grid.ny()); ++j) {
-        for (int k = first(glo.z()); k <= last(ghi.z(), grid.nz()); ++k) {
+    for (int x = first(grid_lower.x()); x <= last(grid_upper.x(), grid.nx());
+         ++x) {
+      for (int y = first(grid_lower.y());
+           y <= last(grid_upper.y(), grid.ny()); ++y) {
+        for (int z = first(grid_lower.z());
+             z <= last(grid_upper.z(), grid.nz()); ++z) {
           const Vec3 local =
-              rotation.transpose() * (grid.VoxelCenter(i, j, k) - box.center);
+              rotation.transpose() * (grid.VoxelCenter(x, y, z) - box.center);
           if (std::abs(local.x()) <= half.x() &&
               std::abs(local.y()) <= half.y() &&
               std::abs(local.z()) <= half.z()) {
-            semantics[grid.Linear(i, j, k)] = static_cast<uint8_t>(box.label);
+            semantics[grid.Linear(x, y, z)] = static_cast<uint8_t>(box.label);
           }
         }
       }
@@ -144,13 +190,13 @@ void RasterizeBoxes(const Grid& grid, const std::vector<OrientedBox>& boxes,
 void MarkLidarVisibility(const Grid& grid, const Vec3& lidar_origin_ego,
                          const Points& scan_ego, std::vector<uint8_t>& mask) {
   const Vec3 origin = grid.ToGrid(lidar_origin_ego);
-  for (const Vec3& p : scan_ego) {
-    const Vec3 delta = grid.ToGrid(p) - origin;
+  for (const Vec3& point : scan_ego) {
+    const Vec3 delta = grid.ToGrid(point) - origin;
     const double length = delta.norm();
-    if (length < 1e-9) continue;
-    TraverseGrid(origin, delta / length, length, grid.nx(), grid.ny(),
-                 grid.nz(), [&](int i, int j, int k) {
-                   mask[grid.Linear(i, j, k)] = 1;
+    if (length < kMinRayLength) continue;
+    TraverseGrid(origin, delta / length, length, grid.dims(),
+                 [&](int x, int y, int z) {
+                   mask[grid.Linear(x, y, z)] = 1;
                    return true;
                  });
   }
@@ -162,20 +208,22 @@ void MarkCameraVisibility(const Grid& grid, const OccupancyConfig& config,
                           const std::vector<uint8_t>& semantics,
                           std::vector<uint8_t>& mask) {
   const double t_end = config.camera_max_range * (1.0 / config.voxel);
-  const int stride = std::max(1, config.camera_pixel_stride);
+  const int stride = std::max(kMinPixelStride, config.camera_pixel_stride);
+  // The first ray of each stride goes through its middle pixel.
+  const int first_pixel = stride / 2;
   for (const CameraView& view : cameras) {
     if (!view.camera) continue;
     const Vec3 center = grid.ToGrid(view.ego_from_camera.translation);
-    for (int v = stride / 2; v < view.camera->height(); v += stride) {
-      for (int u = stride / 2; u < view.camera->width(); u += stride) {
+    for (int v = first_pixel; v < view.camera->height(); v += stride) {
+      for (int u = first_pixel; u < view.camera->width(); u += stride) {
         const std::optional<Vec3> ray =
-            view.camera->Unproject(Vec2(u + 0.5, v + 0.5));
+            view.camera->Unproject(Vec2(u + kPixelCentre, v + kPixelCentre));
         if (!ray) continue;
         const Vec3 direction =
             (view.ego_from_camera.rotation * *ray).normalized();
-        TraverseGrid(center, direction, t_end, grid.nx(), grid.ny(), grid.nz(),
-                     [&](int i, int j, int k) {
-                       const size_t index = grid.Linear(i, j, k);
+        TraverseGrid(center, direction, t_end, grid.dims(),
+                     [&](int x, int y, int z) {
+                       const size_t index = grid.Linear(x, y, z);
                        mask[index] = 1;
                        return semantics[index] ==
                               static_cast<uint8_t>(config.free_label);
@@ -232,25 +280,26 @@ OccupancyResult OccupancyGenerator::Generate(
                                    std::abs(config_.max_bound.y()));
   const std::vector<int> near =
       index_.RadiusSearchXy(world_from_vehicle.translation.head<2>(),
-                            std::hypot(extent_x, extent_y) + 1.0);
+                            std::hypot(extent_x, extent_y) +
+                                kStaticSearchMargin);
   Points points;
   std::vector<int> labels;
   points.reserve(near.size());
   labels.reserve(near.size());
-  for (int i : near) {
-    points.push_back(index_.points()[static_cast<size_t>(i)]);
-    labels.push_back(labels_[static_cast<size_t>(i)]);
+  for (int point : near) {
+    points.push_back(index_.points()[static_cast<size_t>(point)]);
+    labels.push_back(labels_[static_cast<size_t>(point)]);
   }
   const Pose vehicle_from_world = world_from_vehicle.Inverse();
   const double vehicle_yaw = YawOf(world_from_vehicle.rotation);
   std::vector<OrientedBox> boxes;
   boxes.reserve(boxes_world.size());
-  for (const ObjectBox& b : boxes_world) {
+  for (const ObjectBox& world_box : boxes_world) {
     OrientedBox box;
-    box.center = vehicle_from_world * b.center;
-    box.size = b.size;
-    box.yaw = b.yaw - vehicle_yaw;
-    box.label = b.label;
+    box.center = vehicle_from_world * world_box.center;
+    box.size = world_box.size;
+    box.yaw = world_box.yaw - vehicle_yaw;
+    box.label = world_box.label;
     boxes.push_back(box);
   }
   return BuildOccupancy(config_, world_from_vehicle, points, labels, boxes,

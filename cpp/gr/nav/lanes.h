@@ -37,6 +37,7 @@
 
 #include "gr/core/types.h"
 #include "gr/semantics/markings.h"
+#include "gr/semantics/slots.h"
 
 namespace gr {
 
@@ -71,36 +72,46 @@ struct LaneWall {
 // back-left).
 struct LaneSlot {
   std::string row;
-  std::array<Vec2, 4> corners;
+  std::array<Vec2, kParkingSlotCorners> corners;
   double z = 0.0;
   double width = 0.0;
 };
 
 struct LaneRow {
-  Vec2 u = Vec2::UnitX();  // Along the row.
-  Vec2 n = Vec2::UnitY();  // From the slots towards the aisle.
-  double offset = 0.0;     // Entrance line at n . x = offset ...
-  double lo = 0.0;         // ... spanning u . x in [lo, hi].
+  Vec2 along = Vec2::UnitX();         // Along the row.
+  Vec2 toward_aisle = Vec2::UnitY();  // From the slots towards the aisle.
+  double offset = 0.0;  // Entrance line at toward_aisle . x = offset ...
+  double lo = 0.0;      // ... spanning along . x in [lo, hi].
   double hi = 0.0;
   double z = 0.0;
   int slots = 0;
 };
 
+// A lane line: its two end points.
+inline constexpr int kLineEnds = 2;
+using LaneLine = std::array<Vec2, kLineEnds>;
+
 // Rows of the slots by their row id, in order of first appearance.
 std::vector<LaneRow> SlotRows(const std::vector<LaneSlot>& slots);
 
 // Proposed lanes, facing pairs first: end points.
-std::vector<std::array<Vec2, 2>> LaneLines(const std::vector<LaneRow>& rows,
+std::vector<LaneLine> LaneLines(const std::vector<LaneRow>& rows,
                                            const LaneConfig& config);
+
+// What proposed a lane.
+enum LaneSource : uint8_t {
+  kSlotRowLane = 0,
+  kWallLane = 1,
+  kDriveLane = 2,
+};
 
 struct LanePlan {
   int rows = 0;
   int walls = 0;     // Walls that proposed a lane.
   int drives = 0;    // Drive stretches that proposed a lane.
   int followed = 0;  // Pieces the skeleton already runs along.
-  std::vector<std::array<Vec2, 2>> lanes;
-  // Per lane: 0 slot row, 1 wall, 2 drive.
-  std::vector<uint8_t> source;
+  std::vector<LaneLine> lanes;
+  std::vector<uint8_t> source;  // LaneSource per lane.
 };
 
 // The lane pieces of one level: proposed lanes (slot rows, walls in open
@@ -117,7 +128,7 @@ LanePlan PlanLanes(const std::vector<LaneSlot>& slots,
 
 // Whether a skeleton edge runs along one of the lanes.
 bool CoveredByLanes(const std::vector<Vec2>& edge,
-                    const std::vector<std::array<Vec2, 2>>& lanes,
+                    const std::vector<LaneLine>& lanes,
                     const LaneConfig& config);
 
 }  // namespace gr

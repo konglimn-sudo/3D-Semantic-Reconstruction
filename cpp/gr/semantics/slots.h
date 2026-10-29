@@ -71,15 +71,27 @@ struct SlotColumn {
   Vec2 size = Vec2::Zero();
 };
 
+// A parking slot is a quadrilateral.
+inline constexpr int kParkingSlotCorners = 4;
+// Corner order: the entrance edge (left, right as seen entering), then the
+// back edge (right, left).
+inline constexpr int kEntranceLeftCorner = 0;
+inline constexpr int kEntranceRightCorner = 1;
+inline constexpr int kBackRightCorner = 2;
+inline constexpr int kBackLeftCorner = 3;
+
 struct ParkingSlot {
+  // Occupancy at capture time.
+  static constexpr int kOccupancyUnknown = -1;
+
   std::string slot_id;  // "L<level>-R<row>-<index>".
   std::string row;      // "R<n>".
   int level = 0;
-  std::array<Vec2, 4> corners;
+  std::array<Vec2, kParkingSlotCorners> corners;
   double z = 0.0;
   double width = 0.0;
   double depth = 0.0;
-  int occupied = -1;  // At capture time: -1 not measured, 0 / 1.
+  int occupied = kOccupancyUnknown;  // Else 0 (free) / 1 (occupied).
   bool inferred = false;
   double confidence = 1.0;
 };

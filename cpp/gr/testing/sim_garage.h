@@ -27,9 +27,12 @@ struct StaticScan {
   std::vector<int> box_ids;
 };
 
+// Range (m) of the static scans.
+inline constexpr double kDefaultScanRange = 50.0;
+
 // 16 beams in [-15, 15] deg and 720 azimuth steps from a static sensor.
 StaticScan ScanFromPose(const BoxScene& scene, const Pose& world_from_sensor,
-                        double max_range = 50.0);
+                        double max_range = kDefaultScanRange);
 
 // 60 m corridor with columns: enough structure to constrain all 6 DoF.
 BoxScene CorridorScene();
@@ -54,10 +57,11 @@ BoxScene MakeScene(const std::vector<SimBox>& boxes);
 // y = 15, left half-turn around (2, 10); arc length from (2, 5).
 class LoopRoute {
  public:
-  static constexpr double kRadius = 5.0;
-  static constexpr double kStraight = 26.0;
+  static constexpr double kRadius = 5.0;     // m
+  static constexpr double kStraight = 26.0;  // m
+  static constexpr double kDefaultSpeed = 4.0;  // m/s
 
-  explicit LoopRoute(double start = 0.0, double speed = 4.0)
+  explicit LoopRoute(double start = 0.0, double speed = kDefaultSpeed)
       : start_(start), speed_(speed) {}
 
   double length() const { return 2.0 * kStraight + 2.0 * kPi * kRadius; }

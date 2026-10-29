@@ -9,30 +9,36 @@
 #include "gr/core/voxel.h"
 
 namespace gr {
+namespace {
+
+// Resolutions closer than this (m) are the same.
+constexpr double kVoxelTolerance = 1e-6;
+
+}  // namespace
 
 KeyframeSet::KeyframeSet(std::vector<double> voxels) {
-  for (double v : voxels) {
-    GR_CHECK(v > 0.0);
-    if (Slot(v) < 0) voxels_.push_back(v);
+  for (double voxel : voxels) {
+    GR_CHECK(voxel > 0.0);
+    if (Slot(voxel) == kNoSlot) voxels_.push_back(voxel);
   }
   clouds_.resize(voxels_.size());
 }
 
 int KeyframeSet::Add(const Keyframe& keyframe, const Points& sweep) {
-  const int k = static_cast<int>(keyframes_.size());
+  const int index = static_cast<int>(keyframes_.size());
   keyframes_.push_back(keyframe);
-  for (size_t s = 0; s < voxels_.size(); ++s) {
-    clouds_[s].push_back(VoxelDownsample(sweep, voxels_[s]));
+  for (size_t slot = 0; slot < voxels_.size(); ++slot) {
+    clouds_[slot].push_back(VoxelDownsample(sweep, voxels_[slot]));
   }
-  by_trip_[keyframe.trip].push_back(k);
-  return k;
+  by_trip_[keyframe.trip].push_back(index);
+  return index;
 }
 
 const std::vector<int>& KeyframeSet::TripIndices(int trip) const {
   // Never destroyed (Google style: no non-trivial static destructors).
   static const auto* const kEmpty = new std::vector<int>();
-  const auto it = by_trip_.find(trip);
-  return it == by_trip_.end() ? *kEmpty : it->second;
+  const auto found = by_trip_.find(trip);
+  return found == by_trip_.end() ? *kEmpty : found->second;
 }
 
 std::vector<Pose> KeyframeSet::OdomPoses() const {
@@ -43,19 +49,23 @@ std::vector<Pose> KeyframeSet::OdomPoses() const {
 }
 
 int KeyframeSet::Slot(double voxel) const {
-  for (size_t s = 0; s < voxels_.size(); ++s) {
-    if (std::abs(voxels_[s] - voxel) < 1e-6) return static_cast<int>(s);
+  for (size_t slot = 0; slot < voxels_.size(); ++slot) {
+    if (std::abs(voxels_[slot] - voxel) < kVoxelTolerance) {
+      return static_cast<int>(slot);
+    }
   }
-  return -1;
+  return kNoSlot;
 }
 
-bool KeyframeSet::HasVoxel(double voxel) const { return Slot(voxel) >= 0; }
+bool KeyframeSet::HasVoxel(double voxel) const {
+  return Slot(voxel) != kNoSlot;
+}
 
-const Points& KeyframeSet::Cloud(size_t k, double voxel) const {
+const Points& KeyframeSet::Cloud(size_t index, double voxel) const {
   const int slot = Slot(voxel);
-  GR_CHECK(slot >= 0);
-  GR_CHECK(k < keyframes_.size());
-  return clouds_[static_cast<size_t>(slot)][k];
+  GR_CHECK(slot != kNoSlot);
+  GR_CHECK(index < keyframes_.size());
+  return clouds_[static_cast<size_t>(slot)][index];
 }
 
 std::vector<double> KeyframeSet::PathDistance(
@@ -64,36 +74,39 @@ std::vector<double> KeyframeSet::PathDistance(
   std::vector<double> out(keyframes_.size(), 0.0);
   for (const auto& [trip, indices] : by_trip_) {
     double travelled = 0.0;
-    for (size_t a = 1; a < indices.size(); ++a) {
-      travelled += (poses[static_cast<size_t>(indices[a])].translation -
-                    poses[static_cast<size_t>(indices[a - 1])].translation)
-                       .norm();
-      out[static_cast<size_t>(indices[a])] = travelled;
+    for (size_t position = 1; position < indices.size(); ++position) {
+      travelled +=
+          (poses[static_cast<size_t>(indices[position])].translation -
+           poses[static_cast<size_t>(indices[position - 1])].translation)
+              .norm();
+      out[static_cast<size_t>(indices[position])] = travelled;
     }
   }
   return out;
 }
 
-Points KeyframeSet::Submap(size_t k, int half_window, double voxel,
+Points KeyframeSet::Submap(size_t index, int half_window, double voxel,
                            const std::vector<Pose>& poses) const {
   GR_CHECK(poses.size() == keyframes_.size());
   const int slot = Slot(voxel);
-  GR_CHECK(slot >= 0);
-  GR_CHECK(k < keyframes_.size());
-  const std::vector<int>& indices = TripIndices(keyframes_[k].trip);
-  const int64_t position =
-      std::lower_bound(indices.begin(), indices.end(), static_cast<int>(k)) -
-      indices.begin();
-  const int64_t lo = std::max<int64_t>(0, position - half_window);
-  const int64_t hi = std::min<int64_t>(static_cast<int64_t>(indices.size()),
-                                       position + half_window + 1);
-  const Pose k_from_world = poses[k].Inverse();
+  GR_CHECK(slot != kNoSlot);
+  GR_CHECK(index < keyframes_.size());
+  const std::vector<int>& indices = TripIndices(keyframes_[index].trip);
+  const int64_t position = std::lower_bound(indices.begin(), indices.end(),
+                                            static_cast<int>(index)) -
+                           indices.begin();
+  const int64_t first = std::max<int64_t>(0, position - half_window);
+  const int64_t end = std::min<int64_t>(static_cast<int64_t>(indices.size()),
+                                        position + half_window + 1);
+  const Pose center_from_world = poses[index].Inverse();
   Points points;
-  for (int64_t a = lo; a < hi; ++a) {
-    const size_t j = static_cast<size_t>(indices[static_cast<size_t>(a)]);
-    const Pose k_from_j = k_from_world * poses[j];
-    for (const Vec3& p : clouds_[static_cast<size_t>(slot)][j]) {
-      points.push_back(k_from_j * p);
+  for (int64_t neighbor_position = first; neighbor_position < end;
+       ++neighbor_position) {
+    const size_t neighbor =
+        static_cast<size_t>(indices[static_cast<size_t>(neighbor_position)]);
+    const Pose center_from_neighbor = center_from_world * poses[neighbor];
+    for (const Vec3& point : clouds_[static_cast<size_t>(slot)][neighbor]) {
+      points.push_back(center_from_neighbor * point);
     }
   }
   return VoxelDownsample(points, voxel);

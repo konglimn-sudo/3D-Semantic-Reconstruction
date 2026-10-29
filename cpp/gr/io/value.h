@@ -12,11 +12,17 @@
 #ifndef GARAGE_RECON_GR_IO_VALUE_H_
 #define GARAGE_RECON_GR_IO_VALUE_H_
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace gr {
+
+// ToJson's `indent` for one line, and its default: the indentation the
+// Python stages write with (json.dump(..., indent=1)).
+inline constexpr int kJsonOneLine = -1;
+inline constexpr int kDefaultJsonIndent = 1;
 
 class Value {
  public:
@@ -25,7 +31,7 @@ class Value {
   Value() = default;
   static Value Bool(bool value);
   static Value Number(double value);
-  static Value Integer(long long value);  // Written without a fraction.
+  static Value Integer(int64_t value);  // Written without a fraction.
   static Value String(std::string value);
   static Value List();
   static Value Map();
@@ -48,7 +54,7 @@ class Value {
 
   // Lists and maps: number of items / members; 0 otherwise.
   size_t size() const;
-  const std::vector<Value>& items() const;  // Lists.
+  const std::vector<Value>& items() const;                            // Lists.
   const std::vector<std::pair<std::string, Value>>& members() const;  // Maps.
 
   // Member of a map (nullptr if absent or not a map).
@@ -83,7 +89,7 @@ Value ReadJsonFile(const std::string& path);
 // JSON text: `indent` spaces per level (negative: one line). Numbers are
 // written in their shortest round-trip form, integral ones without a
 // fraction; non-ASCII text is kept as UTF-8.
-std::string ToJson(const Value& value, int indent = 1);
+std::string ToJson(const Value& value, int indent = kDefaultJsonIndent);
 
 // Block-style YAML that PyYAML (YAML 1.1) reads back to the same value:
 // keys and strings double-quoted, lists of scalars in flow style, floats

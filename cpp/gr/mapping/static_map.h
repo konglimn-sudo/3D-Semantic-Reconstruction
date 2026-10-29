@@ -19,6 +19,13 @@
 
 namespace gr {
 
+// Distinct entries of a symmetric 3 x 3 matrix (xx, xy, xz, yy, yz, zz).
+inline constexpr int kSymmetricTerms = 6;
+
+// Neighbours of the map normals (EstimateOrientedNormals defaults).
+inline constexpr int kMapNormalMinNeighbors = 6;
+inline constexpr int kMapNormalMaxNeighbors = 48;
+
 // How the observations falling into one voxel become a map point.
 struct MapFusionConfig {
   // false: the observation from the closest sensor position wins (the v1
@@ -71,7 +78,7 @@ class MapAccumulator {
     std::vector<int> keyframe;      // Keyframe of the nearest observation.
     std::vector<int> observations;  // Observations averaged per point.
     // Covariance of the averaged observations (xx, xy, xz, yy, yz, zz), m^2.
-    std::vector<std::array<float, 6>> spread;
+    std::vector<std::array<float, kSymmetricTerms>> spread;
     std::vector<float> model_sigma;  // Formal sigma of the weighted mean (m).
     // The order key of Collect: nearest observation range, then the
     // keyframe (high 32 bits) and point index of that observation. The
@@ -95,22 +102,25 @@ class MapAccumulator {
   const MapFusionConfig& fusion() const { return fusion_; }
 
  private:
+  // A cell that has not seen an observation yet.
+  static constexpr int kNoKeyframe = -1;
+
   struct Cell {
     double range = 0.0;  // Nearest observation.
     int64_t sequence = 0;
     Vec3 point = Vec3::Zero();  // Nearest observation (no fusion).
     float intensity = 0.0f;
-    int keyframe = -1;
+    int keyframe = kNoKeyframe;
     // Fusion sums, relative to the voxel centre.
     float weight = 0.0f;
-    std::array<float, 3> sum{};
-    std::array<float, 6> outer{};
+    std::array<float, kSpaceDim> sum{};
+    std::array<float, kSymmetricTerms> outer{};
     float weighted_intensity = 0.0f;
     int count = 0;
   };
 
   double voxel_;
-  double inv_voxel_;
+  double inverse_voxel_;
   double max_range_;
   MapFusionConfig fusion_;
   std::optional<VoxelRegion> region_;
@@ -127,11 +137,11 @@ std::vector<float> PointSigmas(const MapAccumulator::Cloud& cloud,
 
 // Normals of the map points, flipped towards the sensor position of the
 // keyframe that observed each point.
-NormalsResult EstimateOrientedNormals(const Points& points,
-                                      const std::vector<int>& keyframe,
-                                      const std::vector<Vec3>& keyframe_origins,
-                                      double radius, int min_neighbors = 6,
-                                      int max_neighbors = 48);
+NormalsResult EstimateOrientedNormals(
+    const Points& points, const std::vector<int>& keyframe,
+    const std::vector<Vec3>& keyframe_origins, double radius,
+    int min_neighbors = kMapNormalMinNeighbors,
+    int max_neighbors = kMapNormalMaxNeighbors);
 
 // Median elevation gap (deg) between LiDAR beams measured on sweeps, so that
 // range-image rows match the scanner.
@@ -179,8 +189,10 @@ class DynamicDetector {
   DynamicDetector& operator=(DynamicDetector&&) = default;
 
   size_t num_points() const { return map_.size(); }
-  void SetElevationResolution(double degrees) { el_res_ = degrees; }
-  double elevation_resolution() const { return el_res_; }
+  void SetElevationResolution(double degrees) {
+    elevation_resolution_ = degrees;
+  }
+  double elevation_resolution() const { return elevation_resolution_; }
   // Height of every map point above its floor; lower points are never
   // dynamic (floors are grazed by many rays).
   void SetHeights(const std::vector<double>& height);
@@ -200,7 +212,7 @@ class DynamicDetector {
   std::vector<int> trip_;
   std::vector<double> height_;
   VisibilityVoter voter_;
-  double el_res_ = 0.0;
+  double elevation_resolution_ = 0.0;  // deg; <= 0: not measured yet.
   std::map<int, Points> ego_paths_;
 };
 

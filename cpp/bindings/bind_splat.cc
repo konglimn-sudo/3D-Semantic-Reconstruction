@@ -24,6 +24,15 @@ using ::pybind11::literals::operator""_a;
 using U8Array = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
 using F64Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
+// Quaternion columns of the Gaussian rotations: (w, x, y, z).
+constexpr int kQuaternionDim = 4;
+constexpr int kQuaternionW = 0;
+constexpr int kQuaternionX = 1;
+constexpr int kQuaternionY = 2;
+constexpr int kQuaternionZ = 3;
+// Depth samples are (u, v, range) rows.
+constexpr int kDepthSampleColumns = 3;
+
 // (N, k) float64 rows of an array-like with `columns` columns.
 F64Array Rows(const py::object& values, py::ssize_t rows, int columns,
               const char* name) {
@@ -39,29 +48,31 @@ GaussianSet GaussianSetFrom(const PointsIn& means, const py::object& quats,
                             const py::object& scales, const py::object& opacity,
                             const py::object& intensity,
                             const py::object& trip) {
-  const py::ssize_t n = means.rows();
+  const py::ssize_t count = means.rows();
   GaussianSet set;
   set.means = ToPoints(means);
-  const F64Array q = Rows(quats, n, 4, "quats");
-  const F64Array s = Rows(scales, n, 3, "scales");
-  auto qv = q.unchecked<2>();
-  auto sv = s.unchecked<2>();
-  set.rotations.resize(static_cast<size_t>(n));
-  set.scales.resize(static_cast<size_t>(n));
-  for (py::ssize_t i = 0; i < n; ++i) {
-    set.rotations[static_cast<size_t>(i)] =
-        Eigen::Quaterniond(qv(i, 0), qv(i, 1), qv(i, 2), qv(i, 3));
-    set.scales[static_cast<size_t>(i)] = Vec3(sv(i, 0), sv(i, 1), sv(i, 2));
+  const F64Array quat_rows = Rows(quats, count, kQuaternionDim, "quats");
+  const F64Array scale_rows = Rows(scales, count, kSpaceDim, "scales");
+  auto quat = quat_rows.unchecked<2>();
+  auto scale = scale_rows.unchecked<2>();
+  set.rotations.resize(static_cast<size_t>(count));
+  set.scales.resize(static_cast<size_t>(count));
+  for (py::ssize_t i = 0; i < count; ++i) {
+    set.rotations[static_cast<size_t>(i)] = Eigen::Quaterniond(
+        quat(i, kQuaternionW), quat(i, kQuaternionX), quat(i, kQuaternionY),
+        quat(i, kQuaternionZ));
+    set.scales[static_cast<size_t>(i)] =
+        Vec3(scale(i, 0), scale(i, 1), scale(i, 2));
   }
   set.opacity = ToFloatVector(opacity);
-  Require(set.opacity.size() == static_cast<size_t>(n),
+  Require(set.opacity.size() == static_cast<size_t>(count),
           "opacity must have N values");
   set.intensity = ToFloatVector(intensity);
   Require(set.intensity.empty() ||
-              set.intensity.size() == static_cast<size_t>(n),
+              set.intensity.size() == static_cast<size_t>(count),
           "intensity must have N values");
   set.trip = ToIntVector(trip);
-  Require(set.trip.empty() || set.trip.size() == static_cast<size_t>(n),
+  Require(set.trip.empty() || set.trip.size() == static_cast<size_t>(count),
           "trip must have N values");
   set.FillDefaults();
   return set;
@@ -96,31 +107,32 @@ void BindSplat(py::module_& m) {
          const py::object& sigma, const GaussianInitConfig& config) {
         Require(config.search_radius > 0.0 && config.neighbors > 0,
                 "search_radius and neighbors must be positive");
-        const Points p = ToPoints(points);
-        const Points n = PointsFrom(normals);
-        Require(n.empty() || n.size() == p.size(),
+        const Points cloud = ToPoints(points);
+        const Points point_normals = PointsFrom(normals);
+        Require(point_normals.empty() || point_normals.size() == cloud.size(),
                 "normals must match the points");
-        const std::vector<double> s = ToDoubleVector(sigma);
-        Require(s.empty() || s.size() == p.size(),
+        const std::vector<double> point_sigma = ToDoubleVector(sigma);
+        Require(point_sigma.empty() || point_sigma.size() == cloud.size(),
                 "sigma must match the points");
         GaussianSet set;
         {
           py::gil_scoped_release release;
-          set = InitGaussians(p, n, s, config);
+          set = InitGaussians(cloud, point_normals, point_sigma, config);
         }
         const py::ssize_t size = static_cast<py::ssize_t>(set.size());
-        py::array_t<double> quats({size, py::ssize_t{4}});
-        py::array_t<double> scales({size, py::ssize_t{3}});
-        auto q = quats.mutable_unchecked<2>();
-        auto sc = scales.mutable_unchecked<2>();
+        py::array_t<double> quats({size, py::ssize_t{kQuaternionDim}});
+        py::array_t<double> scales({size, py::ssize_t{kSpaceDim}});
+        auto quat = quats.mutable_unchecked<2>();
+        auto scale = scales.mutable_unchecked<2>();
         for (py::ssize_t i = 0; i < size; ++i) {
-          const Eigen::Quaterniond& r = set.rotations[static_cast<size_t>(i)];
-          q(i, 0) = r.w();
-          q(i, 1) = r.x();
-          q(i, 2) = r.y();
-          q(i, 3) = r.z();
-          for (int a = 0; a < 3; ++a) {
-            sc(i, a) = set.scales[static_cast<size_t>(i)][a];
+          const Eigen::Quaterniond& rotation =
+              set.rotations[static_cast<size_t>(i)];
+          quat(i, kQuaternionW) = rotation.w();
+          quat(i, kQuaternionX) = rotation.x();
+          quat(i, kQuaternionY) = rotation.y();
+          quat(i, kQuaternionZ) = rotation.z();
+          for (int axis = 0; axis < kSpaceDim; ++axis) {
+            scale(i, axis) = set.scales[static_cast<size_t>(i)][axis];
           }
         }
         py::dict out;
@@ -166,12 +178,12 @@ void BindSplat(py::module_& m) {
              const PointsIn& directions, int trip) {
             Require(origins.rows() == directions.rows(),
                     "origins and directions must have the same length");
-            const Points o = ToPoints(origins);
-            const Points d = ToPoints(directions);
+            const Points ray_origins = ToPoints(origins);
+            const Points ray_directions = ToPoints(directions);
             RayRender render;
             {
               py::gil_scoped_release release;
-              render = renderer.Render(o, d, trip);
+              render = renderer.Render(ray_origins, ray_directions, trip);
             }
             py::dict out;
             out["depth"] = ToArray(render.depth);
@@ -202,12 +214,13 @@ void BindSplat(py::module_& m) {
   py::class_<CameraCoverage>(m, "CameraCoverage")
       .def(py::init([](const PointsIn& points, const py::object& normals,
                        const CoverageConfig& config) {
-             Points p = ToPoints(points);
-             Points n = PointsFrom(normals);
-             Require(n.empty() || n.size() == p.size(),
+             Points cloud = ToPoints(points);
+             Points point_normals = PointsFrom(normals);
+             Require(point_normals.empty() ||
+                         point_normals.size() == cloud.size(),
                      "normals must match the points");
-             return std::make_unique<CameraCoverage>(std::move(p), std::move(n),
-                                                     config);
+             return std::make_unique<CameraCoverage>(
+                 std::move(cloud), std::move(point_normals), config);
            }),
            "points"_a, "normals"_a = py::none(),
            "config"_a = CoverageConfig())
@@ -222,12 +235,13 @@ void BindSplat(py::module_& m) {
             ImageView view;
             if (!image.is_none()) {
               holder = U8Array::ensure(image);
-              Require(holder && holder.ndim() == 3 && holder.shape(2) == 3 &&
+              Require(holder && holder.ndim() == 3 &&
+                          holder.shape(2) == kRgbChannels &&
                           holder.shape(0) == camera.height() &&
                           holder.shape(1) == camera.width(),
                       "image must be HxWx3 uint8 like the camera");
               view = ImageView{holder.data(), camera.height(), camera.width(),
-                               3};
+                               kRgbChannels};
             }
             const U8Array mask_array =
                 MaskView(mask, camera.height(), camera.width());
@@ -242,21 +256,23 @@ void BindSplat(py::module_& m) {
           "last row. Without an image every visible point counts.")
       .def("result",
            [](const CameraCoverage& coverage) {
-             const CoverageResult r = coverage.Result();
+             const CoverageResult result = coverage.Result();
              py::array_t<float> color(
-                 {static_cast<py::ssize_t>(r.color.size()), py::ssize_t{3}});
-             auto c = color.mutable_unchecked<2>();
-             for (size_t i = 0; i < r.color.size(); ++i) {
-               for (int a = 0; a < 3; ++a) {
-                 c(static_cast<py::ssize_t>(i), a) = r.color[i][a];
+                 {static_cast<py::ssize_t>(result.color.size()),
+                  py::ssize_t{kRgbChannels}});
+             auto color_rows = color.mutable_unchecked<2>();
+             for (size_t i = 0; i < result.color.size(); ++i) {
+               for (int channel = 0; channel < kRgbChannels; ++channel) {
+                 color_rows(static_cast<py::ssize_t>(i), channel) =
+                     result.color[i][channel];
                }
              }
              py::dict out;
-             out["views"] = ToArray(r.views);
-             out["good_views"] = ToArray(r.good_views);
-             out["best_gsd"] = ToArray(r.best_gsd);
+             out["views"] = ToArray(result.views);
+             out["good_views"] = ToArray(result.good_views);
+             out["best_gsd"] = ToArray(result.best_gsd);
              out["color"] = color;
-             out["color_weight"] = ToArray(r.color_weight);
+             out["color_weight"] = ToArray(result.color_weight);
              return out;
            })
       .def_property_readonly("frames", &CameraCoverage::frames);
@@ -300,38 +316,42 @@ void BindSplat(py::module_& m) {
         const int height = static_cast<int>(shape.shape(0));
         const int width = static_cast<int>(shape.shape(1));
         Require(config.cell > 0, "cell must be positive");
-        const std::vector<float> p = ToDepth(prior, height, width);
-        const std::vector<float> c = ToDepth(confidence, height, width);
-        const std::vector<float> l = ToDepth(lidar, height, width);
-        Require(!p.empty(), "prior must be (height, width)");
-        std::vector<DepthSample> s;
+        const std::vector<float> prior_range = ToDepth(prior, height, width);
+        const std::vector<float> prior_confidence =
+            ToDepth(confidence, height, width);
+        const std::vector<float> lidar_range = ToDepth(lidar, height, width);
+        Require(!prior_range.empty(), "prior must be (height, width)");
+        std::vector<DepthSample> depth_samples;
         if (!samples.is_none()) {
           F64Array array = F64Array::ensure(samples);
-          Require(array && array.ndim() == 2 && array.shape(1) == 3,
+          Require(array && array.ndim() == 2 &&
+                      array.shape(1) == kDepthSampleColumns,
                   "samples must be (N, 3) rows of u, v, range");
-          const double* d = array.data();
-          s.resize(static_cast<size_t>(array.shape(0)));
-          for (size_t i = 0; i < s.size(); ++i) {
-            s[i] = {d[3 * i], d[3 * i + 1], d[3 * i + 2]};
+          const double* data = array.data();
+          depth_samples.resize(static_cast<size_t>(array.shape(0)));
+          for (size_t i = 0; i < depth_samples.size(); ++i) {
+            const double* row = data + kDepthSampleColumns * i;
+            depth_samples[i] = {row[0], row[1], row[2]};
           }
         }
         FusedDepth fused;
         {
           py::gil_scoped_release release;
-          fused = FuseDepthPrior(p, c, l, s, height, width, config);
+          fused = FuseDepthPrior(prior_range, prior_confidence, lidar_range,
+                                 depth_samples, height, width, config);
         }
-        const DepthAlignment& a = fused.alignment;
+        const DepthAlignment& fit = fused.alignment;
         py::dict alignment;
-        alignment["valid"] = a.valid;
-        alignment["scale"] = a.scale;
-        alignment["shift"] = a.shift;
-        alignment["raw_ratio"] = a.raw_ratio;
-        alignment["pixels"] = a.pixels;
-        alignment["residual_median"] = a.residual_median;
-        alignment["residual_p90"] = a.residual_p90;
-        alignment["inlier_fraction"] = a.inlier_fraction;
-        alignment["cells_checked"] = a.cells_checked;
-        alignment["cells_rejected"] = a.cells_rejected;
+        alignment["valid"] = fit.valid;
+        alignment["scale"] = fit.scale;
+        alignment["shift"] = fit.shift;
+        alignment["raw_ratio"] = fit.raw_ratio;
+        alignment["pixels"] = fit.pixels;
+        alignment["residual_median"] = fit.residual_median;
+        alignment["residual_p90"] = fit.residual_p90;
+        alignment["inlier_fraction"] = fit.inlier_fraction;
+        alignment["cells_checked"] = fit.cells_checked;
+        alignment["cells_rejected"] = fit.cells_rejected;
         alignment["prior_pixels"] = fused.prior_pixels;
         return py::make_tuple(ToImage(fused.range, height, width),
                               ToImage(fused.confidence, height, width),

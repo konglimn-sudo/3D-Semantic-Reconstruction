@@ -14,42 +14,42 @@
 namespace gr {
 
 Value Value::Bool(bool value) {
-  Value v;
-  v.kind_ = Kind::kBool;
-  v.bool_ = value;
-  return v;
+  Value out;
+  out.kind_ = Kind::kBool;
+  out.bool_ = value;
+  return out;
 }
 
 Value Value::Number(double value) {
-  Value v;
-  v.kind_ = Kind::kNumber;
-  v.number_ = value;
-  return v;
+  Value out;
+  out.kind_ = Kind::kNumber;
+  out.number_ = value;
+  return out;
 }
 
-Value Value::Integer(long long value) {
-  Value v = Number(static_cast<double>(value));
-  v.integer_ = true;
-  return v;
+Value Value::Integer(int64_t value) {
+  Value out = Number(static_cast<double>(value));
+  out.integer_ = true;
+  return out;
 }
 
 Value Value::String(std::string value) {
-  Value v;
-  v.kind_ = Kind::kString;
-  v.string_ = std::move(value);
-  return v;
+  Value out;
+  out.kind_ = Kind::kString;
+  out.string_ = std::move(value);
+  return out;
 }
 
 Value Value::List() {
-  Value v;
-  v.kind_ = Kind::kList;
-  return v;
+  Value out;
+  out.kind_ = Kind::kList;
+  return out;
 }
 
 Value Value::Map() {
-  Value v;
-  v.kind_ = Kind::kMap;
-  return v;
+  Value out;
+  out.kind_ = Kind::kMap;
+  return out;
 }
 
 namespace {
@@ -177,47 +177,94 @@ Value& Value::Append(Value value) {
 
 namespace {
 
+// UTF-8 (RFC 3629): code points below these limits take one, two or three
+// bytes, the others four. The lead byte of a multi-byte sequence marks its
+// length; the continuation bytes carry 6 bits each.
+constexpr unsigned kOneByteLimit = 0x80;
+constexpr unsigned kTwoByteLimit = 0x800;
+constexpr unsigned kThreeByteLimit = 0x10000;
+constexpr unsigned kTwoByteLead = 0xC0;
+constexpr unsigned kThreeByteLead = 0xE0;
+constexpr unsigned kFourByteLead = 0xF0;
+constexpr unsigned kContinuationMarker = 0x80;
+constexpr unsigned kContinuationMask = 0x3F;
+constexpr int kContinuationBits = 6;
+
+// Escapes: "\xXX" and "\uXXXX".
+constexpr int kHexDigitBits = 4;
+constexpr unsigned kFirstHexLetterValue = 10;  // 'a' and 'A'.
+constexpr int kByteEscapeDigits = 2;
+constexpr int kUnicodeEscapeDigits = 4;
+constexpr size_t kEscapePrefixLength = 2;  // A backslash and the letter.
+constexpr size_t kUnicodeEscapeLength =
+    kEscapePrefixLength + kUnicodeEscapeDigits;
+// UTF-16 surrogate pairs (JSON's encoding of characters beyond the BMP):
+// the high surrogate carries the upper 10 bits of the offset from
+// kFirstSupplementary, the low one the lower 10.
+constexpr unsigned kHighSurrogateFirst = 0xD800;
+constexpr unsigned kLowSurrogateFirst = 0xDC00;
+constexpr unsigned kLowSurrogateEnd = 0xE000;
+constexpr unsigned kFirstSupplementary = 0x10000;
+constexpr int kSurrogateBits = 10;
+// JSON escapes the control characters below this one.
+constexpr unsigned kFirstUnescapedCharacter = 0x20;
+
+constexpr int kDecimalBase = 10;
+
 [[noreturn]] void Fail(int line, const std::string& message) {
   throw std::runtime_error("line " + std::to_string(line) + ": " + message);
 }
 
-std::string Trim(const std::string& s) {
-  const size_t begin = s.find_first_not_of(" \t");
+std::string Trim(const std::string& text) {
+  const size_t begin = text.find_first_not_of(" \t");
   if (begin == std::string::npos) return "";
-  const size_t end = s.find_last_not_of(" \t");
-  return s.substr(begin, end - begin + 1);
+  const size_t end = text.find_last_not_of(" \t");
+  return text.substr(begin, end - begin + 1);
+}
+
+// The continuation byte with bits [6 * position, 6 * position + 6) of `code`.
+char ContinuationByte(unsigned code, int position) {
+  return static_cast<char>(
+      kContinuationMarker |
+      ((code >> (kContinuationBits * position)) & kContinuationMask));
+}
+
+// The lead byte of a sequence with `continuations` continuation bytes.
+char LeadByte(unsigned code, unsigned lead, int continuations) {
+  return static_cast<char>(lead |
+                           (code >> (kContinuationBits * continuations)));
 }
 
 void AppendUtf8(unsigned code, std::string* out) {
-  if (code < 0x80) {
+  if (code < kOneByteLimit) {
     out->push_back(static_cast<char>(code));
-  } else if (code < 0x800) {
-    out->push_back(static_cast<char>(0xC0 | (code >> 6)));
-    out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
-  } else if (code < 0x10000) {
-    out->push_back(static_cast<char>(0xE0 | (code >> 12)));
-    out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+  } else if (code < kTwoByteLimit) {
+    out->push_back(LeadByte(code, kTwoByteLead, 1));
+    out->push_back(ContinuationByte(code, 0));
+  } else if (code < kThreeByteLimit) {
+    out->push_back(LeadByte(code, kThreeByteLead, 2));
+    out->push_back(ContinuationByte(code, 1));
+    out->push_back(ContinuationByte(code, 0));
   } else {
-    out->push_back(static_cast<char>(0xF0 | (code >> 18)));
-    out->push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    out->push_back(LeadByte(code, kFourByteLead, 3));
+    out->push_back(ContinuationByte(code, 2));
+    out->push_back(ContinuationByte(code, 1));
+    out->push_back(ContinuationByte(code, 0));
   }
 }
 
-unsigned ParseHex(const std::string& s, size_t at, int digits, int line) {
-  if (at + digits > s.size()) Fail(line, "truncated escape");
+unsigned ParseHex(const std::string& text, size_t at, int digits, int line) {
+  if (at + digits > text.size()) Fail(line, "truncated escape");
   unsigned code = 0;
   for (int k = 0; k < digits; ++k) {
-    const char c = s[at + k];
-    code <<= 4;
-    if (c >= '0' && c <= '9') {
-      code |= c - '0';
-    } else if (c >= 'a' && c <= 'f') {
-      code |= c - 'a' + 10;
-    } else if (c >= 'A' && c <= 'F') {
-      code |= c - 'A' + 10;
+    const char digit = text[at + k];
+    code <<= kHexDigitBits;
+    if (digit >= '0' && digit <= '9') {
+      code |= digit - '0';
+    } else if (digit >= 'a' && digit <= 'f') {
+      code |= digit - 'a' + kFirstHexLetterValue;
+    } else if (digit >= 'A' && digit <= 'F') {
+      code |= digit - 'A' + kFirstHexLetterValue;
     } else {
       Fail(line, "bad hex digit in an escape");
     }
@@ -225,26 +272,27 @@ unsigned ParseHex(const std::string& s, size_t at, int digits, int line) {
   return code;
 }
 
-// A double-quoted string (JSON or YAML) starting at s[i] == '"'; leaves `i`
-// after the closing quote.
-std::string ParseDoubleQuoted(const std::string& s, size_t& i, int line) {
+// A double-quoted string (JSON or YAML) starting at text[position] == '"';
+// leaves `position` after the closing quote.
+std::string ParseDoubleQuoted(const std::string& text, size_t& position,
+                              int line) {
   std::string out;
-  ++i;
+  ++position;
   while (true) {
-    if (i >= s.size()) Fail(line, "unterminated string");
-    const char c = s[i++];
-    if (c == '"') return out;
-    if (c != '\\') {
-      out.push_back(c);
+    if (position >= text.size()) Fail(line, "unterminated string");
+    const char character = text[position++];
+    if (character == '"') return out;
+    if (character != '\\') {
+      out.push_back(character);
       continue;
     }
-    if (i >= s.size()) Fail(line, "unterminated string");
-    const char e = s[i++];
-    switch (e) {
+    if (position >= text.size()) Fail(line, "unterminated string");
+    const char escape = text[position++];
+    switch (escape) {
       case '"':
       case '\\':
       case '/':
-        out.push_back(e);
+        out.push_back(escape);
         break;
       case 'b':
         out.push_back('\b');
@@ -265,42 +313,47 @@ std::string ParseDoubleQuoted(const std::string& s, size_t& i, int line) {
         out.push_back('\0');
         break;
       case 'x':
-        AppendUtf8(ParseHex(s, i, 2, line), &out);
-        i += 2;
+        AppendUtf8(ParseHex(text, position, kByteEscapeDigits, line), &out);
+        position += kByteEscapeDigits;
         break;
       case 'u': {
-        unsigned code = ParseHex(s, i, 4, line);
-        i += 4;
-        // A surrogate pair (JSON's encoding of characters beyond the BMP).
-        if (code >= 0xD800 && code < 0xDC00 && i + 6 <= s.size() &&
-            s[i] == '\\' && s[i + 1] == 'u') {
-          const unsigned low = ParseHex(s, i + 2, 4, line);
-          if (low >= 0xDC00 && low < 0xE000) {
-            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-            i += 6;
+        unsigned code = ParseHex(text, position, kUnicodeEscapeDigits, line);
+        position += kUnicodeEscapeDigits;
+        // A surrogate pair: this high surrogate and the low one after it.
+        if (code >= kHighSurrogateFirst && code < kLowSurrogateFirst &&
+            position + kUnicodeEscapeLength <= text.size() &&
+            text[position] == '\\' && text[position + 1] == 'u') {
+          const unsigned low = ParseHex(text, position + kEscapePrefixLength,
+                                        kUnicodeEscapeDigits, line);
+          if (low >= kLowSurrogateFirst && low < kLowSurrogateEnd) {
+            code = kFirstSupplementary +
+                   ((code - kHighSurrogateFirst) << kSurrogateBits) +
+                   (low - kLowSurrogateFirst);
+            position += kUnicodeEscapeLength;
           }
         }
         AppendUtf8(code, &out);
         break;
       }
       default:
-        Fail(line, std::string("unknown escape \\") + e);
+        Fail(line, std::string("unknown escape \\") + escape);
     }
   }
 }
 
-// A single-quoted YAML string ('' is a quote); leaves `i` after it.
-std::string ParseSingleQuoted(const std::string& s, size_t& i, int line) {
+// A single-quoted YAML string ('' is a quote); leaves `position` after it.
+std::string ParseSingleQuoted(const std::string& text, size_t& position,
+                              int line) {
   std::string out;
-  ++i;
+  ++position;
   while (true) {
-    if (i >= s.size()) Fail(line, "unterminated string");
-    const char c = s[i++];
-    if (c != '\'') {
-      out.push_back(c);
-    } else if (i < s.size() && s[i] == '\'') {
+    if (position >= text.size()) Fail(line, "unterminated string");
+    const char character = text[position++];
+    if (character != '\'') {
+      out.push_back(character);
+    } else if (position < text.size() && text[position] == '\'') {
       out.push_back('\'');
-      ++i;
+      ++position;
     } else {
       return out;
     }
@@ -310,7 +363,7 @@ std::string ParseSingleQuoted(const std::string& s, size_t& i, int line) {
 // ------------------------------------------------------------------- YAML
 
 // A plain scalar typed as PyYAML's safe_load (YAML 1.1 resolver).
-Value TypePlain(const std::string& s) {
+Value TypePlain(const std::string& text) {
   static const std::regex kNull("~|null|Null|NULL|");
   static const std::regex kTrue("yes|Yes|YES|true|True|TRUE|on|On|ON");
   static const std::regex kFalse("no|No|NO|false|False|FALSE|off|Off|OFF");
@@ -319,84 +372,89 @@ Value TypePlain(const std::string& s) {
       "[-+]?([0-9][0-9_]*)?\\.[0-9_]*([eE][-+][0-9]+)?");
   static const std::regex kInf("[-+]?\\.(inf|Inf|INF)");
   static const std::regex kNan("\\.(nan|NaN|NAN)");
-  if (std::regex_match(s, kNull)) return Value();
-  if (std::regex_match(s, kTrue)) return Value::Bool(true);
-  if (std::regex_match(s, kFalse)) return Value::Bool(false);
+  if (std::regex_match(text, kNull)) return Value();
+  if (std::regex_match(text, kTrue)) return Value::Bool(true);
+  if (std::regex_match(text, kFalse)) return Value::Bool(false);
   std::string digits;
-  for (char c : s) {
-    if (c != '_') digits.push_back(c);
+  for (char character : text) {
+    if (character != '_') digits.push_back(character);
   }
-  if (std::regex_match(s, kInt)) {
-    return Value::Integer(std::strtoll(digits.c_str(), nullptr, 10));
+  if (std::regex_match(text, kInt)) {
+    return Value::Integer(std::strtoll(digits.c_str(), nullptr, kDecimalBase));
   }
-  if (std::regex_match(s, kFloat) && s != "." && s != "+." && s != "-.") {
+  if (std::regex_match(text, kFloat) && text != "." && text != "+." &&
+      text != "-.") {
     return Value::Number(std::strtod(digits.c_str(), nullptr));
   }
-  if (std::regex_match(s, kInf)) {
+  if (std::regex_match(text, kInf)) {
     const double inf = std::numeric_limits<double>::infinity();
-    return Value::Number(s[0] == '-' ? -inf : inf);
+    return Value::Number(text[0] == '-' ? -inf : inf);
   }
-  if (std::regex_match(s, kNan)) {
+  if (std::regex_match(text, kNan)) {
     return Value::Number(std::numeric_limits<double>::quiet_NaN());
   }
-  return Value::String(s);
+  return Value::String(text);
 }
 
-// Whether a quote at s[i] opens a quoted scalar: only at the start of a
-// scalar (line start, after "key:", "- ", "[", "{" or ",").
-bool OpensQuote(const std::string& s, size_t i) {
-  size_t k = i;
-  while (k > 0 && (s[k - 1] == ' ' || s[k - 1] == '\t')) --k;
-  if (k == 0) return true;
-  const char p = s[k - 1];
-  return p == ':' || p == '-' || p == '[' || p == '{' || p == ',' ||
-         p == '?';
+// Whether a quote at text[position] opens a quoted scalar: only at the start of
+// a scalar (line start, after "key:", "- ", "[", "{" or ",").
+bool OpensQuote(const std::string& text, size_t position) {
+  size_t start = position;
+  while (start > 0 && (text[start - 1] == ' ' || text[start - 1] == '\t')) {
+    --start;
+  }
+  if (start == 0) return true;
+  const char previous = text[start - 1];
+  return previous == ':' || previous == '-' || previous == '[' ||
+         previous == '{' || previous == ',' || previous == '?';
 }
 
-// Index just after the quoted scalar starting at s[i].
-size_t SkipQuoted(const std::string& s, size_t i) {
-  const char quote = s[i];
-  for (size_t k = i + 1; k < s.size(); ++k) {
-    if (quote == '"' && s[k] == '\\') {
-      ++k;
-    } else if (s[k] == quote) {
-      if (quote == '\'' && k + 1 < s.size() && s[k + 1] == '\'') {
-        ++k;
+// Index just after the quoted scalar starting at text[position].
+size_t SkipQuoted(const std::string& text, size_t position) {
+  const char quote = text[position];
+  for (size_t scan = position + 1; scan < text.size(); ++scan) {
+    if (quote == '"' && text[scan] == '\\') {
+      ++scan;
+    } else if (text[scan] == quote) {
+      if (quote == '\'' && scan + 1 < text.size() && text[scan + 1] == '\'') {
+        ++scan;
       } else {
-        return k + 1;
+        return scan + 1;
       }
     }
   }
-  return s.size();
+  return text.size();
 }
 
-std::string StripComment(const std::string& s) {
-  for (size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if ((c == '"' || c == '\'') && OpensQuote(s, i)) {
-      i = SkipQuoted(s, i) - 1;
-    } else if (c == '#' && (i == 0 || s[i - 1] == ' ' || s[i - 1] == '\t')) {
-      return s.substr(0, i);
+std::string StripComment(const std::string& text) {
+  for (size_t position = 0; position < text.size(); ++position) {
+    const char character = text[position];
+    if ((character == '"' || character == '\'') && OpensQuote(text, position)) {
+      position = SkipQuoted(text, position) - 1;
+    } else if (character == '#' &&
+               (position == 0 || text[position - 1] == ' ' ||
+                text[position - 1] == '\t')) {
+      return text.substr(0, position);
     }
   }
-  return s;
+  return text;
 }
 
 // Position of the ':' that ends a mapping key (followed by a blank or the
 // end), outside quotes and flow collections; npos if none.
-size_t FindMappingColon(const std::string& s) {
+size_t FindMappingColon(const std::string& text) {
   int depth = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if ((c == '"' || c == '\'') && OpensQuote(s, i)) {
-      i = SkipQuoted(s, i) - 1;
-    } else if (c == '[' || c == '{') {
+  for (size_t position = 0; position < text.size(); ++position) {
+    const char character = text[position];
+    if ((character == '"' || character == '\'') && OpensQuote(text, position)) {
+      position = SkipQuoted(text, position) - 1;
+    } else if (character == '[' || character == '{') {
       ++depth;
-    } else if (c == ']' || c == '}') {
+    } else if (character == ']' || character == '}') {
       --depth;
-    } else if (c == ':' && depth == 0 &&
-               (i + 1 == s.size() || s[i + 1] == ' ')) {
-      return i;
+    } else if (character == ':' && depth == 0 &&
+               (position + 1 == text.size() || text[position + 1] == ' ')) {
+      return position;
     }
   }
   return std::string::npos;
@@ -407,74 +465,90 @@ bool IsSequenceItem(const std::string& text) {
 }
 
 // Bracket balance of a flow collection, outside quotes.
-int FlowDepth(const std::string& s) {
+int FlowDepth(const std::string& text) {
   int depth = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if ((c == '"' || c == '\'') && OpensQuote(s, i)) {
-      i = SkipQuoted(s, i) - 1;
-    } else if (c == '[' || c == '{') {
+  for (size_t position = 0; position < text.size(); ++position) {
+    const char character = text[position];
+    if ((character == '"' || character == '\'') && OpensQuote(text, position)) {
+      position = SkipQuoted(text, position) - 1;
+    } else if (character == '[' || character == '{') {
       ++depth;
-    } else if (c == ']' || c == '}') {
+    } else if (character == ']' || character == '}') {
       --depth;
     }
   }
   return depth;
 }
 
-void SkipBlanks(const std::string& s, size_t& i) {
-  while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+void SkipBlanks(const std::string& text, size_t& position) {
+  while (position < text.size() &&
+         (text[position] == ' ' || text[position] == '\t')) {
+    ++position;
+  }
 }
 
-Value ParseFlowNode(const std::string& s, size_t& i, int line, bool key);
+Value ParseFlowNode(const std::string& text, size_t& position, int line,
+                    bool key);
 
-Value ParseFlowCollection(const std::string& s, size_t& i, int line) {
-  const char open = s[i++];
+Value ParseFlowCollection(const std::string& text, size_t& position, int line) {
+  const char open = text[position++];
   const char close = open == '[' ? ']' : '}';
   Value out = open == '[' ? Value::List() : Value::Map();
   while (true) {
-    SkipBlanks(s, i);
-    if (i >= s.size()) Fail(line, "unterminated flow collection");
-    if (s[i] == close) {
-      ++i;
+    SkipBlanks(text, position);
+    if (position >= text.size()) Fail(line, "unterminated flow collection");
+    if (text[position] == close) {
+      ++position;
       return out;
     }
     if (open == '[') {
-      out.Append(ParseFlowNode(s, i, line, false));
+      out.Append(ParseFlowNode(text, position, line, false));
     } else {
-      const Value key = ParseFlowNode(s, i, line, true);
-      SkipBlanks(s, i);
-      if (i >= s.size() || s[i] != ':') Fail(line, "expected ':' in a map");
-      ++i;
-      SkipBlanks(s, i);
-      Value value;
-      if (i < s.size() && s[i] != ',' && s[i] != '}') {
-        value = ParseFlowNode(s, i, line, false);
+      const Value key = ParseFlowNode(text, position, line, true);
+      SkipBlanks(text, position);
+      if (position >= text.size() || text[position] != ':') {
+        Fail(line, "expected ':' in a map");
       }
-      out.Set(key.is_string() ? key.AsString() : ToJson(key, -1), value);
+      ++position;
+      SkipBlanks(text, position);
+      Value value;
+      if (position < text.size() && text[position] != ',' &&
+          text[position] != '}') {
+        value = ParseFlowNode(text, position, line, false);
+      }
+      out.Set(key.is_string() ? key.AsString() : ToJson(key, kJsonOneLine),
+              value);
     }
-    SkipBlanks(s, i);
-    if (i < s.size() && s[i] == ',') {
-      ++i;
-    } else if (i >= s.size() || s[i] != close) {
+    SkipBlanks(text, position);
+    if (position < text.size() && text[position] == ',') {
+      ++position;
+    } else if (position >= text.size() || text[position] != close) {
       Fail(line, std::string("expected ',' or '") + close + "'");
     }
   }
 }
 
-Value ParseFlowNode(const std::string& s, size_t& i, int line, bool key) {
-  SkipBlanks(s, i);
-  if (i >= s.size()) Fail(line, "missing value");
-  const char c = s[i];
-  if (c == '[' || c == '{') return ParseFlowCollection(s, i, line);
-  if (c == '"') return Value::String(ParseDoubleQuoted(s, i, line));
-  if (c == '\'') return Value::String(ParseSingleQuoted(s, i, line));
-  const size_t begin = i;
-  while (i < s.size() && s[i] != ',' && s[i] != ']' && s[i] != '}' &&
-         !(key && s[i] == ':')) {
-    ++i;
+Value ParseFlowNode(const std::string& text, size_t& position, int line,
+                    bool key) {
+  SkipBlanks(text, position);
+  if (position >= text.size()) Fail(line, "missing value");
+  const char character = text[position];
+  if (character == '[' || character == '{') {
+    return ParseFlowCollection(text, position, line);
   }
-  return TypePlain(Trim(s.substr(begin, i - begin)));
+  if (character == '"') {
+    return Value::String(ParseDoubleQuoted(text, position, line));
+  }
+  if (character == '\'') {
+    return Value::String(ParseSingleQuoted(text, position, line));
+  }
+  const size_t begin = position;
+  while (position < text.size() && text[position] != ',' &&
+         text[position] != ']' && text[position] != '}' &&
+         !(key && text[position] == ':')) {
+    ++position;
+  }
+  return TypePlain(Trim(text.substr(begin, position - begin)));
 }
 
 struct Line {
@@ -523,8 +597,7 @@ class YamlParser {
         continue;
       }
       const std::string rest = line.text.substr(offset);
-      if (IsSequenceItem(rest) ||
-          FindMappingColon(rest) != std::string::npos) {
+      if (IsSequenceItem(rest) || FindMappingColon(rest) != std::string::npos) {
         // Compact nested item: continues at the column of `rest`.
         line.indent = indent + static_cast<int>(offset);
         line.text = rest;
@@ -547,8 +620,8 @@ class YamlParser {
       if (colon == std::string::npos) {
         Fail(line.number, "expected 'key: value'");
       }
-      const std::string key = ParseKey(Trim(line.text.substr(0, colon)),
-                                       line.number);
+      const std::string key =
+          ParseKey(Trim(line.text.substr(0, colon)), line.number);
       const std::string rest = Trim(line.text.substr(colon + 1));
       ++pos_;
       Value value;
@@ -570,29 +643,30 @@ class YamlParser {
 
   static std::string ParseKey(const std::string& text, int line) {
     if (text.empty()) Fail(line, "empty key");
-    size_t i = 0;
-    if (text[0] == '"') return ParseDoubleQuoted(text, i, line);
-    if (text[0] == '\'') return ParseSingleQuoted(text, i, line);
+    size_t position = 0;
+    if (text[0] == '"') return ParseDoubleQuoted(text, position, line);
+    if (text[0] == '\'') return ParseSingleQuoted(text, position, line);
     return text;
   }
 
   // A value on the rest of a line; flow collections may continue on the
   // following (more indented) lines.
   Value ParseInline(std::string text, int number) {
-    const char c = text[0];
-    if (c == '&' || c == '*' || c == '!' || c == '|' || c == '>') {
+    const char first = text[0];
+    if (first == '&' || first == '*' || first == '!' || first == '|' ||
+        first == '>') {
       Fail(number, "anchors, tags and block scalars are not supported");
     }
-    if (c == '[' || c == '{') {
+    if (first == '[' || first == '{') {
       while (FlowDepth(text) > 0 && pos_ < lines_.size()) {
         text += " " + lines_[pos_++].text;
       }
     }
-    if (c == '[' || c == '{' || c == '"' || c == '\'') {
-      size_t i = 0;
-      Value out = ParseFlowNode(text, i, number, false);
-      SkipBlanks(text, i);
-      if (i != text.size()) Fail(number, "text after a value");
+    if (first == '[' || first == '{' || first == '"' || first == '\'') {
+      size_t position = 0;
+      Value out = ParseFlowNode(text, position, number, false);
+      SkipBlanks(text, position);
+      if (position != text.size()) Fail(number, "text after a value");
       return out;
     }
     return TypePlain(text);
@@ -606,85 +680,92 @@ class YamlParser {
 
 class JsonParser {
  public:
-  explicit JsonParser(const std::string& text) : s_(text) {}
+  explicit JsonParser(const std::string& text) : text_(text) {}
 
   Value Parse() {
     Value out = ParseValue();
     Skip();
-    if (i_ != s_.size()) Fail(line_, "text after the document");
+    if (position_ != text_.size()) Fail(line_, "text after the document");
     return out;
   }
 
  private:
   void Skip() {
-    while (i_ < s_.size() && std::isspace(static_cast<unsigned char>(s_[i_]))) {
-      if (s_[i_] == '\n') ++line_;
-      ++i_;
+    while (position_ < text_.size() &&
+           std::isspace(static_cast<unsigned char>(text_[position_]))) {
+      if (text_[position_] == '\n') ++line_;
+      ++position_;
     }
   }
 
   bool Consume(const char* word) {
-    const size_t n = std::char_traits<char>::length(word);
-    if (s_.compare(i_, n, word) != 0) return false;
-    i_ += n;
+    const size_t length = std::char_traits<char>::length(word);
+    if (text_.compare(position_, length, word) != 0) return false;
+    position_ += length;
     return true;
   }
 
   Value ParseValue() {
     Skip();
-    if (i_ >= s_.size()) Fail(line_, "unexpected end");
-    const char c = s_[i_];
-    if (c == '{') {
-      ++i_;
+    if (position_ >= text_.size()) Fail(line_, "unexpected end");
+    const char character = text_[position_];
+    if (character == '{') {
+      ++position_;
       Value out = Value::Map();
       Skip();
-      if (i_ < s_.size() && s_[i_] == '}') {
-        ++i_;
+      if (position_ < text_.size() && text_[position_] == '}') {
+        ++position_;
         return out;
       }
       while (true) {
         Skip();
-        if (i_ >= s_.size() || s_[i_] != '"') Fail(line_, "expected a key");
-        const std::string key = ParseDoubleQuoted(s_, i_, line_);
+        if (position_ >= text_.size() || text_[position_] != '"') {
+          Fail(line_, "expected a key");
+        }
+        const std::string key = ParseDoubleQuoted(text_, position_, line_);
         Skip();
-        if (i_ >= s_.size() || s_[i_] != ':') Fail(line_, "expected ':'");
-        ++i_;
+        if (position_ >= text_.size() || text_[position_] != ':') {
+          Fail(line_, "expected ':'");
+        }
+        ++position_;
         out.Set(key, ParseValue());
         Skip();
-        if (i_ < s_.size() && s_[i_] == ',') {
-          ++i_;
+        if (position_ < text_.size() && text_[position_] == ',') {
+          ++position_;
           continue;
         }
-        if (i_ < s_.size() && s_[i_] == '}') {
-          ++i_;
+        if (position_ < text_.size() && text_[position_] == '}') {
+          ++position_;
           return out;
         }
         Fail(line_, "expected ',' or '}'");
       }
     }
-    if (c == '[') {
-      ++i_;
+    if (character == '[') {
+      ++position_;
       Value out = Value::List();
       Skip();
-      if (i_ < s_.size() && s_[i_] == ']') {
-        ++i_;
+      if (position_ < text_.size() && text_[position_] == ']') {
+        ++position_;
         return out;
       }
       while (true) {
         out.Append(ParseValue());
         Skip();
-        if (i_ < s_.size() && s_[i_] == ',') {
-          ++i_;
+        if (position_ < text_.size() && text_[position_] == ',') {
+          ++position_;
           continue;
         }
-        if (i_ < s_.size() && s_[i_] == ']') {
-          ++i_;
+        if (position_ < text_.size() && text_[position_] == ']') {
+          ++position_;
           return out;
         }
         Fail(line_, "expected ',' or ']'");
       }
     }
-    if (c == '"') return Value::String(ParseDoubleQuoted(s_, i_, line_));
+    if (character == '"') {
+      return Value::String(ParseDoubleQuoted(text_, position_, line_));
+    }
     if (Consume("true")) return Value::Bool(true);
     if (Consume("false")) return Value::Bool(false);
     if (Consume("null")) return Value();
@@ -698,65 +779,78 @@ class JsonParser {
     if (Consume("-Infinity")) {
       return Value::Number(-std::numeric_limits<double>::infinity());
     }
-    const size_t begin = i_;
+    const size_t begin = position_;
     bool integral = true;
-    while (i_ < s_.size() &&
-           (std::isdigit(static_cast<unsigned char>(s_[i_])) ||
-            s_[i_] == '-' || s_[i_] == '+' || s_[i_] == '.' ||
-            s_[i_] == 'e' || s_[i_] == 'E')) {
-      if (s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E') integral = false;
-      ++i_;
+    while (position_ < text_.size() &&
+           (std::isdigit(static_cast<unsigned char>(text_[position_])) ||
+            text_[position_] == '-' || text_[position_] == '+' ||
+            text_[position_] == '.' || text_[position_] == 'e' ||
+            text_[position_] == 'E')) {
+      if (text_[position_] == '.' || text_[position_] == 'e' ||
+          text_[position_] == 'E') {
+        integral = false;
+      }
+      ++position_;
     }
-    if (i_ == begin) Fail(line_, std::string("unexpected '") + c + "'");
-    const std::string number = s_.substr(begin, i_ - begin);
+    if (position_ == begin) {
+      Fail(line_, std::string("unexpected '") + character + "'");
+    }
+    const std::string number = text_.substr(begin, position_ - begin);
     char* end = nullptr;
     if (integral) {
-      const long long v = std::strtoll(number.c_str(), &end, 10);
-      if (*end == '\0') return Value::Integer(v);
+      const int64_t parsed = std::strtoll(number.c_str(), &end, kDecimalBase);
+      if (*end == '\0') return Value::Integer(parsed);
     }
-    const double v = std::strtod(number.c_str(), &end);
+    const double parsed = std::strtod(number.c_str(), &end);
     if (*end != '\0') Fail(line_, "bad number " + number);
-    return Value::Number(v);
+    return Value::Number(parsed);
   }
 
-  const std::string& s_;
-  size_t i_ = 0;
+  const std::string& text_;
+  size_t position_ = 0;
   int line_ = 1;
 };
 
 // Python's repr of a float: the shortest digits that round-trip, fixed
-// notation for exponents in [-4, 16), else d.ddde+XX.
-std::string FloatRepr(double v) {
-  if (std::isnan(v)) return "NaN";
-  if (std::isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
-  if (v == 0.0) return std::signbit(v) ? "-0.0" : "0.0";
-  char buffer[40];
+// notation for exponents in [kMinFixedExponent, kMaxFixedExponent), else
+// d.ddde+XX.
+constexpr int kMinFixedExponent = -4;
+constexpr int kMaxFixedExponent = 16;
+// Room for "-d.<16 digits>e-XXX" and for "e-XXX".
+constexpr size_t kFloatTextBuffer = 40;
+constexpr size_t kExponentTextBuffer = 16;
+
+std::string FloatRepr(double value) {
+  if (std::isnan(value)) return "NaN";
+  if (std::isinf(value)) return value > 0 ? "Infinity" : "-Infinity";
+  if (value == 0.0) return std::signbit(value) ? "-0.0" : "0.0";
+  char buffer[kFloatTextBuffer];
   int precision = 1;
-  for (; precision <= 17; ++precision) {
-    std::snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, v);
-    if (std::strtod(buffer, nullptr) == v) break;
+  for (; precision <= std::numeric_limits<double>::max_digits10; ++precision) {
+    std::snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, value);
+    if (std::strtod(buffer, nullptr) == value) break;
   }
   // buffer: [-]d[.ddd]e[+-]XX
   std::string text = buffer;
   const bool negative = text[0] == '-';
   if (negative) text.erase(0, 1);
-  const size_t e = text.find('e');
-  const int exponent = std::atoi(text.c_str() + e + 1);
+  const size_t exponent_mark = text.find('e');
+  const int exponent = std::atoi(text.c_str() + exponent_mark + 1);
   std::string digits;
-  for (size_t k = 0; k < e; ++k) {
+  for (size_t k = 0; k < exponent_mark; ++k) {
     if (text[k] != '.') digits.push_back(text[k]);
   }
   while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
   std::string out = negative ? "-" : "";
-  if (exponent >= -4 && exponent < 16) {
+  if (exponent >= kMinFixedExponent && exponent < kMaxFixedExponent) {
     if (exponent < 0) {
-      out += "0." + std::string(static_cast<size_t>(-exponent - 1), '0') +
-             digits;
+      out +=
+          "0." + std::string(static_cast<size_t>(-exponent - 1), '0') + digits;
     } else if (static_cast<int>(digits.size()) <= exponent + 1) {
-      out += digits +
-             std::string(static_cast<size_t>(exponent + 1) - digits.size(),
-                         '0') +
-             ".0";
+      out +=
+          digits +
+          std::string(static_cast<size_t>(exponent + 1) - digits.size(), '0') +
+          ".0";
     } else {
       out += digits.substr(0, static_cast<size_t>(exponent + 1)) + "." +
              digits.substr(static_cast<size_t>(exponent + 1));
@@ -765,16 +859,16 @@ std::string FloatRepr(double v) {
   }
   out += digits.substr(0, 1);
   if (digits.size() > 1) out += "." + digits.substr(1);
-  char exp[16];
-  std::snprintf(exp, sizeof(exp), "e%c%02d", exponent < 0 ? '-' : '+',
-                std::abs(exponent));
-  return out + exp;
+  char exponent_text[kExponentTextBuffer];
+  std::snprintf(exponent_text, sizeof(exponent_text), "e%c%02d",
+                exponent < 0 ? '-' : '+', std::abs(exponent));
+  return out + exponent_text;
 }
 
-void WriteString(const std::string& s, std::string* out) {
+void WriteString(const std::string& text, std::string* out) {
   out->push_back('"');
-  for (char c : s) {
-    switch (c) {
+  for (char character : text) {
+    switch (character) {
       case '"':
         *out += "\\\"";
         break;
@@ -797,12 +891,12 @@ void WriteString(const std::string& s, std::string* out) {
         *out += "\\f";
         break;
       default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          char buffer[8];
-          std::snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+        if (static_cast<unsigned char>(character) < kFirstUnescapedCharacter) {
+          char buffer[kUnicodeEscapeLength + 1];
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x", character);
           *out += buffer;
         } else {
-          out->push_back(c);
+          out->push_back(character);
         }
     }
   }
@@ -825,7 +919,7 @@ void WriteJson(const Value& value, int indent, int depth, std::string* out) {
       return;
     case Value::Kind::kNumber:
       if (value.is_integer()) {
-        *out += std::to_string(static_cast<long long>(value.AsDouble()));
+        *out += std::to_string(static_cast<int64_t>(value.AsDouble()));
       } else {
         *out += FloatRepr(value.AsDouble());
       }
@@ -910,16 +1004,16 @@ Value ParseJson(const std::string& text) { return JsonParser(text).Parse(); }
 Value ReadYamlFile(const std::string& path) {
   try {
     return ParseYaml(ReadText(path));
-  } catch (const std::runtime_error& e) {
-    throw std::runtime_error(path + ": " + e.what());
+  } catch (const std::runtime_error& error) {
+    throw std::runtime_error(path + ": " + error.what());
   }
 }
 
 Value ReadJsonFile(const std::string& path) {
   try {
     return ParseJson(ReadText(path));
-  } catch (const std::runtime_error& e) {
-    throw std::runtime_error(path + ": " + e.what());
+  } catch (const std::runtime_error& error) {
+    throw std::runtime_error(path + ": " + error.what());
   }
 }
 
@@ -931,21 +1025,25 @@ std::string ToJson(const Value& value, int indent) {
 
 namespace {
 
+// Spaces per level of ToYaml's block style.
+constexpr int kYamlIndent = 2;
+
 // A scalar as PyYAML (YAML 1.1) reads it back: strings double-quoted (JSON
 // escapes are YAML escapes), floats with a '.' before any exponent.
 std::string YamlScalar(const Value& value) {
   if (value.is_number() && !value.is_integer()) {
-    std::string text = ToJson(value, -1);
-    const size_t e = text.find('e');
-    if (e != std::string::npos && text.find('.') == std::string::npos) {
-      text.insert(e, ".0");
+    std::string text = ToJson(value, kJsonOneLine);
+    const size_t exponent_mark = text.find('e');
+    if (exponent_mark != std::string::npos &&
+        text.find('.') == std::string::npos) {
+      text.insert(exponent_mark, ".0");
     }
     if (text == "NaN") return ".nan";
     if (text == "Infinity") return ".inf";
     if (text == "-Infinity") return "-.inf";
     return text;
   }
-  return ToJson(value, -1);
+  return ToJson(value, kJsonOneLine);
 }
 
 bool IsScalar(const Value& value) {
@@ -953,18 +1051,18 @@ bool IsScalar(const Value& value) {
 }
 
 void WriteYaml(const Value& value, int depth, std::string* out) {
-  const std::string pad(static_cast<size_t>(2 * depth), ' ');
+  const std::string pad(static_cast<size_t>(kYamlIndent * depth), ' ');
   if (value.is_map()) {
     for (const auto& [key, item] : value.members()) {
-      *out += pad + ToJson(Value::String(key), -1) + ":";
+      *out += pad + ToJson(Value::String(key), kJsonOneLine) + ":";
       if (IsScalar(item) || item.size() == 0) {
-        *out += " " + (item.is_list() ? std::string("[]")
-                       : item.is_map() ? std::string("{}")
-                                       : YamlScalar(item)) +
+        *out += " " +
+                (item.is_list()  ? std::string("[]")
+                 : item.is_map() ? std::string("{}")
+                                 : YamlScalar(item)) +
                 "\n";
-      } else if (item.is_list() &&
-                 std::all_of(item.items().begin(), item.items().end(),
-                             IsScalar)) {
+      } else if (item.is_list() && std::all_of(item.items().begin(),
+                                               item.items().end(), IsScalar)) {
         std::string flow = " [";
         for (size_t k = 0; k < item.size(); ++k) {
           if (k) flow += ", ";
@@ -982,7 +1080,7 @@ void WriteYaml(const Value& value, int depth, std::string* out) {
     for (const Value& item : value.items()) {
       if (IsScalar(item) || item.size() == 0) {
         *out += pad + "- " +
-                (item.is_list() ? std::string("[]")
+                (item.is_list()  ? std::string("[]")
                  : item.is_map() ? std::string("{}")
                                  : YamlScalar(item)) +
                 "\n";
@@ -990,7 +1088,8 @@ void WriteYaml(const Value& value, int depth, std::string* out) {
         // The item's block one level deeper, its first line after "- ".
         std::string block;
         WriteYaml(item, depth + 1, &block);
-        block.replace(0, static_cast<size_t>(2 * (depth + 1)), pad + "- ");
+        block.replace(0, static_cast<size_t>(kYamlIndent * (depth + 1)),
+                      pad + "- ");
         *out += block;
       }
     }
@@ -1004,7 +1103,7 @@ void WriteYaml(const Value& value, int depth, std::string* out) {
 std::string ToYaml(const Value& value) {
   std::string out;
   if (IsScalar(value) || value.size() == 0) {
-    return (value.is_list() ? std::string("[]")
+    return (value.is_list()  ? std::string("[]")
             : value.is_map() ? std::string("{}")
                              : YamlScalar(value)) +
            "\n";

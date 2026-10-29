@@ -46,7 +46,8 @@ struct SweepLocalization {
 
 struct TripLocalizationSummary {
   int sweeps = 0;
-  int first_tracked = -1;     // Index into the sweeps; -1: never tracked.
+  static constexpr int kNeverTracked = -1;
+  int first_tracked = kNeverTracked;  // Index into the sweeps.
   double init_time_s = 0.0;   // From the first sweep to the first tracked.
   double init_distance_m = 0.0;  // Odometry travel until then.
   int placement_attempts = 0;

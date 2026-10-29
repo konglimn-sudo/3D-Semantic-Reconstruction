@@ -27,8 +27,11 @@ std::vector<Footprint> ObjectFootprints(const std::vector<Vec2>& xy,
                                         double cell, int min_points);
 
 struct FootprintEdge {
-  int footprint = -1;
-  int edge = -1;
+  // A footprint or edge index that is not set.
+  static constexpr int kNone = -1;
+
+  int footprint = kNone;
+  int edge = kNone;
   double along = 0.0;     // Arc length of the closest point (m).
   double distance = 0.0;  // From the footprint's box (0 inside).
 };

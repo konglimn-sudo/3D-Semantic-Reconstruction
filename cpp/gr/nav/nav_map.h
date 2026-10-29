@@ -22,9 +22,11 @@ namespace gr {
 // DistanceTransform and ThinMask: gr/core/morphology.h.
 
 struct SkeletonEdge {
-  int a = -1;               // Node indices (a == b for a closed loop).
-  int b = -1;
-  std::vector<Vec2> cells;  // (col, row) from node a to node b.
+  // Node indices (equal for a closed loop); kNoNode before they are known.
+  static constexpr int kNoNode = -1;
+  int start_node = kNoNode;
+  int end_node = kNoNode;
+  std::vector<Vec2> cells;  // (column, row) from start_node to end_node.
   double length = 0.0;      // Cells.
 };
 
@@ -57,9 +59,9 @@ class RouteGraph {
  public:
   explicit RouteGraph(int num_nodes);
 
-  // Returns the edge index. A one-way edge is travelled from `a` to `b` only.
-  // `cost` must be non-negative.
-  int AddEdge(int a, int b, double cost, bool one_way);
+  // Returns the edge index. A one-way edge is travelled from `from` to `to`
+  // only. `cost` must be non-negative.
+  int AddEdge(int from, int to, double cost, bool one_way);
 
   // Cost from `source` to every node (+inf where unreachable).
   std::vector<double> Distances(int source) const;
@@ -69,11 +71,15 @@ class RouteGraph {
   int num_edges() const { return static_cast<int>(costs_.size()); }
 
  private:
+  // A node or edge index that is not set.
+  static constexpr int kNone = -1;
+
   struct Arc {
     int to;
     int edge;
   };
-  // Dijkstra from `source`; fills the incoming arc of every settled node.
+  // Dijkstra from `source` (up to `target`, or every node for kNone); fills
+  // the incoming arc of every settled node.
   std::vector<double> Run(int source, int target,
                           std::vector<Arc>* parent) const;
 

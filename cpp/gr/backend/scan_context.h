@@ -10,10 +10,10 @@
 namespace gr {
 
 struct ScanContextConfig {
-  int rings = 20;
-  int sectors = 60;
-  double max_radius = 30.0;
-  double lidar_height = 2.0;  // Added to z so that bin values stay positive.
+  int rings = 20;             // Radial bins.
+  int sectors = 60;           // Azimuth bins.
+  double max_radius = 30.0;   // m
+  double lidar_height = 2.0;  // m, added to z so that bin values stay positive.
 };
 
 // rings x sectors matrix; empty bins are 0.

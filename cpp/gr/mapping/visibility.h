@@ -36,9 +36,12 @@ struct VisibilityVoteOptions {
 
 class VisibilityVoter {
  public:
+  // Side (m) of the xy buckets of the map points.
+  static constexpr double kDefaultBucketSize = 4.0;
+
   // `normals` holds one unit normal per map point.
   VisibilityVoter(const Points& map, const Points& normals,
-                  double bucket_size = 4.0);
+                  double bucket_size = kDefaultBucketSize);
   VisibilityVoter(const VisibilityVoter&) = default;
   VisibilityVoter& operator=(const VisibilityVoter&) = default;
   VisibilityVoter(VisibilityVoter&&) = default;

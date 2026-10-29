@@ -100,6 +100,7 @@ set(GR_CORE_SOURCES
   cpp/gr/semantics/labeling.cc
   cpp/gr/semantics/markings.cc
   cpp/gr/semantics/objects.cc
+  cpp/gr/semantics/objects4d.cc
   cpp/gr/semantics/occupancy.cc
   cpp/gr/semantics/paint.cc
   cpp/gr/semantics/projector.cc
@@ -277,6 +278,7 @@ if(GR_BUILD_TESTS)
     cpp/gr/semantics/labeling_test.cc
     cpp/gr/semantics/markings_test.cc
     cpp/gr/semantics/objects_test.cc
+    cpp/gr/semantics/objects4d_test.cc
     cpp/gr/semantics/occupancy_test.cc
     cpp/gr/semantics/projector_test.cc
     cpp/gr/semantics/slot_paint_test.cc

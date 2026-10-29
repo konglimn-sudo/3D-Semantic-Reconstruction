@@ -77,13 +77,25 @@ py::list TripAlignments(const std::vector<TripAlignment>& alignments) {
   return out;
 }
 
+// Elements of a Vec6 (pose or IMU bias).
+constexpr int kVec6Size = static_cast<int>(Vec6::SizeAtCompileTime);
+// Clock-sync windows are reported as [center, lag, residual, samples] rows.
+constexpr int kClockWindowColumns = 4;
+// Pairs of keyframe indices.
+constexpr int kPairSize = 2;
+// Camera tracks are [image, u, v] rows.
+constexpr int kTrackColumns = 3;
+constexpr int kTrackImageColumn = 0;
+constexpr int kTrackPixelColumn = 1;
+
 py::array_t<double> Vec6Array(const std::vector<Vec6>& values) {
-  py::array_t<double> array(
-      {static_cast<py::ssize_t>(values.size()), static_cast<py::ssize_t>(6)});
+  py::array_t<double> array({static_cast<py::ssize_t>(values.size()),
+                             static_cast<py::ssize_t>(kVec6Size)});
   double* data = array.mutable_data();
   for (size_t i = 0; i < values.size(); ++i) {
-    for (int k = 0; k < 6; ++k)
-      data[6 * i + static_cast<size_t>(k)] = values[i][k];
+    for (int element = 0; element < kVec6Size; ++element) {
+      data[kVec6Size * i + static_cast<size_t>(element)] = values[i][element];
+    }
   }
   return array;
 }
@@ -100,9 +112,10 @@ void RequirePoses(const KeyframeSet& keyframes,
 
 void RequireLoops(const KeyframeSet& keyframes,
                   const std::vector<LoopConstraint>& loops) {
-  const int n = static_cast<int>(keyframes.size());
+  const int keyframe_count = static_cast<int>(keyframes.size());
   for (const LoopConstraint& loop : loops) {
-    RequireIndex(loop.i >= 0 && loop.i < n && loop.j >= 0 && loop.j < n,
+    RequireIndex(loop.i >= 0 && loop.i < keyframe_count && loop.j >= 0 &&
+                     loop.j < keyframe_count,
                  "loop refers to an unknown keyframe");
   }
 }
@@ -112,7 +125,7 @@ void BindImu(py::module_& m) {
       .def(py::init<>())
       .def(py::init([](const Eigen::MatrixXd& rows,
                        const Mat3& vehicle_from_imu, const Vec3& position) {
-             Require(rows.rows() == 0 || rows.cols() >= 7,
+             Require(rows.rows() == 0 || rows.cols() >= ImuSamples::kCsvColumns,
                      "expected rows of [t, gx, gy, gz, ax, ay, az]");
              return ImuSamples::FromRows(rows, vehicle_from_imu, position);
            }),
@@ -137,8 +150,9 @@ void BindImu(py::module_& m) {
   py::class_<WheelSamples>(m, "WheelSamples")
       .def(py::init<>())
       .def(py::init([](const Eigen::MatrixXd& rows, double speed_scale) {
-             Require(rows.rows() == 0 || rows.cols() >= 2,
-                     "expected rows of [t, speed]");
+             Require(
+                 rows.rows() == 0 || rows.cols() >= WheelSamples::kCsvColumns,
+                 "expected rows of [t, speed]");
              return WheelSamples::FromRows(rows, speed_scale);
            }),
            "rows"_a, "speed_scale"_a = 1.0, "rows: (M, 2) [t, speed (m/s)].")
@@ -178,11 +192,12 @@ void BindImu(py::module_& m) {
                                        other_stamps, other, config);
         }
         Eigen::MatrixXd windows(
-            static_cast<Eigen::Index>(result.windows.size()), 4);
+            static_cast<Eigen::Index>(result.windows.size()),
+            kClockWindowColumns);
         for (size_t i = 0; i < result.windows.size(); ++i) {
-          const ClockSyncWindow& w = result.windows[i];
-          windows.row(static_cast<Eigen::Index>(i)) << w.center, w.lag,
-              w.residual, w.samples;
+          const ClockSyncWindow& window = result.windows[i];
+          windows.row(static_cast<Eigen::Index>(i)) << window.center,
+              window.lag, window.residual, window.samples;
         }
         py::dict out;
         out["valid"] = result.valid;
@@ -219,12 +234,12 @@ void BindImu(py::module_& m) {
       [](const PointsIn& points, const py::object& times, double stamp,
          const MotionPrior& prior, const Mat4& vehicle_from_lidar,
          int samples) -> py::object {
-        const Points p = ToPoints(points);
-        const std::vector<double> t = ToDoubleVector(times);
+        const Points cloud = ToPoints(points);
+        const std::vector<double> point_times = ToDoubleVector(times);
         std::optional<Points> out;
         {
           py::gil_scoped_release release;
-          out = DeskewWithPrior(p, t, stamp, prior,
+          out = DeskewWithPrior(cloud, point_times, stamp, prior,
                                 Pose::FromMatrix(vehicle_from_lidar), samples);
         }
         if (!out) return py::none();
@@ -279,9 +294,9 @@ void BindOdometryPipeline(py::module_& m) {
              const py::object& intensity, const py::object& times, double stamp,
              bool force_keyframe, const py::object& external_pose,
              bool fill_sweep) -> py::tuple {
-            const Points p = ToPoints(points);
-            const std::vector<float> i = ToFloatVector(intensity);
-            const std::vector<double> t = ToDoubleVector(times);
+            const Points cloud = ToPoints(points);
+            const std::vector<float> point_intensity = ToFloatVector(intensity);
+            const std::vector<double> point_times = ToDoubleVector(times);
             std::optional<Pose> external;
             if (!external_pose.is_none()) {
               external = Pose::FromMatrix(external_pose.cast<Mat4>());
@@ -289,8 +304,9 @@ void BindOdometryPipeline(py::module_& m) {
             OdometryFrame frame;
             {
               py::gil_scoped_release release;
-              frame = pipeline.Process(p, i, t, stamp, force_keyframe,
-                                       external, fill_sweep);
+              frame =
+                  pipeline.Process(cloud, point_intensity, point_times, stamp,
+                                   force_keyframe, external, fill_sweep);
             }
             if (!frame.is_keyframe && !fill_sweep) {
               return py::make_tuple(frame.pose.Matrix(), false, py::none(),
@@ -326,15 +342,16 @@ void BindOdometryPipeline(py::module_& m) {
           "lio_stats",
           [](const OdometryPipeline& pipeline) {
             Require(pipeline.uses_lio(), "the pipeline does not run the LIO");
-            const LioStats& s = pipeline.lio_stats();
+            const LioStats& stats = pipeline.lio_stats();
             py::dict out;
-            out["correspondences"] = s.correspondences;
-            out["iterations"] = s.iterations;
-            out["rmse"] = s.rmse;
-            out["min_translation_information"] = s.min_translation_information;
-            out["point_residuals"] = s.point_residuals;
-            out["stationary"] = s.stationary;
-            out["velocity"] = s.velocity;
+            out["correspondences"] = stats.correspondences;
+            out["iterations"] = stats.iterations;
+            out["rmse"] = stats.rmse;
+            out["min_translation_information"] =
+                stats.min_translation_information;
+            out["point_residuals"] = stats.point_residuals;
+            out["stationary"] = stats.stationary;
+            out["velocity"] = stats.velocity;
             return out;
           },
           "Statistics of the last LIO update.");
@@ -343,12 +360,13 @@ void BindOdometryPipeline(py::module_& m) {
 void BindKeyframes(py::module_& m) {
   py::class_<KeyframeSet>(m, "KeyframeSet")
       .def(py::init([](const std::vector<double>& voxels) {
-             for (double v : voxels) {
-               Require(v > 0.0, "KeyframeSet: voxel sizes must be positive");
+             for (double voxel : voxels) {
+               Require(voxel > 0.0,
+                       "KeyframeSet: voxel sizes must be positive");
              }
              return KeyframeSet(voxels);
            }),
-           "voxels"_a = std::vector<double>{0.2},
+           "voxels"_a = std::vector<double>{KeyframeSet::kDefaultVoxel},
            "Keyframe table; sweeps are kept downsampled at each voxel size of "
            "`voxels`.")
       .def(
@@ -371,16 +389,18 @@ void BindKeyframes(py::module_& m) {
       .def_property_readonly("trip",
                              [](const KeyframeSet& keyframes) {
                                std::vector<int> trips;
-                               for (const Keyframe& k : keyframes.keyframes()) {
-                                 trips.push_back(k.trip);
+                               for (const Keyframe& keyframe :
+                                    keyframes.keyframes()) {
+                                 trips.push_back(keyframe.trip);
                                }
                                return ToArray(trips);
                              })
       .def_property_readonly("stamp",
                              [](const KeyframeSet& keyframes) {
                                std::vector<double> stamps;
-                               for (const Keyframe& k : keyframes.keyframes()) {
-                                 stamps.push_back(k.stamp);
+                               for (const Keyframe& keyframe :
+                                    keyframes.keyframes()) {
+                                 stamps.push_back(keyframe.stamp);
                                }
                                return ToArray(stamps);
                              })
@@ -406,21 +426,22 @@ void BindKeyframes(py::module_& m) {
       .def(
           "path_distance",
           [](const KeyframeSet& keyframes, const py::object& poses) {
-            const std::vector<Pose> p = PosesFrom(poses);
-            RequirePoses(keyframes, p);
-            return ToArray(keyframes.PathDistance(p));
+            const std::vector<Pose> keyframe_poses = PosesFrom(poses);
+            RequirePoses(keyframes, keyframe_poses);
+            return ToArray(keyframes.PathDistance(keyframe_poses));
           },
           "poses"_a)
       .def(
           "submap",
           [](const KeyframeSet& keyframes, size_t k, int half_window,
              double voxel, const py::object& poses) {
-            const std::vector<Pose> p = PosesFrom(poses);
-            RequirePoses(keyframes, p);
+            const std::vector<Pose> keyframe_poses = PosesFrom(poses);
+            RequirePoses(keyframes, keyframe_poses);
             RequireIndex(k < keyframes.size(), "keyframe index out of range");
             Require(keyframes.HasVoxel(voxel),
                     "sweeps are not kept at this voxel size");
-            return ToMatrix(keyframes.Submap(k, half_window, voxel, p));
+            return ToMatrix(
+                keyframes.Submap(k, half_window, voxel, keyframe_poses));
           },
           "k"_a, "half_window"_a, "voxel"_a, "poses"_a);
 }
@@ -479,9 +500,10 @@ void BindLoops(py::module_& m) {
       "detect_loops",
       [](const KeyframeSet& keyframes, const py::object& poses,
          const LoopConfig& config) {
-        const std::vector<Pose> p = PosesFrom(poses);
-        if (config.enabled && keyframes.size() >= 2) {
-          RequirePoses(keyframes, p);
+        const std::vector<Pose> keyframe_poses = PosesFrom(poses);
+        if (config.enabled &&
+            keyframes.size() >= static_cast<size_t>(kMinLoopKeyframes)) {
+          RequirePoses(keyframes, keyframe_poses);
           Require(keyframes.HasVoxel(config.sc_voxel) &&
                       keyframes.HasVoxel(config.icp_voxel),
                   "keyframes must keep sweeps at sc_voxel and icp_voxel");
@@ -490,7 +512,7 @@ void BindLoops(py::module_& m) {
         std::vector<LoopConstraint> loops;
         {
           py::gil_scoped_release release;
-          loops = DetectLoops(keyframes, p, config, &stats);
+          loops = DetectLoops(keyframes, keyframe_poses, config, &stats);
         }
         return py::make_tuple(loops, py::dict("queries"_a = stats.queries,
                                               "tested"_a = stats.tested));
@@ -500,10 +522,11 @@ void BindLoops(py::module_& m) {
       "pcm_filter",
       [](const std::vector<LoopConstraint>& loops, const KeyframeSet& keyframes,
          const py::object& poses, const LoopConfig& config) {
-        const std::vector<Pose> p = PosesFrom(poses);
+        const std::vector<Pose> keyframe_poses = PosesFrom(poses);
         RequireLoops(keyframes, loops);
-        if (loops.size() >= 3) RequirePoses(keyframes, p);
-        return SelectConsistentLoops(loops, keyframes, p, config);
+        if (loops.size() >= kMinConsistencyLoops)
+          RequirePoses(keyframes, keyframe_poses);
+        return SelectConsistentLoops(loops, keyframes, keyframe_poses, config);
       },
       "loops"_a, "keyframes"_a, "poses"_a, "config"_a);
 }
@@ -646,7 +669,7 @@ void BindBackend(py::module_& m) {
           [](TripInputs& trip, const py::object& rows) {
             trip.gnss = rows.is_none() ? Eigen::MatrixXd()
                                        : rows.cast<Eigen::MatrixXd>();
-            Require(trip.gnss.rows() == 0 || trip.gnss.cols() >= 4,
+            Require(trip.gnss.rows() == 0 || trip.gnss.cols() >= kGnssStdColumn,
                     "gnss rows must be [t, x, y, z(, std)]");
           },
           "(M, 4|5) rows [t, x, y, z(, std)] or None.")
@@ -658,7 +681,7 @@ void BindBackend(py::module_& m) {
                                       ? Eigen::MatrixXd()
                                       : rows.cast<Eigen::MatrixXd>();
             Require(trip.control_points.rows() == 0 ||
-                        trip.control_points.cols() >= 7,
+                        trip.control_points.cols() >= kControlStdColumn,
                     "control point rows must be [t, px, py, pz, x, y, z(, "
                     "std)]");
           },
@@ -703,10 +726,11 @@ void BindBackend(py::module_& m) {
                                             py::array::forcecast>::ensure(
               appearance);
           Require(array && (array.size() == 0 ||
-                            (array.ndim() == 2 && array.shape(1) == 2)),
+                            (array.ndim() == 2 && array.shape(1) == kPairSize)),
                   "appearance must be (N, 2) keyframe pairs");
-          for (py::ssize_t r = 0; array.size() && r < array.shape(0); ++r) {
-            pairs.emplace_back(array.at(r, 0), array.at(r, 1));
+          for (py::ssize_t row = 0; array.size() && row < array.shape(0);
+               ++row) {
+            pairs.emplace_back(array.at(row, 0), array.at(row, 1));
           }
         }
         for (double voxel : config.RequiredVoxels()) {
@@ -820,11 +844,11 @@ void BindMap(py::module_& m) {
             const MapAccumulator::Cloud cloud = accumulator.Collect();
             py::array_t<float> spread(
                 {static_cast<py::ssize_t>(cloud.spread.size()),
-                 static_cast<py::ssize_t>(6)});
+                 static_cast<py::ssize_t>(kSymmetricTerms)});
             float* data = spread.mutable_data();
             for (size_t i = 0; i < cloud.spread.size(); ++i) {
               std::copy(cloud.spread[i].begin(), cloud.spread[i].end(),
-                        data + 6 * i);
+                        data + kSymmetricTerms * i);
             }
             return py::dict("xyz"_a = ToMatrix(cloud.points),
                             "intensity"_a = ToArray(cloud.intensity),
@@ -843,26 +867,29 @@ void BindMap(py::module_& m) {
          const py::object& spread, const py::object& model_sigma,
          double sigma_floor) {
         MapAccumulator::Cloud cloud;
-        const Points n = ToPoints(normals);
+        const Points point_normals = ToPoints(normals);
         const std::vector<int> count = ToIntVector(observations);
-        const Eigen::MatrixXd s = spread.cast<Eigen::MatrixXd>();
+        const Eigen::MatrixXd spread_rows = spread.cast<Eigen::MatrixXd>();
         const std::vector<double> model = ToDoubleVector(model_sigma);
-        Require(count.size() == n.size() && model.size() == n.size() &&
-                    static_cast<size_t>(s.rows()) == n.size() && s.cols() == 6,
+        Require(count.size() == point_normals.size() &&
+                    model.size() == point_normals.size() &&
+                    static_cast<size_t>(spread_rows.rows()) ==
+                        point_normals.size() &&
+                    spread_rows.cols() == kSymmetricTerms,
                 "point_sigmas: one normal, count, spread row (6) and model "
                 "sigma per point");
-        cloud.points.assign(n.size(), Vec3::Zero());
+        cloud.points.assign(point_normals.size(), Vec3::Zero());
         cloud.observations = count;
-        cloud.spread.resize(n.size());
-        cloud.model_sigma.resize(n.size());
-        for (size_t i = 0; i < n.size(); ++i) {
-          for (int k = 0; k < 6; ++k) {
-            cloud.spread[i][static_cast<size_t>(k)] =
-                static_cast<float>(s(static_cast<Eigen::Index>(i), k));
+        cloud.spread.resize(point_normals.size());
+        cloud.model_sigma.resize(point_normals.size());
+        for (size_t i = 0; i < point_normals.size(); ++i) {
+          for (int term = 0; term < kSymmetricTerms; ++term) {
+            cloud.spread[i][static_cast<size_t>(term)] = static_cast<float>(
+                spread_rows(static_cast<Eigen::Index>(i), term));
           }
           cloud.model_sigma[i] = static_cast<float>(model[i]);
         }
-        return ToArray(PointSigmas(cloud, n, sigma_floor));
+        return ToArray(PointSigmas(cloud, point_normals, sigma_floor));
       },
       "normals"_a, "observations"_a, "spread"_a, "model_sigma"_a,
       "sigma_floor"_a, "Sigma (m) of fused map points along their normals.");
@@ -877,8 +904,9 @@ void BindMap(py::module_& m) {
         const std::vector<int> owner = ToIntVector(keyframe);
         Require(owner.size() == points.size(),
                 "map_normals: one keyframe index per point");
-        for (int k : owner) {
-          RequireIndex(k >= 0 && k < static_cast<int>(keyframe_origins.size()),
+        for (int keyframe : owner) {
+          RequireIndex(keyframe >= 0 &&
+                           keyframe < static_cast<int>(keyframe_origins.size()),
                        "map_normals: keyframe index out of range");
         }
         Require(radius > 0.0, "radius must be positive");
@@ -1026,24 +1054,25 @@ void BindTrajectory(py::module_& m) {
            }),
            "stamps"_a, "poses"_a, "imu"_a = py::none(),
            "bias_stamps"_a = py::none(), "gyro_biases"_a = py::none(),
-           "wheel"_a = py::none(), "table_step"_a = 0.005,
+           "wheel"_a = py::none(),
+           "table_step"_a = TrajectoryOptions().table_step,
            "world_from_vehicle(t) through the pose knots (N, 4, 4); between "
            "knots the bias-corrected gyro and the wheel speed shape the "
            "curve (slerp / Hermite without them).")
       .def(
           "at",
-          [](const ContinuousTrajectory& trajectory, double t) {
-            return trajectory.At(t).Matrix();
+          [](const ContinuousTrajectory& trajectory, double time) {
+            return trajectory.At(time).Matrix();
           },
           "t"_a, "world_from_vehicle (4, 4) at t, clamped to the knots.")
       .def(
           "poses_at",
           [](const ContinuousTrajectory& trajectory, const py::object& times) {
-            const std::vector<double> t = ToDoubleVector(times);
+            const std::vector<double> query_times = ToDoubleVector(times);
             std::vector<Pose> poses;
             {
               py::gil_scoped_release release;
-              poses = trajectory.PosesAt(t);
+              poses = trajectory.PosesAt(query_times);
             }
             return PosesToArray(poses);
           },
@@ -1068,14 +1097,15 @@ void BindTrajectory(py::module_& m) {
       [](const PointsIn& points, const py::object& times, double stamp,
          const ContinuousTrajectory& trajectory, const Mat4& vehicle_from_lidar,
          int samples) {
-        const Points p = ToPoints(points);
-        const std::vector<double> t = ToDoubleVector(times);
-        Require(t.size() == p.size(), "one time per point expected");
-        Require(samples >= 2, "samples must be at least 2");
+        const Points cloud = ToPoints(points);
+        const std::vector<double> point_times = ToDoubleVector(times);
+        Require(point_times.size() == cloud.size(),
+                "one time per point expected");
+        Require(samples >= kMinDeskewSamples, "samples must be at least 2");
         Points out;
         {
           py::gil_scoped_release release;
-          out = DeskewSweep(p, t, stamp, trajectory,
+          out = DeskewSweep(cloud, point_times, stamp, trajectory,
                             Pose::FromMatrix(vehicle_from_lidar), samples);
         }
         return ToMatrix(out);
@@ -1091,15 +1121,16 @@ void BindTrajectory(py::module_& m) {
          const py::object& times, double stamp,
          const ContinuousTrajectory& trajectory, const Mat4& vehicle_from_lidar,
          double min_range, double max_range, double voxel) {
-        const Points p = ToPoints(points);
-        const std::vector<float> i = ToFloatVector(intensity);
-        const std::vector<double> t = ToDoubleVector(times);
-        Require(t.empty() || t.size() == p.size(),
+        const Points cloud = ToPoints(points);
+        const std::vector<float> point_intensity = ToFloatVector(intensity);
+        const std::vector<double> point_times = ToDoubleVector(times);
+        Require(point_times.empty() || point_times.size() == cloud.size(),
                 "times must be empty or one per point");
         SweepSamples out;
         {
           py::gil_scoped_release release;
-          out = DeskewKeyframeSweep(p, i, t, stamp, trajectory,
+          out = DeskewKeyframeSweep(cloud, point_intensity, point_times, stamp,
+                                    trajectory,
                                     Pose::FromMatrix(vehicle_from_lidar),
                                     min_range, max_range, voxel);
         }
@@ -1149,27 +1180,31 @@ void BindCalibration(py::module_& m) {
         Require(trajectory_index.size() == stamps.size(),
                 "one trajectory index per image stamp expected");
         std::vector<CalibrationImage> images(stamps.size());
-        for (size_t n = 0; n < images.size(); ++n) {
-          const int t = trajectory_index[n];
-          RequireIndex(t >= 0 && t < static_cast<int>(trajectories.size()),
+        for (size_t image_index = 0; image_index < images.size();
+             ++image_index) {
+          const int trajectory = trajectory_index[image_index];
+          RequireIndex(trajectory >= 0 &&
+                           trajectory < static_cast<int>(trajectories.size()),
                        "image refers to an unknown trajectory");
-          Require(trajectories[static_cast<size_t>(t)] != nullptr &&
-                      !trajectories[static_cast<size_t>(t)]->empty(),
+          Require(trajectories[static_cast<size_t>(trajectory)] != nullptr &&
+                      !trajectories[static_cast<size_t>(trajectory)]->empty(),
                   "trajectories must not be empty");
-          images[n].trajectory = trajectories[static_cast<size_t>(t)];
-          images[n].stamp = stamps[n];
+          images[image_index].trajectory =
+              trajectories[static_cast<size_t>(trajectory)];
+          images[image_index].stamp = stamps[image_index];
         }
         std::vector<Track> track_list;
         track_list.reserve(tracks.size());
         for (const Eigen::MatrixXd& rows : tracks) {
-          Require(rows.rows() == 0 || rows.cols() == 3,
+          Require(rows.rows() == 0 || rows.cols() == kTrackColumns,
                   "tracks must be (K, 3) rows of [image, u, v]");
           Track track;
-          for (Eigen::Index r = 0; r < rows.rows(); ++r) {
-            const int image = static_cast<int>(rows(r, 0));
+          for (Eigen::Index row = 0; row < rows.rows(); ++row) {
+            const int image = static_cast<int>(rows(row, kTrackImageColumn));
             RequireIndex(image >= 0 && image < static_cast<int>(images.size()),
                          "track refers to an unknown image");
-            track.push_back({image, Vec2(rows(r, 1), rows(r, 2))});
+            track.push_back({image, Vec2(rows(row, kTrackPixelColumn),
+                                         rows(row, kTrackPixelColumn + 1))});
           }
           track_list.push_back(std::move(track));
         }
@@ -1227,15 +1262,15 @@ void BindCalibration(py::module_& m) {
         calibration.time_offset = time_offset;
         calibration.line_time = line_time;
         const CalibrationImage image{&trajectory, stamp};
-        const Points p = ToPoints(points);
-        RowMatX2d uv =
-            RowMatX2d::Constant(static_cast<Eigen::Index>(p.size()), 2,
-                                std::numeric_limits<double>::quiet_NaN());
+        const Points cloud = ToPoints(points);
+        RowMatX2d uv = RowMatX2d::Constant(
+            static_cast<Eigen::Index>(cloud.size()), kPlaneDim,
+            std::numeric_limits<double>::quiet_NaN());
         {
           py::gil_scoped_release release;
-          for (size_t i = 0; i < p.size(); ++i) {
+          for (size_t i = 0; i < cloud.size(); ++i) {
             const std::optional<Vec2> pixel =
-                ProjectWithCalibration(camera, calibration, image, p[i]);
+                ProjectWithCalibration(camera, calibration, image, cloud[i]);
             if (pixel)
               uv.row(static_cast<Eigen::Index>(i)) = pixel->transpose();
           }
@@ -1273,12 +1308,12 @@ void BindAcceptance(py::module_& m) {
          const CoarseAlignConfig& config) -> py::object {
         Require(config.coarse_cell > config.fine_cell && config.fine_cell > 0.0,
                 "need coarse_cell > fine_cell > 0");
-        const Points s = ToPoints(source);
-        const Points r = ToPoints(reference);
+        const Points source_points = ToPoints(source);
+        const Points reference_points = ToPoints(reference);
         std::optional<CoarseAlignment> result;
         {
           py::gil_scoped_release release;
-          result = AlignGravityAligned(s, r, config);
+          result = AlignGravityAligned(source_points, reference_points, config);
         }
         if (!result) return py::none();
         return py::dict("T"_a = result->reference_from_source.Matrix(),
@@ -1295,12 +1330,13 @@ void BindAcceptance(py::module_& m) {
          double max_distance) {
         Require(radius > 0.0 && max_distance > 0.0,
                 "radius and max_distance must be positive");
-        const Points q = ToPoints(query);
-        const Points r = ToPoints(reference);
+        const Points query_points = ToPoints(query);
+        const Points reference_points = ToPoints(reference);
         SurfaceDistances result;
         {
           py::gil_scoped_release release;
-          result = MeasureSurfaceDistance(q, r, radius, max_distance);
+          result = MeasureSurfaceDistance(query_points, reference_points,
+                                          radius, max_distance);
         }
         return py::make_tuple(DoubleArray(result.signed_distance),
                               DoubleArray(result.nearest),
@@ -1316,14 +1352,15 @@ void BindAcceptance(py::module_& m) {
       "extract_planes",
       [](const KeyframeSet& keyframes, const py::object& poses,
          const LidarBaConfig& config) {
-        const std::vector<Pose> p = PosesFrom(poses);
-        Require(p.size() == keyframes.size(), "one pose per keyframe");
+        const std::vector<Pose> keyframe_poses = PosesFrom(poses);
+        Require(keyframe_poses.size() == keyframes.size(),
+                "one pose per keyframe");
         Require(keyframes.HasVoxel(config.sweep_voxel),
                 "keyframes must keep sweeps at config.sweep_voxel");
         std::vector<BaPlane> planes;
         {
           py::gil_scoped_release release;
-          planes = ExtractPlanes(keyframes, p, config);
+          planes = ExtractPlanes(keyframes, keyframe_poses, config);
         }
         Points centroids;
         Points normals;
@@ -1336,8 +1373,8 @@ void BindAcceptance(py::module_& m) {
           normals.push_back(plane.normal);
           rms.push_back(plane.rms);
           size.push_back(plane.size);
-          for (const PlaneObservation& o : plane.observations) {
-            nodes.push_back(o.node);
+          for (const PlaneObservation& observation : plane.observations) {
+            nodes.push_back(observation.node);
           }
           offsets.push_back(static_cast<double>(nodes.size()));
         }
@@ -1387,28 +1424,32 @@ void BindRecon(py::module_& m) {
       [](const std::vector<double>& stamps, const py::object& poses,
          const ImuSamples& imu, const Mat4& initial,
          const LidarImuConfig& config) {
-        const std::vector<Pose> p = PosesFrom(poses);
-        Require(p.size() == stamps.size() && stamps.size() >= 3,
+        const std::vector<Pose> lidar_poses = PosesFrom(poses);
+        Require(lidar_poses.size() == stamps.size() &&
+                    stamps.size() >= kMinLidarImuSamples,
                 "need 3+ poses, one per stamp");
-        LidarImuResult r;
+        LidarImuResult result;
         {
           py::gil_scoped_release release;
-          r = CalibrateLidarImu(stamps, p, imu, Pose::FromMatrix(initial),
-                                config);
+          result = CalibrateLidarImu(stamps, lidar_poses, imu,
+                                     Pose::FromMatrix(initial), config);
         }
         return py::dict(
-            "converged"_a = r.converged, "samples"_a = r.samples,
-            "R_imu_lidar"_a = r.imu_from_lidar, "gyro_bias"_a = r.gyro_bias,
-            "accel_bias"_a = r.accel_bias, "accel_scale"_a = r.accel_scale,
-            "gravity_world"_a = r.gravity_world,
-            "time_offset"_a = r.time_offset, "lever_arm"_a = r.lever_arm,
-            "sigma_lever_arm"_a = r.sigma_lever_arm,
-            "sigma_time_offset"_a = r.sigma_time_offset,
-            "sigma_rotation_deg"_a = r.sigma_rotation_deg,
-            "sigma_gyro_bias"_a = r.sigma_gyro_bias,
-            "sigma_accel_bias"_a = r.sigma_accel_bias,
-            "sigma_accel_scale"_a = r.sigma_accel_scale,
-            "gyro_rms"_a = r.gyro_rms, "accel_rms"_a = r.accel_rms);
+            "converged"_a = result.converged, "samples"_a = result.samples,
+            "R_imu_lidar"_a = result.imu_from_lidar,
+            "gyro_bias"_a = result.gyro_bias,
+            "accel_bias"_a = result.accel_bias,
+            "accel_scale"_a = result.accel_scale,
+            "gravity_world"_a = result.gravity_world,
+            "time_offset"_a = result.time_offset,
+            "lever_arm"_a = result.lever_arm,
+            "sigma_lever_arm"_a = result.sigma_lever_arm,
+            "sigma_time_offset"_a = result.sigma_time_offset,
+            "sigma_rotation_deg"_a = result.sigma_rotation_deg,
+            "sigma_gyro_bias"_a = result.sigma_gyro_bias,
+            "sigma_accel_bias"_a = result.sigma_accel_bias,
+            "sigma_accel_scale"_a = result.sigma_accel_scale,
+            "gyro_rms"_a = result.gyro_rms, "accel_rms"_a = result.accel_rms);
       },
       "stamps"_a, "T_world_lidar"_a, "imu"_a, "T_imu_lidar"_a,
       "config"_a = LidarImuConfig(),

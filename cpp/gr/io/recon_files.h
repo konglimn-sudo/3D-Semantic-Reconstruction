@@ -86,12 +86,12 @@ void ReadFramePoses(const std::string& trip_dir, std::vector<double>* stamps,
 // One trip of the pose set (pose_set.TripPoses).
 struct TripPoses {
   std::string trip_id;
-  std::string dataset;             // The trip directory.
+  std::string dataset;  // The trip directory.
   std::vector<double> knot_stamps;
-  std::vector<Pose> knot_poses;    // world <- vehicle.
+  std::vector<Pose> knot_poses;  // world <- vehicle.
   std::vector<double> bias_stamps;
-  std::vector<Vec6> biases;        // [gyro, accel].
-  Value rig;                       // schema.Rig.to_dict of rig.yaml.
+  std::vector<Vec6> biases;  // [gyro, accel].
+  Value rig;                 // schema.Rig.to_dict of rig.yaml.
 };
 
 // Rig.from_dict(rig.yaml).to_dict(): the canonical rig dictionary.

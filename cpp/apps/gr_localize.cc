@@ -44,6 +44,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Exit status of a command-line error (argparse's).
+constexpr int kUsageExitCode = 2;
+
 struct Args {
   std::string nav;
   std::string trip;
@@ -62,19 +65,19 @@ struct Args {
                "[--config FILE ...] [--prior none|entrance|reference] "
                "[--reference TUM] [--stride N] [--start S] [--changes]\n",
                error.c_str());
-  std::exit(2);
+  std::exit(kUsageExitCode);
 }
 
 Args Parse(int argc, char** argv) {
   Args args;
-  for (int k = 1; k < argc; ++k) {
-    const std::string flag = argv[k];
+  for (int index = 1; index < argc; ++index) {
+    const std::string flag = argv[index];
     if (flag == "--changes") {
       args.changes = true;
       continue;
     }
-    if (k + 1 >= argc) Usage("missing value of " + flag);
-    const std::string value = argv[++k];
+    if (index + 1 >= argc) Usage("missing value of " + flag);
+    const std::string value = argv[++index];
     if (flag == "--nav") {
       args.nav = value;
     } else if (flag == "--trip") {
@@ -163,31 +166,32 @@ int Run(const Args& args) {
   const std::vector<SlotGeometry> slots =
       fs::exists(goals) ? ReadSlotGeometry(goals.string())
                         : std::vector<SlotGeometry>();
-  const SlotStateConfig slot_config =
-      SlotStateConfigFrom(config);
+  const SlotStateConfig slot_config = SlotStateConfigFrom(config);
   SlotStateTracker slot_states(slots.size(), slot_config);
   std::optional<ChangeDetector> changes;
   if (args.changes) changes.emplace(map, ChangeConfigFrom(config));
-  const size_t n = stamps_ns.size();
-  for (size_t k = first; k < n; ++k) {
-    const LidarSweep sweep = trip.LoadLidar(k);
-    const std::optional<SweepLocalization> s = localizer.Process(
+  const size_t sweep_count = stamps_ns.size();
+  for (size_t index = first; index < sweep_count; ++index) {
+    const LidarSweep sweep = trip.LoadLidar(index);
+    const std::optional<SweepLocalization> localized = localizer.Process(
         sweep.points, sweep.intensity, sweep.time, sweep.stamp,
-        static_cast<int>(k), k == n - 1,
-        (k - first) % static_cast<size_t>(args.stride) == 0);
-    if (!s || !s->result.registered ||
-        s->result.status != LocalizationStatus::kTracking) {
+        static_cast<int>(index), index == sweep_count - 1,
+        (index - first) % static_cast<size_t>(args.stride) == 0);
+    if (!localized || !localized->result.registered ||
+        localized->result.status != LocalizationStatus::kTracking) {
       continue;
     }
     const Points in_map =
-        TransformPoints(localizer.last_sweep(), s->result.pose);
+        TransformPoints(localizer.last_sweep(), localized->result.pose);
     if (!slots.empty()) {
-      slot_states.Update(s->stamp,
-                         ObserveSlots(in_map, s->result.pose.translation,
-                                      slots, slot_config));
+      slot_states.Update(
+          localized->stamp,
+          ObserveSlots(in_map, localized->result.pose.translation, slots,
+                       slot_config));
     }
     if (changes) {
-      changes->AddSweep(in_map, s->result.pose.translation, s->stamp);
+      changes->AddSweep(in_map, localized->result.pose.translation,
+                        localized->stamp);
     }
   }
   const TripLocalizationSummary summary = localizer.Summary();
@@ -202,8 +206,8 @@ int Run(const Args& args) {
   }
   const std::vector<SweepLocalization>& sweeps = localizer.sweeps();
   const auto last = std::find_if(
-      sweeps.rbegin(), sweeps.rend(), [](const SweepLocalization& s) {
-        return s.result.status == LocalizationStatus::kTracking;
+      sweeps.rbegin(), sweeps.rend(), [](const SweepLocalization& sweep) {
+        return sweep.result.status == LocalizationStatus::kTracking;
       });
   if (last != sweeps.rend()) {
     const fs::path nav(args.nav);
@@ -225,7 +229,7 @@ int Run(const Args& args) {
     report.Set("changes", found["summary"]);
     fs::create_directories(args.out);
     std::ofstream file(fs::path(args.out) / "changes.json");
-    file << ToJson(found, 1);
+    file << ToJson(found, kDefaultJsonIndent);
     if (!file) throw std::runtime_error("cannot write changes.json");
   }
   if (!slots.empty()) {
@@ -233,7 +237,7 @@ int Run(const Args& args) {
     report.Set("slot_states", states["summary"]);
     fs::create_directories(args.out);
     std::ofstream file(fs::path(args.out) / "slot_states.json");
-    file << ToJson(states, 1);
+    file << ToJson(states, kDefaultJsonIndent);
     if (!file) throw std::runtime_error("cannot write slot_states.json");
   }
   WriteLocalizationResult(args.out, sweeps, report);
@@ -242,7 +246,7 @@ int Run(const Args& args) {
       "%.1f ms/sweep (median)",
       trip.trip_id().c_str(), summary.tracked, summary.sweeps,
       summary.registered, summary.lost_sweeps, summary.ms_median));
-  return 0;
+  return EXIT_SUCCESS;
 }
 
 }  // namespace
@@ -251,8 +255,8 @@ int main(int argc, char** argv) {
   const Args args = Parse(argc, argv);
   try {
     return Run(args);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "gr_localize: %s\n", e.what());
-    return 1;
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "gr_localize: %s\n", error.what());
+    return EXIT_FAILURE;
   }
 }

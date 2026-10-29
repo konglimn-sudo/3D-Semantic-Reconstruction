@@ -5,7 +5,7 @@ import numpy as np
 from garage_recon.config import load_config
 from garage_recon.recon.bev import BevGrid
 from garage_recon.semantics.markings import MarkingSegment, extract_markings
-from garage_recon.semantics.objects4d import Box3D, Detection, refine_track, stitch_tracks, track_detections
+from garage_recon.semantics.objects4d import Box3D
 from garage_recon.semantics.rules import fix_slot_numbers
 from garage_recon.semantics.slots import assemble_slots
 from garage_recon.semantics.structure import Column
@@ -64,26 +64,6 @@ def test_markings_from_intensity_raster():
     for s in segs:
         assert 5.0 < s.length < 5.8
         assert 0.08 < s.width < 0.3
-
-
-def _det(k, t, x, y, cls="vehicle", n=60):
-    pts = np.column_stack([np.random.default_rng(k).normal(x, 0.5, n), np.random.default_rng(k + 1).normal(y, 0.3, n),
-                           np.full(n, 0.8)])
-    return Detection(k, t, np.array([x, y, 0.75]), np.array([4.5, 1.8, 1.5]), 0.0, cls, 1.0, pts)
-
-
-def test_tracking_stitches_fragments_and_flags_motion():
-    frames = [[_det(k, 0.5 * k, 1.5 * k, 0.0, "two_wheeler" if k < 3 else "vehicle")] for k in range(10)]
-    frames[3] = []  # one miss
-    tracks = stitch_tracks(track_detections(frames, CFG), CFG)
-    assert len(tracks) == 1
-    from garage_recon.recon.levels import LevelModel
-
-    levels = LevelModel(np.array([0.0]), np.array([3.0]))
-    static, boxes = refine_track(tracks[0], levels, CFG)
-    assert not static
-    vx = np.median([b.velocity[0] for b in boxes.values()])
-    assert abs(vx - 3.0) < 0.5  # 1.5 m per 0.5 s
 
 
 def test_box_contains():

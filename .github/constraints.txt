@@ -1,0 +1,16 @@
+# Python package versions of the CI (PIP_CONSTRAINT in workflows/ci.yml,
+# also inside pip's isolated wheel builds): the versions the tests pass with
+# in the local .venv. Unpinned, CI picked up OpenCV 5.0 on 2026-10-28 and a
+# test broke. Raise a version here after the tests pass with it locally.
+numpy==1.26.4
+scipy==1.10.1
+PyYAML==6.0.2
+opencv-python-headless==4.9.0.80
+opencv-python==4.9.0.80
+shapely==2.1.2
+pybind11==3.1.0
+scikit-build-core==1.1.1
+pytest==9.0.3
+pytest-github-actions-annotate-failures==0.4.2
+rosbags==0.11.7
+laspy==2.7.0

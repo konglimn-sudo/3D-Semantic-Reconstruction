@@ -21,11 +21,14 @@
 namespace gr {
 
 struct RenderResult {
+  // Label and index of empty pixels (and of splats without either).
+  static constexpr int32_t kEmpty = -1;
+
   int width = 0;
   int height = 0;
   std::vector<float> depth;    // Range (m), +inf where empty; row-major H x W.
-  std::vector<int32_t> label;  // -1 where empty.
-  std::vector<int32_t> index;  // Index of the winning point, -1 where empty.
+  std::vector<int32_t> label;  // kEmpty where empty.
+  std::vector<int32_t> index;  // Index of the winning point, kEmpty if empty.
 };
 
 // Incremental z-buffer. The splat radius is clamp(round(focal *
@@ -97,7 +100,10 @@ VisibilityResult ProjectVisibility(const CameraModel& camera,
 
 class PointCloudIndex {
  public:
-  explicit PointCloudIndex(Points points, double bucket = 4.0);
+  // Side of the xy buckets (m).
+  static constexpr double kDefaultBucketSize = 4.0;
+
+  explicit PointCloudIndex(Points points, double bucket = kDefaultBucketSize);
   PointCloudIndex(const PointCloudIndex&) = default;
   PointCloudIndex& operator=(const PointCloudIndex&) = default;
   PointCloudIndex(PointCloudIndex&&) = default;

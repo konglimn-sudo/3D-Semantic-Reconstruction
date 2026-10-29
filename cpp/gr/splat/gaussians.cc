@@ -14,10 +14,40 @@ namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 constexpr double kInf = std::numeric_limits<double>::infinity();
+// Normals with a z component up to this take world z as the helper axis of
+// their frame, others world x.
+constexpr double kMaxHelperCos = 0.9;
+// The spacing comes from the voxels this many steps around a point and needs
+// at least kMinSpacingNeighbours neighbours.
+constexpr int kNeighbourhoodRadius = 1;
+constexpr size_t kMinSpacingNeighbours = 3;
+// The neighbour grid is reserved for one cell per kPointsPerCellEstimate
+// points.
+constexpr size_t kPointsPerCellEstimate = 8;
+// Points per OpenMP chunk of the initialisation, rays per chunk of the
+// renderer.
+constexpr int kPointsPerChunk = 1024;
+constexpr int kRaysPerChunk = 64;
+// Normals shorter than this are missing.
+constexpr double kMinNormalNorm = 0.5;
+// Defaults of FillDefaults: sigma (m) and opacity.
+constexpr double kDefaultScale = 0.01;
+constexpr float kDefaultOpacity = 1.0f;
+// Sigmas are at least this (m) when inverted.
+constexpr double kMinScale = 1e-6;
+// The grid cell grows by this factor until the grid fits `max_cells`.
+constexpr double kCellGrowth = 1.25;
+// Rays with a smaller direction component are parallel to that axis; local
+// directions with a smaller squared norm are degenerate.
+constexpr double kParallelDirection = 1e-12;
+constexpr float kMinLocalDirection = 1e-12f;
+// The grid walk starts this far (m) inside the clipped ray.
+constexpr double kEntryNudge = 1e-9;
 
 // Rotation whose third column is the unit vector `z`.
 Mat3 FrameFromNormal(const Vec3& z) {
-  const Vec3 helper = std::abs(z.z()) < 0.9 ? Vec3::UnitZ() : Vec3::UnitX();
+  const Vec3 helper =
+      std::abs(z.z()) < kMaxHelperCos ? Vec3::UnitZ() : Vec3::UnitX();
   const Vec3 x = helper.cross(z).normalized();
   Mat3 frame;
   frame.col(0) = x;
@@ -26,46 +56,53 @@ Mat3 FrameFromNormal(const Vec3& z) {
   return frame;
 }
 
-// Mean distance to the `k` nearest neighbours within the grid radius, or NaN
-// with fewer than three neighbours.
+// Mean distance to the `neighbors` nearest neighbours within the grid
+// radius, or NaN with fewer than kMinSpacingNeighbours neighbours.
 double LocalSpacing(
-    const Points& points, size_t i, int k, double inv_cell, double radius,
+    const Points& points, size_t point, int neighbors, double inverse_cell,
+    double radius,
     const std::unordered_map<VoxelKey, std::vector<int>, VoxelKeyHash>& grid) {
-  const VoxelKey center = VoxelOf(points[i], inv_cell);
-  const double r2 = radius * radius;
-  std::vector<double> d2;
-  for (int dx = -1; dx <= 1; ++dx) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        const auto it =
+  const VoxelKey center = VoxelOf(points[point], inverse_cell);
+  const double squared_radius = radius * radius;
+  std::vector<double> squared_distances;
+  for (int dx = -kNeighbourhoodRadius; dx <= kNeighbourhoodRadius; ++dx) {
+    for (int dy = -kNeighbourhoodRadius; dy <= kNeighbourhoodRadius; ++dy) {
+      for (int dz = -kNeighbourhoodRadius; dz <= kNeighbourhoodRadius; ++dz) {
+        const auto found =
             grid.find({center.x + dx, center.y + dy, center.z + dz});
-        if (it == grid.end()) continue;
-        for (int j : it->second) {
-          if (static_cast<size_t>(j) == i) continue;
-          const double d = (points[static_cast<size_t>(j)] - points[i])
-                               .squaredNorm();
-          if (d < r2 && d > 0.0) d2.push_back(d);
+        if (found == grid.end()) continue;
+        for (int other : found->second) {
+          if (static_cast<size_t>(other) == point) continue;
+          const double squared_distance =
+              (points[static_cast<size_t>(other)] - points[point])
+                  .squaredNorm();
+          if (squared_distance < squared_radius && squared_distance > 0.0) {
+            squared_distances.push_back(squared_distance);
+          }
         }
       }
     }
   }
-  if (d2.size() < 3) return kNaN;
-  const size_t m = std::min(d2.size(), static_cast<size_t>(k));
-  std::partial_sort(d2.begin(), d2.begin() + static_cast<long>(m), d2.end());
+  if (squared_distances.size() < kMinSpacingNeighbours) return kNaN;
+  const size_t nearest =
+      std::min(squared_distances.size(), static_cast<size_t>(neighbors));
+  std::partial_sort(squared_distances.begin(),
+                    squared_distances.begin() + static_cast<long>(nearest),
+                    squared_distances.end());
   double sum = 0.0;
-  for (size_t a = 0; a < m; ++a) sum += std::sqrt(d2[a]);
-  return sum / static_cast<double>(m);
+  for (size_t k = 0; k < nearest; ++k) sum += std::sqrt(squared_distances[k]);
+  return sum / static_cast<double>(nearest);
 }
 
 }  // namespace
 
 void GaussianSet::FillDefaults() {
-  const size_t n = means.size();
-  rotations.resize(n, Eigen::Quaterniond::Identity());
-  scales.resize(n, Vec3::Constant(0.01));
-  opacity.resize(n, 1.0f);
-  intensity.resize(n, 0.0f);
-  trip.resize(n, -1);
+  const size_t count = means.size();
+  rotations.resize(count, Eigen::Quaterniond::Identity());
+  scales.resize(count, Vec3::Constant(kDefaultScale));
+  opacity.resize(count, kDefaultOpacity);
+  intensity.resize(count, 0.0f);
+  trip.resize(count, kSharedTrip);
 }
 
 GaussianSet InitGaussians(const Points& points, const Points& normals,
@@ -77,35 +114,36 @@ GaussianSet InitGaussians(const Points& points, const Points& normals,
   GaussianSet set;
   set.means = points;
   set.FillDefaults();
-  const size_t n = points.size();
-  const double inv_cell = 1.0 / config.search_radius;
+  const size_t count = points.size();
+  const double inverse_cell = 1.0 / config.search_radius;
   std::unordered_map<VoxelKey, std::vector<int>, VoxelKeyHash> grid;
-  grid.reserve(n / 8 + 1);
-  for (size_t i = 0; i < n; ++i) {
-    grid[VoxelOf(points[i], inv_cell)].push_back(static_cast<int>(i));
+  grid.reserve(count / kPointsPerCellEstimate + 1);
+  for (size_t point = 0; point < count; ++point) {
+    grid[VoxelOf(points[point], inverse_cell)].push_back(
+        static_cast<int>(point));
   }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1024)
+#pragma omp parallel for schedule(dynamic, kPointsPerChunk)
 #endif
-  for (int64_t ii = 0; ii < static_cast<int64_t>(n); ++ii) {
-    const size_t i = static_cast<size_t>(ii);
-    double spacing = LocalSpacing(points, i, config.neighbors, inv_cell,
-                                  config.search_radius, grid);
+  for (int64_t index = 0; index < static_cast<int64_t>(count); ++index) {
+    const size_t point = static_cast<size_t>(index);
+    double spacing = LocalSpacing(points, point, config.neighbors,
+                                  inverse_cell, config.search_radius, grid);
     if (!std::isfinite(spacing)) spacing = config.default_spacing;
     const double tangent = std::clamp(config.tangent_factor * spacing,
                                       config.min_tangent, config.max_tangent);
-    const Vec3 normal = normals.empty() ? Vec3::Zero() : normals[i];
-    if (normal.norm() > 0.5) {
-      const double along = sigma.empty() || !std::isfinite(sigma[i])
+    const Vec3 normal = normals.empty() ? Vec3::Zero() : normals[point];
+    if (normal.norm() > kMinNormalNorm) {
+      const double along = sigma.empty() || !std::isfinite(sigma[point])
                                ? config.normal_floor
-                               : std::max(sigma[i], config.normal_floor);
-      set.rotations[i] =
+                               : std::max(sigma[point], config.normal_floor);
+      set.rotations[point] =
           Eigen::Quaterniond(FrameFromNormal(normal.normalized()));
-      set.scales[i] = Vec3(tangent, tangent, std::min(along, tangent));
+      set.scales[point] = Vec3(tangent, tangent, std::min(along, tangent));
     } else {
-      set.scales[i] = Vec3::Constant(tangent);
+      set.scales[point] = Vec3::Constant(tangent);
     }
-    set.opacity[i] = static_cast<float>(config.opacity);
+    set.opacity[point] = static_cast<float>(config.opacity);
   }
   return set;
 }
@@ -114,37 +152,41 @@ GaussianRayRenderer::GaussianRayRenderer(GaussianSet gaussians,
                                          const RayRenderConfig& config)
     : set_(std::move(gaussians)), config_(config) {
   set_.FillDefaults();
-  const size_t n = set_.size();
-  axes_.resize(n);
-  std::vector<Vec3> extents(n);
-  Vec3 lo = Vec3::Constant(kInf);
-  Vec3 hi = Vec3::Constant(-kInf);
-  for (size_t i = 0; i < n; ++i) {
-    const Mat3 r = set_.rotations[i].normalized().toRotationMatrix();
-    const Vec3 s = set_.scales[i].cwiseMax(1e-6);
+  const size_t count = set_.size();
+  axes_.resize(count);
+  std::vector<Vec3> extents(count);
+  Vec3 lower = Vec3::Constant(kInf);
+  Vec3 upper = Vec3::Constant(-kInf);
+  for (size_t gaussian = 0; gaussian < count; ++gaussian) {
+    const Mat3 rotation =
+        set_.rotations[gaussian].normalized().toRotationMatrix();
+    const Vec3 sigma = set_.scales[gaussian].cwiseMax(kMinScale);
     Eigen::Matrix3f axes;
-    for (int a = 0; a < 3; ++a) {
-      axes.row(a) = (r.col(a) / s[a]).transpose().cast<float>();
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      axes.row(axis) =
+          (rotation.col(axis) / sigma[axis]).transpose().cast<float>();
     }
-    axes_[i] = axes;
+    axes_[gaussian] = axes;
     // Half-extent of the cutoff ellipsoid along each world axis.
-    for (int w = 0; w < 3; ++w) {
+    for (int world_axis = 0; world_axis < kSpaceDim; ++world_axis) {
       double variance = 0.0;
-      for (int a = 0; a < 3; ++a) variance += std::pow(r(w, a) * s[a], 2);
-      extents[i][w] = config_.cutoff * std::sqrt(variance);
+      for (int axis = 0; axis < kSpaceDim; ++axis) {
+        variance += std::pow(rotation(world_axis, axis) * sigma[axis], 2);
+      }
+      extents[gaussian][world_axis] = config_.cutoff * std::sqrt(variance);
     }
-    lo = lo.cwiseMin(set_.means[i] - extents[i]);
-    hi = hi.cwiseMax(set_.means[i] + extents[i]);
-    max_extent_ = std::max(max_extent_, extents[i].norm());
+    lower = lower.cwiseMin(set_.means[gaussian] - extents[gaussian]);
+    upper = upper.cwiseMax(set_.means[gaussian] + extents[gaussian]);
+    max_extent_ = std::max(max_extent_, extents[gaussian].norm());
   }
   // Attributes the renderer does not need any more.
   set_.rotations = {};
   set_.scales = {};
-  if (n == 0) return;
-  min_bound_ = lo;
+  if (count == 0) return;
+  min_bound_ = lower;
   cell_ = config_.cell;
-  const Vec3 span = hi - lo;
-  auto cells_along = [&](double extent) {
+  const Vec3 span = upper - lower;
+  const auto cells_along = [&](double extent) {
     return std::max(1, static_cast<int>(std::ceil(extent / cell_)));
   };
   while (true) {
@@ -152,41 +194,52 @@ GaussianRayRenderer::GaussianRayRenderer(GaussianSet gaussians,
     ny_ = cells_along(span.y());
     nz_ = cells_along(span.z());
     if (static_cast<int64_t>(nx_) * ny_ * nz_ <= config_.max_cells) break;
-    cell_ *= 1.25;
+    cell_ *= kCellGrowth;
   }
   const int64_t num_cells = static_cast<int64_t>(nx_) * ny_ * nz_;
-  auto cell_range = [&](size_t i, Eigen::Vector3i& a, Eigen::Vector3i& b) {
-    const Vec3 g0 = (set_.means[i] - extents[i] - min_bound_) / cell_;
-    const Vec3 g1 = (set_.means[i] + extents[i] - min_bound_) / cell_;
-    const int dims[3] = {nx_, ny_, nz_};
-    for (int w = 0; w < 3; ++w) {
-      a[w] = std::clamp(static_cast<int>(std::floor(g0[w])), 0, dims[w] - 1);
-      b[w] = std::clamp(static_cast<int>(std::floor(g1[w])), 0, dims[w] - 1);
+  // The first and last cell of a Gaussian's bounding box along each axis.
+  const auto cell_range = [&](size_t gaussian, Eigen::Vector3i& first,
+                              Eigen::Vector3i& last) {
+    const Vec3 grid_first =
+        (set_.means[gaussian] - extents[gaussian] - min_bound_) / cell_;
+    const Vec3 grid_last =
+        (set_.means[gaussian] + extents[gaussian] - min_bound_) / cell_;
+    const int dims[kSpaceDim] = {nx_, ny_, nz_};
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      first[axis] = std::clamp(static_cast<int>(std::floor(grid_first[axis])),
+                               0, dims[axis] - 1);
+      last[axis] = std::clamp(static_cast<int>(std::floor(grid_last[axis])),
+                              0, dims[axis] - 1);
     }
   };
-  auto linear = [&](int i, int j, int k) {
-    return (static_cast<int64_t>(i) * ny_ + j) * nz_ + k;
+  const auto linear = [&](int x, int y, int z) {
+    return (static_cast<int64_t>(x) * ny_ + y) * nz_ + z;
   };
   offsets_.assign(static_cast<size_t>(num_cells + 1), 0);
-  Eigen::Vector3i a, b;
-  for (size_t i = 0; i < n; ++i) {
-    cell_range(i, a, b);
-    for (int x = a.x(); x <= b.x(); ++x) {
-      for (int y = a.y(); y <= b.y(); ++y) {
-        for (int z = a.z(); z <= b.z(); ++z) ++offsets_[linear(x, y, z) + 1];
+  Eigen::Vector3i first;
+  Eigen::Vector3i last;
+  for (size_t gaussian = 0; gaussian < count; ++gaussian) {
+    cell_range(gaussian, first, last);
+    for (int x = first.x(); x <= last.x(); ++x) {
+      for (int y = first.y(); y <= last.y(); ++y) {
+        for (int z = first.z(); z <= last.z(); ++z) {
+          ++offsets_[linear(x, y, z) + 1];
+        }
       }
     }
   }
-  for (int64_t c = 0; c < num_cells; ++c) offsets_[c + 1] += offsets_[c];
+  for (int64_t cell = 0; cell < num_cells; ++cell) {
+    offsets_[cell + 1] += offsets_[cell];
+  }
   entries_.resize(static_cast<size_t>(offsets_.back()));
   std::vector<int64_t> cursor(offsets_.begin(), offsets_.end() - 1);
-  for (size_t i = 0; i < n; ++i) {
-    cell_range(i, a, b);
-    for (int x = a.x(); x <= b.x(); ++x) {
-      for (int y = a.y(); y <= b.y(); ++y) {
-        for (int z = a.z(); z <= b.z(); ++z) {
+  for (size_t gaussian = 0; gaussian < count; ++gaussian) {
+    cell_range(gaussian, first, last);
+    for (int x = first.x(); x <= last.x(); ++x) {
+      for (int y = first.y(); y <= last.y(); ++y) {
+        for (int z = first.z(); z <= last.z(); ++z) {
           entries_[static_cast<size_t>(cursor[linear(x, y, z)]++)] =
-              static_cast<int>(i);
+              static_cast<int>(gaussian);
         }
       }
     }
@@ -195,21 +248,25 @@ GaussianRayRenderer::GaussianRayRenderer(GaussianSet gaussians,
 
 bool GaussianRayRenderer::Evaluate(int index, const Vec3& origin,
                                    const Vec3& direction, Hit& hit) const {
-  const size_t i = static_cast<size_t>(index);
-  const Eigen::Matrix3f& axes = axes_[i];
-  const Eigen::Vector3f o = axes * (origin - set_.means[i]).cast<float>();
-  const Eigen::Vector3f d = axes * direction.cast<float>();
-  const float dd = d.squaredNorm();
-  if (dd < 1e-12f) return false;
-  const float t = -o.dot(d) / dd;
-  if (t <= 0.0f) return false;
-  const float m2 = (o + t * d).squaredNorm();
-  if (m2 > config_.cutoff * config_.cutoff) return false;
+  const size_t gaussian = static_cast<size_t>(index);
+  const Eigen::Matrix3f& axes = axes_[gaussian];
+  // The ray in the Gaussian's whitened frame.
+  const Eigen::Vector3f local_origin =
+      axes * (origin - set_.means[gaussian]).cast<float>();
+  const Eigen::Vector3f local_direction = axes * direction.cast<float>();
+  const float squared_length = local_direction.squaredNorm();
+  if (squared_length < kMinLocalDirection) return false;
+  const float peak = -local_origin.dot(local_direction) / squared_length;
+  if (peak <= 0.0f) return false;
+  const float squared_distance =
+      (local_origin + peak * local_direction).squaredNorm();
+  if (squared_distance > config_.cutoff * config_.cutoff) return false;
   const double alpha = std::min(
-      static_cast<double>(set_.opacity[i]) * std::exp(-0.5 * m2),
+      static_cast<double>(set_.opacity[gaussian]) *
+          std::exp(-0.5 * squared_distance),
       config_.max_alpha);
   if (alpha < config_.min_alpha) return false;
-  hit = {static_cast<double>(t), alpha, index};
+  hit = {static_cast<double>(peak), alpha, index};
   return true;
 }
 
@@ -219,61 +276,66 @@ void GaussianRayRenderer::CollectHits(const Vec3& origin,
   hits.clear();
   if (entries_.empty()) return;
   // Clip the ray to the grid box (slab test, metres).
-  const Vec3 hi = min_bound_ + cell_ * Vec3(nx_, ny_, nz_);
-  double t0 = 0.0;
-  double t1 = config_.max_range;
-  for (int a = 0; a < 3; ++a) {
-    if (std::abs(direction[a]) < 1e-12) {
-      if (origin[a] < min_bound_[a] || origin[a] > hi[a]) return;
+  const Vec3 max_bound = min_bound_ + cell_ * Vec3(nx_, ny_, nz_);
+  double t_enter = 0.0;
+  double t_exit = config_.max_range;
+  for (int axis = 0; axis < kSpaceDim; ++axis) {
+    if (std::abs(direction[axis]) < kParallelDirection) {
+      if (origin[axis] < min_bound_[axis] || origin[axis] > max_bound[axis]) {
+        return;
+      }
       continue;
     }
-    double near = (min_bound_[a] - origin[a]) / direction[a];
-    double far = (hi[a] - origin[a]) / direction[a];
+    double near = (min_bound_[axis] - origin[axis]) / direction[axis];
+    double far = (max_bound[axis] - origin[axis]) / direction[axis];
     if (near > far) std::swap(near, far);
-    t0 = std::max(t0, near);
-    t1 = std::min(t1, far);
+    t_enter = std::max(t_enter, near);
+    t_exit = std::min(t_exit, far);
   }
-  if (t0 > t1) return;
-  const Vec3 start = (origin + (t0 + 1e-9) * direction - min_bound_) / cell_;
-  const double t_end = (t1 - t0) / cell_;
-  const double min_t = config_.min_transmittance;
+  if (t_enter > t_exit) return;
+  const Vec3 start =
+      (origin + (t_enter + kEntryNudge) * direction - min_bound_) / cell_;
+  const double t_end = (t_exit - t_enter) / cell_;
+  const double min_transmittance = config_.min_transmittance;
   double saturated = kInf;  // Range where the ray became opaque.
   size_t sorted = 0;
-  int ijk[3] = {static_cast<int>(std::floor(start.x())),
-                static_cast<int>(std::floor(start.y())),
-                static_cast<int>(std::floor(start.z()))};
-  const int dims[3] = {nx_, ny_, nz_};
-  int step[3];
-  double t_max[3];
-  double t_delta[3];
-  for (int a = 0; a < 3; ++a) {
-    ijk[a] = std::clamp(ijk[a], 0, dims[a] - 1);
-    if (direction[a] > 0.0) {
-      step[a] = 1;
-      t_max[a] = (ijk[a] + 1 - start[a]) / direction[a];
-      t_delta[a] = 1.0 / direction[a];
-    } else if (direction[a] < 0.0) {
-      step[a] = -1;
-      t_max[a] = (ijk[a] - start[a]) / direction[a];
-      t_delta[a] = -1.0 / direction[a];
+  int cell_index[kSpaceDim] = {static_cast<int>(std::floor(start.x())),
+                               static_cast<int>(std::floor(start.y())),
+                               static_cast<int>(std::floor(start.z()))};
+  const int dims[kSpaceDim] = {nx_, ny_, nz_};
+  int step[kSpaceDim];
+  double t_max[kSpaceDim];    // Ray parameter of the next cell boundary.
+  double t_delta[kSpaceDim];  // Ray parameter between two boundaries.
+  for (int axis = 0; axis < kSpaceDim; ++axis) {
+    cell_index[axis] = std::clamp(cell_index[axis], 0, dims[axis] - 1);
+    if (direction[axis] > 0.0) {
+      step[axis] = 1;
+      t_max[axis] = (cell_index[axis] + 1 - start[axis]) / direction[axis];
+      t_delta[axis] = 1.0 / direction[axis];
+    } else if (direction[axis] < 0.0) {
+      step[axis] = -1;
+      t_max[axis] = (cell_index[axis] - start[axis]) / direction[axis];
+      t_delta[axis] = -1.0 / direction[axis];
     } else {
-      step[a] = 0;
-      t_max[a] = kInf;
-      t_delta[a] = kInf;
+      step[axis] = 0;
+      t_max[axis] = kInf;
+      t_delta[axis] = kInf;
     }
   }
   double t_cell = 0.0;  // Entry of the current cell (grid units from start).
   while (true) {
-    if (t0 + t_cell * cell_ > saturated + max_extent_) break;
-    const int64_t c = (static_cast<int64_t>(ijk[0]) * ny_ + ijk[1]) * nz_ +
-                      ijk[2];
-    for (int64_t e = offsets_[static_cast<size_t>(c)];
-         e < offsets_[static_cast<size_t>(c) + 1]; ++e) {
-      const int g = entries_[static_cast<size_t>(e)];
-      const int g_trip = set_.trip[static_cast<size_t>(g)];
-      if (g_trip >= 0 && g_trip != trip) continue;
+    if (t_enter + t_cell * cell_ > saturated + max_extent_) break;
+    const int64_t cell =
+        (static_cast<int64_t>(cell_index[0]) * ny_ + cell_index[1]) * nz_ +
+        cell_index[2];
+    for (int64_t entry = offsets_[static_cast<size_t>(cell)];
+         entry < offsets_[static_cast<size_t>(cell) + 1]; ++entry) {
+      const int gaussian = entries_[static_cast<size_t>(entry)];
+      const int gaussian_trip = set_.trip[static_cast<size_t>(gaussian)];
+      const bool trip_specific = gaussian_trip >= 0;
+      if (trip_specific && gaussian_trip != trip) continue;
       Hit hit;
-      if (Evaluate(g, origin, direction, hit)) hits.push_back(hit);
+      if (Evaluate(gaussian, origin, direction, hit)) hits.push_back(hit);
     }
     if (hits.size() > sorted) {
       std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
@@ -287,21 +349,22 @@ void GaussianRayRenderer::CollectHits(const Vec3& origin,
       sorted = hits.size();
       double transmittance = 1.0;
       saturated = kInf;
-      for (const Hit& h : hits) {
-        transmittance *= 1.0 - h.alpha;
-        if (transmittance < min_t) {
-          saturated = h.t;
+      for (const Hit& hit : hits) {
+        transmittance *= 1.0 - hit.alpha;
+        if (transmittance < min_transmittance) {
+          saturated = hit.t;
           break;
         }
       }
     }
-    int axis = 0;
-    if (t_max[1] < t_max[axis]) axis = 1;
-    if (t_max[2] < t_max[axis]) axis = 2;
+    int axis = 0;  // The axis whose boundary comes first.
+    for (int other = 1; other < kSpaceDim; ++other) {
+      if (t_max[other] < t_max[axis]) axis = other;
+    }
     if (t_max[axis] > t_end) break;
     t_cell = t_max[axis];
-    ijk[axis] += step[axis];
-    if (ijk[axis] < 0 || ijk[axis] >= dims[axis]) break;
+    cell_index[axis] += step[axis];
+    if (cell_index[axis] < 0 || cell_index[axis] >= dims[axis]) break;
     t_max[axis] += t_delta[axis];
   }
 }
@@ -310,49 +373,52 @@ RayRender GaussianRayRenderer::Render(const Points& origins,
                                       const Points& directions,
                                       int trip) const {
   GR_CHECK(origins.size() == directions.size());
-  const size_t n = origins.size();
+  const size_t count = origins.size();
   RayRender out;
-  out.depth.assign(n, kNaN);
-  out.mean_depth.assign(n, kNaN);
-  out.intensity.assign(n, std::numeric_limits<float>::quiet_NaN());
-  out.opacity.assign(n, 0.0f);
-  out.dominant.assign(n, -1);
+  out.depth.assign(count, kNaN);
+  out.mean_depth.assign(count, kNaN);
+  out.intensity.assign(count, std::numeric_limits<float>::quiet_NaN());
+  out.opacity.assign(count, 0.0f);
+  out.dominant.assign(count, RayRender::kNoGaussian);
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
   {
     std::vector<Hit> hits;
 #ifdef _OPENMP
-#pragma omp for schedule(dynamic, 64)
+#pragma omp for schedule(dynamic, kRaysPerChunk)
 #endif
-    for (int64_t rr = 0; rr < static_cast<int64_t>(n); ++rr) {
-      const size_t r = static_cast<size_t>(rr);
-      const Vec3 direction = directions[r].normalized();
-      CollectHits(origins[r], direction, trip, hits);
+    for (int64_t index = 0; index < static_cast<int64_t>(count); ++index) {
+      const size_t ray = static_cast<size_t>(index);
+      const Vec3 direction = directions[ray].normalized();
+      CollectHits(origins[ray], direction, trip, hits);
       double transmittance = 1.0;
-      double sum_w = 0.0;
-      double sum_wt = 0.0;
-      double sum_wi = 0.0;
+      double weight_sum = 0.0;
+      double weighted_range = 0.0;
+      double weighted_intensity = 0.0;
       double best = 0.0;
-      for (const Hit& h : hits) {
-        const double w = transmittance * h.alpha;
-        sum_w += w;
-        sum_wt += w * h.t;
-        sum_wi += w * set_.intensity[static_cast<size_t>(h.index)];
-        if (w > best) {
-          best = w;
-          out.dominant[r] = h.index;
+      for (const Hit& hit : hits) {
+        const double weight = transmittance * hit.alpha;
+        weight_sum += weight;
+        weighted_range += weight * hit.t;
+        weighted_intensity +=
+            weight * set_.intensity[static_cast<size_t>(hit.index)];
+        if (weight > best) {
+          best = weight;
+          out.dominant[ray] = hit.index;
         }
-        transmittance *= 1.0 - h.alpha;
-        if (std::isnan(out.depth[r]) && transmittance < 0.5) {
-          out.depth[r] = h.t;
+        transmittance *= 1.0 - hit.alpha;
+        if (std::isnan(out.depth[ray]) &&
+            transmittance < RayRender::kDepthTransmittance) {
+          out.depth[ray] = hit.t;
         }
         if (transmittance < config_.min_transmittance) break;
       }
-      out.opacity[r] = static_cast<float>(1.0 - transmittance);
-      if (sum_w > 0.0) {
-        out.mean_depth[r] = sum_wt / sum_w;
-        out.intensity[r] = static_cast<float>(sum_wi / sum_w);
+      out.opacity[ray] = static_cast<float>(1.0 - transmittance);
+      if (weight_sum > 0.0) {
+        out.mean_depth[ray] = weighted_range / weight_sum;
+        out.intensity[ray] =
+            static_cast<float>(weighted_intensity / weight_sum);
       }
     }
   }

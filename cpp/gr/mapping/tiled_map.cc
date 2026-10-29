@@ -13,14 +13,21 @@ namespace gr {
 namespace {
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
+// The halo of a tile is the normal radius in voxels plus this many: a point
+// of a halo voxel may lie anywhere in it.
+constexpr int kHaloExtraVoxels = 1;
+// uint16 observation counts saturate.
+constexpr int kMaxObservations = 65535;
+// Sweeps that measure the LiDAR beam spacing (first, middle, last).
+constexpr size_t kBeamSpacingSweeps = 3;
 
-// Horizontal distance from `p` to the box of a voxel region (m).
-double DistanceToRegion(const Vec3& p, const VoxelRegion& region,
+// Horizontal distance from `point` to the box of a voxel region (m).
+double DistanceToRegion(const Vec3& point, const VoxelRegion& region,
                         double voxel) {
   const double dx = std::max(
-      {region.x0 * voxel - p.x(), 0.0, p.x() - region.x1 * voxel});
+      {region.x0 * voxel - point.x(), 0.0, point.x() - region.x1 * voxel});
   const double dy = std::max(
-      {region.y0 * voxel - p.y(), 0.0, p.y() - region.y1 * voxel});
+      {region.y0 * voxel - point.y(), 0.0, point.y() - region.y1 * voxel});
   return std::hypot(dx, dy);
 }
 
@@ -29,8 +36,10 @@ VoxelRegion Grow(const VoxelRegion& region, int margin) {
           region.y1 + margin};
 }
 
-int FloorDiv(int a, int b) {
-  return a / b - (a % b != 0 && (a < 0) != (b < 0));
+// Integer division rounding down (Python's //).
+int FloorDiv(int dividend, int divisor) {
+  return dividend / divisor -
+         (dividend % divisor != 0 && (dividend < 0) != (divisor < 0));
 }
 
 struct Builder {
@@ -46,10 +55,10 @@ struct Builder {
   std::vector<int> Reaching(const MapTile& tile, const VoxelRegion& region,
                             double reach) const {
     std::vector<int> out;
-    for (size_t k = 0; k < poses.size(); ++k) {
-      if (tile.whole || DistanceToRegion(poses[k].translation, region,
+    for (size_t keyframe = 0; keyframe < poses.size(); ++keyframe) {
+      if (tile.whole || DistanceToRegion(poses[keyframe].translation, region,
                                          config.voxel) <= reach) {
-        out.push_back(static_cast<int>(k));
+        out.push_back(static_cast<int>(keyframe));
       }
     }
     return out;
@@ -61,25 +70,28 @@ struct Builder {
     const MapFusionConfig& fusion = config.fusion;
     MapAccumulator accumulator(config.voxel, config.max_range, fusion);
     const int halo =
-        static_cast<int>(std::ceil(config.normal_radius / config.voxel)) + 1;
+        static_cast<int>(std::ceil(config.normal_radius / config.voxel)) +
+        kHaloExtraVoxels;
     const VoxelRegion region = Grow(tile.region, halo);
     if (!tile.whole) accumulator.SetRegion(region);
     const std::vector<int> sweeps = Reaching(tile, region, config.max_range);
     Points points;
     std::vector<float> intensity;
     if (fusion.fuse) {
-      for (int k : sweeps) {
-        load(k, &points, &intensity);
-        accumulator.AddRanges(poses[static_cast<size_t>(k)], points);
+      for (int keyframe : sweeps) {
+        load(keyframe, &points, &intensity);
+        accumulator.AddRanges(poses[static_cast<size_t>(keyframe)], points);
       }
     }
-    for (int k : sweeps) {
-      load(k, &points, &intensity);
-      accumulator.Add(k, poses[static_cast<size_t>(k)], points, intensity);
+    for (int keyframe : sweeps) {
+      load(keyframe, &points, &intensity);
+      accumulator.Add(keyframe, poses[static_cast<size_t>(keyframe)], points,
+                      intensity);
     }
     const MapAccumulator::Cloud cloud = accumulator.Collect();
     const NormalsResult normals = EstimateOrientedNormals(
-        cloud.points, cloud.keyframe, origins, config.normal_radius, 6, 48);
+        cloud.points, cloud.keyframe, origins, config.normal_radius,
+        kMapNormalMinNeighbors, kMapNormalMaxNeighbors);
     std::vector<float> sigma;
     if (fusion.fuse) {
       sigma = PointSigmas(cloud, normals.normals, fusion.sigma_floor);
@@ -87,17 +99,17 @@ struct Builder {
     MapChunk chunk;
     for (size_t i = 0; i < cloud.points.size(); ++i) {
       if (!tile.whole && !tile.region.Contains(cloud.voxel[i])) continue;
-      const int k = cloud.keyframe[i];
+      const int keyframe = cloud.keyframe[i];
       chunk.xyz.push_back(cloud.points[i]);
       chunk.intensity.push_back(cloud.intensity[i]);
-      chunk.keyframe.push_back(k);
+      chunk.keyframe.push_back(keyframe);
       chunk.trip.push_back(
-          static_cast<int16_t>(trips[static_cast<size_t>(k)]));
+          static_cast<int16_t>(trips[static_cast<size_t>(keyframe)]));
       chunk.normals.push_back(normals.normals[i]);
       chunk.planarity.push_back(static_cast<float>(normals.planarity[i]));
       if (!sigma.empty()) chunk.sigma.push_back(sigma[i]);
-      chunk.observations.push_back(
-          static_cast<uint16_t>(std::min(cloud.observations[i], 65535)));
+      chunk.observations.push_back(static_cast<uint16_t>(
+          std::min(cloud.observations[i], kMaxObservations)));
       chunk.range.push_back(cloud.range[i]);
       chunk.sequence.push_back(cloud.sequence[i]);
     }
@@ -106,36 +118,37 @@ struct Builder {
 
   // Levels (the later steps see the stored float32 normals) and dynamic
   // points of a tile.
-  void Finish(const MapTile& tile, const LevelModel& levels, double el_res,
-              MapChunk* chunk) const {
+  void Finish(const MapTile& tile, const LevelModel& levels,
+              double elevation_resolution, MapChunk* chunk) const {
     const LevelAssignment assignment = AssignLevels(levels, chunk->xyz);
     chunk->level = assignment.level;
     chunk->height = assignment.height;
     chunk->on_ramp = assignment.on_ramp;
-    const size_t n = chunk->size();
-    chunk->dynamic_kind.assign(n, 0);
-    if (!config.dynamic || n == 0) return;
+    const size_t count = chunk->size();
+    chunk->dynamic_kind.assign(count, 0);
+    if (!config.dynamic || count == 0) return;
     Points normals = chunk->normals;
-    for (Vec3& v : normals) v = v.cast<float>().cast<double>();
+    for (Vec3& normal : normals) normal = normal.cast<float>().cast<double>();
     DynamicDetector detector(
         chunk->xyz, normals,
         std::vector<int>(chunk->trip.begin(), chunk->trip.end()),
         config.dynamic_config);
-    detector.SetElevationResolution(el_res);
+    detector.SetElevationResolution(elevation_resolution);
     Points points;
     std::vector<float> intensity;
-    for (int k : Reaching(tile, tile.region, config.dynamic_config.max_range)) {
-      load(k, &points, &intensity);
-      detector.AddSweep(trips[static_cast<size_t>(k)],
-                        poses[static_cast<size_t>(k)], points);
+    for (int keyframe :
+         Reaching(tile, tile.region, config.dynamic_config.max_range)) {
+      load(keyframe, &points, &intensity);
+      detector.AddSweep(trips[static_cast<size_t>(keyframe)],
+                        poses[static_cast<size_t>(keyframe)], points);
     }
-    for (size_t t = 0; t < paths.size(); ++t) {
-      detector.AddEgoPath(static_cast<int>(t), paths[t]);
+    for (size_t trip = 0; trip < paths.size(); ++trip) {
+      detector.AddEgoPath(static_cast<int>(trip), paths[trip]);
     }
     detector.SetHeights(
         std::vector<double>(chunk->height.begin(), chunk->height.end()));
     const std::vector<DynamicKind> kinds = detector.Classify();
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < count; ++i) {
       chunk->dynamic_kind[i] = static_cast<uint8_t>(kinds[i]);
     }
   }
@@ -143,7 +156,7 @@ struct Builder {
   // The tiles covering every return within max_range of a sensor position.
   std::vector<MapTile> Tiles() const {
     if (config.tile_size <= 0.0 || poses.empty()) return {MapTile{}};
-    const int n = std::max(
+    const int voxels_per_tile = std::max(
         1, static_cast<int>(std::lround(config.tile_size / config.voxel)));
     Vec2 lo = Vec2::Constant(kInf);
     Vec2 hi = Vec2::Constant(-kInf);
@@ -151,8 +164,9 @@ struct Builder {
       lo = lo.cwiseMin(pose.translation.head<2>());
       hi = hi.cwiseMax(pose.translation.head<2>());
     }
-    const auto tile_of = [&](double x) {
-      return FloorDiv(static_cast<int>(std::floor(x / config.voxel)), n);
+    const auto tile_of = [&](double coordinate) {
+      return FloorDiv(static_cast<int>(std::floor(coordinate / config.voxel)),
+                      voxels_per_tile);
     };
     std::vector<MapTile> tiles;
     for (int iy = tile_of(lo.y() - config.max_range);
@@ -163,7 +177,8 @@ struct Builder {
         tile.ix = ix;
         tile.iy = iy;
         tile.whole = false;
-        tile.region = {ix * n, (ix + 1) * n, iy * n, (iy + 1) * n};
+        tile.region = {ix * voxels_per_tile, (ix + 1) * voxels_per_tile,
+                       iy * voxels_per_tile, (iy + 1) * voxels_per_tile};
         tiles.push_back(tile);
       }
     }
@@ -172,20 +187,23 @@ struct Builder {
 
   // Sweep elevation spacing of the range images (DynamicDetector).
   double ElevationResolution() const {
-    if (config.dynamic_config.el_res > 0.0) return config.dynamic_config.el_res;
-    // np.linspace(0, K - 1, min(3, K)).astype(int).
-    const size_t count = std::min<size_t>(3, poses.size());
+    if (config.dynamic_config.el_res > 0.0) {
+      return config.dynamic_config.el_res;
+    }
+    // np.linspace(0, K - 1, min(kBeamSpacingSweeps, K)).astype(int).
+    const size_t count = std::min(kBeamSpacingSweeps, poses.size());
     std::vector<Points> sample;
     std::vector<float> intensity;
     for (size_t m = 0; m < count; ++m) {
       const double step = count > 1 ? static_cast<double>(poses.size() - 1) /
                                           static_cast<double>(count - 1)
                                     : 0.0;
-      const size_t k = m + 1 == count && count > 1
-                           ? poses.size() - 1
-                           : static_cast<size_t>(static_cast<double>(m) * step);
+      const size_t keyframe =
+          m + 1 == count && count > 1
+              ? poses.size() - 1
+              : static_cast<size_t>(static_cast<double>(m) * step);
       sample.emplace_back();
-      load(static_cast<int>(k), &sample.back(), &intensity);
+      load(static_cast<int>(keyframe), &sample.back(), &intensity);
     }
     return EstimateBeamSpacing(sample);
   }
@@ -210,22 +228,23 @@ TiledMapSummary BuildTiledMap(const std::vector<Pose>& world_from_lidar,
 
   // Pass 1: the floors and ceilings of the whole map for the levels.
   Points level_xyz;
-  std::vector<double> level_nz;
+  std::vector<double> level_normal_z;
   std::vector<std::pair<double, int64_t>> level_order;
   MapBounds bounds{Vec2::Constant(kInf), Vec2::Constant(-kInf)};
   std::vector<uint8_t> occupied(tiles.size(), 0);
   std::optional<MapChunk> cached;  // A single tile is not fused twice.
-  for (size_t t = 0; t < tiles.size(); ++t) {
-    MapChunk chunk = builder.Fuse(tiles[t]);
-    occupied[t] = chunk.size() > 0;
+  for (size_t tile = 0; tile < tiles.size(); ++tile) {
+    MapChunk chunk = builder.Fuse(tiles[tile]);
+    occupied[tile] = chunk.size() > 0;
     for (size_t i = 0; i < chunk.size(); ++i) {
       bounds.lo = bounds.lo.cwiseMin(chunk.xyz[i].head<2>());
       bounds.hi = bounds.hi.cwiseMax(chunk.xyz[i].head<2>());
-      const double nz = static_cast<double>(static_cast<float>(
-          chunk.normals[i].z()));
-      if (nz > 0.8 || nz < -0.85) {
+      // DetectLevels sees the stored float32 normals.
+      const double normal_z =
+          static_cast<double>(static_cast<float>(chunk.normals[i].z()));
+      if (normal_z > kRampMinNormalZ || normal_z < kCeilingMaxNormalZ) {
         level_xyz.push_back(chunk.xyz[i]);
-        level_nz.push_back(nz);
+        level_normal_z.push_back(normal_z);
         level_order.emplace_back(chunk.range[i], chunk.sequence[i]);
       }
     }
@@ -233,21 +252,21 @@ TiledMapSummary BuildTiledMap(const std::vector<Pose>& world_from_lidar,
   }
   std::vector<size_t> order(level_xyz.size());
   std::iota(order.begin(), order.end(), size_t{0});
-  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-    return level_order[a] < level_order[b];
+  std::sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+    return level_order[left] < level_order[right];
   });
   Points xyz(order.size());
   Points normals(order.size());
   for (size_t i = 0; i < order.size(); ++i) {
     xyz[i] = level_xyz[order[i]];
-    normals[i] = Vec3(0.0, 0.0, level_nz[order[i]]);
+    normals[i] = Vec3(0.0, 0.0, level_normal_z[order[i]]);
   }
   level_xyz = Points();
-  level_nz = std::vector<double>();
+  level_normal_z = std::vector<double>();
 
   TiledMapSummary summary;
   const bool any = std::any_of(occupied.begin(), occupied.end(),
-                               [](uint8_t o) { return o != 0; });
+                               [](uint8_t flag) { return flag != 0; });
   summary.levels =
       DetectLevels(vehicle_paths, xyz, normals, config.levels, log,
                    any ? std::optional<MapBounds>(bounds) : std::nullopt);
@@ -255,10 +274,10 @@ TiledMapSummary BuildTiledMap(const std::vector<Pose>& world_from_lidar,
       config.dynamic ? builder.ElevationResolution() : 0.0;
 
   // Pass 2: every tile again, with levels and dynamic points.
-  for (size_t t = 0; t < tiles.size(); ++t) {
-    if (!occupied[t]) continue;
-    MapChunk chunk = cached ? std::move(*cached) : builder.Fuse(tiles[t]);
-    builder.Finish(tiles[t], summary.levels, summary.elevation_resolution,
+  for (size_t tile = 0; tile < tiles.size(); ++tile) {
+    if (!occupied[tile]) continue;
+    MapChunk chunk = cached ? std::move(*cached) : builder.Fuse(tiles[tile]);
+    builder.Finish(tiles[tile], summary.levels, summary.elevation_resolution,
                    &chunk);
     ++summary.tiles;
     summary.points += chunk.size();
@@ -268,9 +287,10 @@ TiledMapSummary BuildTiledMap(const std::vector<Pose>& world_from_lidar,
     }
     if (tiles.size() > 1) {
       LogLine(log, StringPrintf("[map] tile (%d, %d): %zu points",
-                                tiles[t].ix, tiles[t].iy, chunk.size()));
+                                tiles[tile].ix, tiles[tile].iy,
+                                chunk.size()));
     }
-    sink(tiles[t], std::move(chunk));
+    sink(tiles[tile], std::move(chunk));
   }
   return summary;
 }

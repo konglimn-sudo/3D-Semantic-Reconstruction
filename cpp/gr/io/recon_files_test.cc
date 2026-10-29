@@ -7,6 +7,7 @@
 
 #include "gr/io/digest.h"
 #include "gr/io/npy.h"
+#include "gr/sensors/imu.h"
 #include "gr/testing/test.h"
 
 namespace gr {
@@ -73,7 +74,7 @@ cameras:
   bias << 0.1, 0.2, 0.3, 0.4, 0.5, 0.6;
   trip.biases = {bias};
   trip.rig = RigDict(rig_yaml);
-  Eigen::MatrixXd imu(1, 7);
+  Eigen::MatrixXd imu(1, ImuSamples::kCsvColumns);
   imu << 0, 1, 2, 3, 4, 5, 6;
   const PoseSetIds ids =
       ComputePoseSetIds({trip}, {imu}, {Eigen::MatrixXd(0, 0)});
@@ -101,21 +102,25 @@ h: true
 
 GR_TEST(NpyTest, HalfsRoundToNearestEvenAsNumpy) {
   const std::vector<float> values = {
-      1.0f,  0.1f,          65504.0f,
+      1.0f,
+      0.1f,
+      65504.0f,
       65520.0f,  // Halfway to 65536: rounds up to Inf.
-      1e-8f, 5.9604645e-08f,  // 2^-24, the smallest subnormal.
-      3.0517578125e-05f,      // 2^-15, subnormal.
-      -2.5f, 1.0f + 0x1p-11f,  // Halfway: to the even 1.0.
-      1.0f + 3 * 0x1p-11f};    // Halfway: to the even 1 + 2^-9.
+      1e-8f,
+      5.9604645e-08f,     // 2^-24, the smallest subnormal.
+      3.0517578125e-05f,  // 2^-15, subnormal.
+      -2.5f,
+      1.0f + 0x1p-11f,       // Halfway: to the even 1.0.
+      1.0f + 3 * 0x1p-11f};  // Halfway: to the even 1 + 2^-9.
   const std::vector<uint16_t> expected = {0x3C00, 0x2E66, 0x7BFF, 0x7C00,
                                           0x0000, 0x0001, 0x0200, 0xC100,
                                           0x3C00, 0x3C02};
-  const NpyArray array = NpyArray::FromHalfs(
-      values, {static_cast<int64_t>(values.size())});
-  GR_ASSERT_TRUE(array.kind == 'f' && array.item_size == 2);
+  const NpyArray array =
+      NpyArray::FromHalfs(values, {static_cast<int64_t>(values.size())});
+  GR_ASSERT_TRUE(array.kind == 'f' && array.item_size == sizeof(uint16_t));
   for (size_t k = 0; k < expected.size(); ++k) {
-    uint16_t bits;
-    std::memcpy(&bits, array.data.data() + 2 * k, 2);
+    uint16_t bits = 0;
+    std::memcpy(&bits, array.data.data() + sizeof(bits) * k, sizeof(bits));
     GR_EXPECT_EQ(bits, expected[k]);
   }
   GR_EXPECT_NEAR(array.ToFloats()[1], 0.0999755859375, 0.0);
@@ -125,7 +130,7 @@ GR_TEST(ReconFilesTest, WorkDirectoryFilesRoundTrip) {
   const fs::path dir = TempDir("work");
   TripOdometryFile odometry;
   odometry.stamps = {0.1, 0.2, 0.3};
-  for (int k = 0; k < 3; ++k) {
+  for (size_t k = 0; k < odometry.stamps.size(); ++k) {
     odometry.lidar_poses.push_back(
         Pose(Mat3::Identity(), Vec3(k, 0.5 * k, 0.0)));
   }
@@ -157,8 +162,8 @@ GR_TEST(ReconFilesTest, WorkDirectoryFilesRoundTrip) {
   const NpzArchive archive = ReadNpz(path);
   // No IMU factors: (0, 3).
   GR_EXPECT_TRUE(archive.at("velocity").shape ==
-                 (std::vector<int64_t>{0, 3}));
-  GR_EXPECT_EQ(archive.at("trip").item_size, 8);
+                 (std::vector<int64_t>{0, kSpaceDim}));
+  GR_EXPECT_EQ(archive.at("trip").item_size, static_cast<int>(sizeof(int64_t)));
   GR_EXPECT_TRUE(ReadKeyframeTable(path).frame == table.frame);
 
   PoseSetIds ids;

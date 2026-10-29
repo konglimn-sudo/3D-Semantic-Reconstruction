@@ -29,10 +29,13 @@
 
 namespace gr {
 
+// rig.yaml's sweep_duration (s) where it gives none.
+inline constexpr double kDefaultSweepDuration = 0.1;
+
 struct LidarCalibration {
   std::string name;
   Pose vehicle_from_lidar;
-  double sweep_duration = 0.1;
+  double sweep_duration = kDefaultSweepDuration;  // s
 };
 
 struct CameraCalibration {
@@ -42,7 +45,9 @@ struct CameraCalibration {
   int height = 0;
   std::vector<double> params;
   Pose vehicle_from_camera;  // OpenCV camera axes.
+  // s from the exposure of one image row to the next.
   double rolling_shutter_line_time = 0.0;
+  // s from the image stamp to the exposure of row 0 (data/schema.py).
   double time_offset = 0.0;
 };
 
@@ -57,7 +62,7 @@ struct Rig {
   static Rig FromValue(const Value& value);
 };
 
-// A 4x4 matrix given as nested lists (or 16 numbers).
+// A 4x4 matrix given as nested lists (or its 16 numbers row by row).
 Pose PoseFromValue(const Value& value);
 
 struct LidarSweep {

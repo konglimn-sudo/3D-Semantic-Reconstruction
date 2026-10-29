@@ -21,10 +21,11 @@ void ReportFailure(const char* file, int line, const std::string& message);
 // Runs every registered test and returns the process exit code.
 int RunAllTests();
 
-template <typename A, typename B>
-std::string CompareMessage(const char* expression, const A& a, const B& b) {
+template <typename Left, typename Right>
+std::string CompareMessage(const char* expression, const Left& left,
+                           const Right& right) {
   std::ostringstream message;
-  message << "expected " << expression << ", got " << a << " vs " << b;
+  message << "expected " << expression << ", got " << left << " vs " << right;
   return message.str();
 }
 

@@ -34,19 +34,24 @@ struct SlotStateConfig {
   double floor_band = 0.1;  // |height| of floor returns (m).
   int min_body_points = 25;
   int max_free_points = 3;
-  double cell = 0.25;       // m, floor coverage cells.
+  double cell = 0.25;  // m, floor coverage cells.
   double min_floor_share = 0.25;
   int confirm = 2;
 };
 
+// A parking slot is a quadrilateral.
+inline constexpr int kSlotCorners = 4;
+
 struct SlotGeometry {
   std::string slot_id;
   int level = 0;
-  std::array<Vec2, 4> corners;
+  std::array<Vec2, kSlotCorners> corners;
   double z = 0.0;  // Floor height.
 };
 
 enum class SlotState { kUnknown = 0, kFree = 1, kOccupied = 2 };
+// The number of SlotState values.
+inline constexpr int kSlotStateCount = 3;
 
 struct SlotObservation {
   int slot = -1;

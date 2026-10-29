@@ -10,7 +10,9 @@
 #include <vector>
 
 #include "bind_util.h"
+#include "gr/core/image.h"
 #include "gr/semantics/markings.h"
+#include "gr/semantics/objects4d.h"
 #include "gr/semantics/paint.h"
 #include "gr/semantics/slot_paint.h"
 #include "gr/semantics/slots.h"
@@ -28,25 +30,35 @@ using DoubleImage =
 using MaskImage =
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
 
+// Fields of the Python tuples the bindings take.
+constexpr size_t kFloorImageFields = 6;  // (name, brightness, valid, x0, y0,
+                                         //  res)
+constexpr size_t kColumnFields = 4;      // (cx, cy, sx, sy)
+// Rasters without a channel axis have one channel.
+constexpr int kSingleChannel = 1;
+
 // Marking segments as dicts (the Python MarkingSegment fields).
 MarkingSegment SegmentFrom(const py::handle& item) {
-  const py::dict d = item.cast<py::dict>();
-  MarkingSegment seg;
-  seg.level = d["level"].cast<int>();
-  seg.p0 = d["p0"].cast<Vec2>();
-  seg.p1 = d["p1"].cast<Vec2>();
-  seg.width = d["width"].cast<double>();
-  seg.lane = d.contains("cls") &&
-             d["cls"].cast<std::string>() == "lane_marking";
-  seg.confidence = d.contains("confidence") ? d["confidence"].cast<double>()
-                                            : 1.0;
-  if (d.contains("end_ok")) {
-    const std::vector<bool> ok = d["end_ok"].cast<std::vector<bool>>();
-    Require(ok.size() == 2, "end_ok has two flags");
-    seg.end_ok[0] = ok[0];
-    seg.end_ok[1] = ok[1];
+  const py::dict fields = item.cast<py::dict>();
+  MarkingSegment segment;
+  segment.level = fields["level"].cast<int>();
+  segment.p0 = fields["p0"].cast<Vec2>();
+  segment.p1 = fields["p1"].cast<Vec2>();
+  segment.width = fields["width"].cast<double>();
+  segment.lane = fields.contains("cls") &&
+                 fields["cls"].cast<std::string>() == "lane_marking";
+  if (fields.contains("confidence")) {
+    segment.confidence = fields["confidence"].cast<double>();
   }
-  return seg;
+  if (fields.contains("end_ok")) {
+    const std::vector<bool> end_ok =
+        fields["end_ok"].cast<std::vector<bool>>();
+    Require(end_ok.size() == kSegmentEnds, "end_ok has two flags");
+    for (int end = 0; end < kSegmentEnds; ++end) {
+      segment.end_ok[end] = end_ok[end];
+    }
+  }
+  return segment;
 }
 
 std::vector<MarkingSegment> SegmentsFrom(const py::list& items) {
@@ -55,15 +67,16 @@ std::vector<MarkingSegment> SegmentsFrom(const py::list& items) {
   return out;
 }
 
-py::list SegmentsTo(const std::vector<MarkingSegment>& segs) {
+py::list SegmentsTo(const std::vector<MarkingSegment>& segments) {
   py::list out;
-  for (const MarkingSegment& s : segs) {
+  for (const MarkingSegment& segment : segments) {
     out.append(py::dict(
-        "level"_a = s.level, "p0"_a = s.p0, "p1"_a = s.p1,
-        "width"_a = s.width,
-        "cls"_a = s.lane ? "lane_marking" : "parking_line",
-        "confidence"_a = s.confidence,
-        "end_ok"_a = std::vector<bool>{s.end_ok[0], s.end_ok[1]}));
+        "level"_a = segment.level, "p0"_a = segment.p0, "p1"_a = segment.p1,
+        "width"_a = segment.width,
+        "cls"_a = segment.lane ? "lane_marking" : "parking_line",
+        "confidence"_a = segment.confidence,
+        "end_ok"_a = std::vector<bool>(std::begin(segment.end_ok),
+                                       std::end(segment.end_ok))));
   }
   return out;
 }
@@ -74,18 +87,19 @@ std::vector<uint8_t> MaskFrom(const py::object& mask, RasterFrame& frame) {
   frame.height = static_cast<int>(array.shape(0));
   frame.width = static_cast<int>(array.shape(1));
   std::vector<uint8_t> out(array.data(), array.data() + array.size());
-  for (uint8_t& v : out) v = v != 0;
+  for (uint8_t& value : out) value = value != 0;
   return out;
 }
 
 // (name, brightness (H, W), valid (H, W), x0, y0, res).
 FloorImage ImageFrom(const py::handle& item) {
-  const py::tuple t = item.cast<py::tuple>();
-  Require(t.size() == 6, "images are (name, brightness, valid, x0, y0, res)");
+  const py::tuple tuple = item.cast<py::tuple>();
+  Require(tuple.size() == kFloorImageFields,
+          "images are (name, brightness, valid, x0, y0, res)");
   FloorImage image;
-  image.name = t[0].cast<std::string>();
-  const DoubleImage brightness = DoubleImage::ensure(t[1]);
-  const DoubleImage valid = DoubleImage::ensure(t[2]);
+  image.name = tuple[0].cast<std::string>();
+  const DoubleImage brightness = DoubleImage::ensure(tuple[1]);
+  const DoubleImage valid = DoubleImage::ensure(tuple[2]);
   Require(brightness && valid && brightness.ndim() == 2 &&
               valid.ndim() == 2 && brightness.shape(0) == valid.shape(0) &&
               brightness.shape(1) == valid.shape(1),
@@ -95,9 +109,9 @@ FloorImage ImageFrom(const py::handle& item) {
   image.brightness.assign(brightness.data(),
                           brightness.data() + brightness.size());
   image.valid.assign(valid.data(), valid.data() + valid.size());
-  image.x0 = t[3].cast<double>();
-  image.y0 = t[4].cast<double>();
-  image.res = t[5].cast<double>();
+  image.x0 = tuple[3].cast<double>();
+  image.y0 = tuple[4].cast<double>();
+  image.res = tuple[5].cast<double>();
   Require(image.res > 0.0, "res must be positive");
   return image;
 }
@@ -126,8 +140,8 @@ std::vector<Vec2> CornersFrom(const py::handle& points) {
           points)
           .cast<RowMatX2d>();
   std::vector<Vec2> out;
-  for (Eigen::Index k = 0; k < xy.rows(); ++k) {
-    out.push_back(xy.row(k).transpose());
+  for (Eigen::Index row = 0; row < xy.rows(); ++row) {
+    out.push_back(xy.row(row).transpose());
   }
   return out;
 }
@@ -135,6 +149,148 @@ std::vector<Vec2> CornersFrom(const py::handle& points) {
 }  // namespace
 
 void BindSemantics(py::module_& m) {
+  py::class_<ObjectsConfig>(m, "ObjectsConfig")
+      .def(py::init<>())
+      .def_readwrite("frame_stride", &ObjectsConfig::frame_stride)
+      .def_readwrite("cluster_res", &ObjectsConfig::cluster_res)
+      .def_readwrite("min_points", &ObjectsConfig::min_points)
+      .def_readwrite("height_min", &ObjectsConfig::height_min)
+      .def_readwrite("height_max", &ObjectsConfig::height_max)
+      .def_readwrite("detect_max_range", &ObjectsConfig::detect_max_range)
+      .def_readwrite("match_gate", &ObjectsConfig::match_gate)
+      .def_readwrite("max_missed", &ObjectsConfig::max_missed)
+      .def_readwrite("min_hits", &ObjectsConfig::min_hits)
+      .def_readwrite("static_displacement", &ObjectsConfig::static_displacement)
+      .def_readwrite("typical_length", &ObjectsConfig::typical_length)
+      .def_readwrite("typical_width", &ObjectsConfig::typical_width)
+      .def_readwrite("moving_fraction", &ObjectsConfig::moving_fraction)
+      .def_readwrite("streak_min_moved", &ObjectsConfig::streak_min_moved)
+      .def_readwrite("parked_min_points", &ObjectsConfig::parked_min_points)
+      .def_readwrite("parked_min_extent", &ObjectsConfig::parked_min_extent)
+      .def_readwrite("vehicle_max_height", &ObjectsConfig::vehicle_max_height)
+      .def_readwrite("max_flat_height_span",
+                     &ObjectsConfig::max_flat_height_span)
+      .def_readwrite("nms_radius", &ObjectsConfig::nms_radius)
+      .def_readwrite("structure_dilation", &ObjectsConfig::structure_dilation)
+      .def_readwrite("structure_voxel", &ObjectsConfig::structure_voxel)
+      .def_readwrite("vehicle_id", &ObjectsConfig::vehicle_id)
+      .def_readwrite("vehicle_moving_id", &ObjectsConfig::vehicle_moving_id)
+      .def_readwrite("pedestrian_id", &ObjectsConfig::pedestrian_id)
+      .def_readwrite("two_wheeler_id", &ObjectsConfig::two_wheeler_id)
+      .def_readwrite("other_id", &ObjectsConfig::other_id);
+
+  m.def(
+      "run_objects",
+      [](const py::dict& map, const std::vector<double>& z,
+         const py::list& grids, const py::list& ramps,
+         const py::object& structure_points, double yaw,
+         const py::dict& paths_by_level, const py::list& slots,
+         const py::object& keyframe_poses, const py::object& keyframe_trip,
+         const py::object& keyframe_stamp,
+         const std::vector<std::string>& trip_names, const py::object& load,
+         const ObjectsConfig& config, const py::object& log) {
+        const LevelModel levels = LevelModelFrom(z, grids, ramps);
+        const Points xyz = PointsFrom(map["xyz"]);
+        const std::vector<float> height = ToFloatVector(map["height"]);
+        const std::vector<int16_t> level = VectorOf<int16_t>(map["level"]);
+        const std::vector<uint8_t> kind =
+            VectorOf<uint8_t>(map["dynamic_kind"]);
+        const std::vector<int16_t> trip = VectorOf<int16_t>(map["trip"]);
+        const std::vector<float> normal_z = ToFloatVector(map["normal_z"]);
+        const std::vector<uint8_t> labels = VectorOf<uint8_t>(map["labels"]);
+        const size_t count = xyz.size();
+        Require(height.size() == count && level.size() == count &&
+                    kind.size() == count && trip.size() == count &&
+                    normal_z.size() == count && labels.size() == count,
+                "run_objects: one height, level, dynamic_kind, trip, "
+                "normal_z and label per map point");
+        ObjectMapView view;
+        view.xyz = &xyz;
+        view.height = &height;
+        view.level = &level;
+        view.dynamic_kind = &kind;
+        view.trip = &trip;
+        view.normal_z = &normal_z;
+        view.labels = &labels;
+        view.floor_id = map["floor_id"].cast<int>();
+        view.ramp_id = map["ramp_id"].cast<int>();
+        const StructureIndex structure(PointsFrom(structure_points),
+                                       config.structure_voxel);
+        std::map<int, std::vector<Vec2>> paths;
+        for (const auto& [key, value] : paths_by_level) {
+          const Points path = PointsFrom(
+              py::reinterpret_borrow<py::object>(value));
+          std::vector<Vec2>& xy = paths[key.cast<int>()];
+          for (const Vec3& point : path) xy.push_back(point.head<2>());
+        }
+        std::vector<SlotOutline> outlines;
+        for (const py::handle& slot : slots) {
+          const py::tuple tuple = py::reinterpret_borrow<py::tuple>(slot);
+          SlotOutline outline;
+          outline.level = tuple[0].cast<int>();
+          const Points corners =
+              PointsFrom(py::reinterpret_borrow<py::object>(tuple[1]));
+          Require(corners.size() == kParkingSlotCorners,
+                  "a slot has 4 corners");
+          for (int corner = 0; corner < kParkingSlotCorners; ++corner) {
+            outline.corners[corner] = corners[corner].head<kPlaneDim>();
+          }
+          outline.width = tuple[2].cast<double>();
+          outlines.push_back(outline);
+        }
+        const std::vector<Pose> poses = PosesFrom(keyframe_poses);
+        const std::vector<int> trips = ToIntVector(keyframe_trip);
+        const std::vector<double> stamps = ToDoubleVector(keyframe_stamp);
+        Require(trips.size() == poses.size() && stamps.size() == poses.size(),
+                "one trip and stamp per keyframe pose");
+        std::exception_ptr error;
+        const KeyframeSweep sweep = [&](int keyframe) {
+          py::gil_scoped_acquire acquire;
+          if (error) return Points();
+          try {
+            return PointsFrom(load(keyframe));
+          } catch (...) {
+            error = std::current_exception();
+            return Points();
+          }
+        };
+        std::exception_ptr log_error;
+        const Logger logger = MakeLogger(log, &log_error);
+        ObjectsResult result;
+        {
+          py::gil_scoped_release release;
+          result = RunObjects(view, levels, structure, yaw, paths, outlines,
+                              poses, trips, stamps, trip_names, sweep, config,
+                              logger);
+        }
+        RethrowIfSet(error);
+        RethrowIfSet(log_error);
+        py::list tracks;
+        for (const ObjectTrack& track : result.tracks) {
+          tracks.append(py::dict(
+              "trip"_a = track.trip, "track_id"_a = track.track_id,
+              "static"_a = track.is_static, "label"_a = track.label,
+              "frames"_a = track.keyframes,
+              "box"_a = track.is_static ? py::cast(track.box) : py::none()));
+        }
+        py::dict moving;
+        for (const auto& [keyframe, boxes] : result.moving) {
+          moving[py::int_(keyframe)] = boxes;
+        }
+        return py::dict("tracks"_a = tracks, "parked"_a = result.parked,
+                        "moving"_a = moving,
+                        "moving_points"_a = ToBoolArray(result.moving_points));
+      },
+      "map"_a, "z"_a, "grids"_a, "ramps"_a, "structure_points"_a, "yaw"_a,
+      "paths_by_level"_a, "slots"_a, "keyframe_poses"_a, "keyframe_trip"_a,
+      "keyframe_stamp"_a, "trip_names"_a, "load"_a, "config"_a,
+      "log"_a = py::none(),
+      "The objects stage (gr/semantics/objects4d.h). map: dict of xyz, "
+      "height, level, dynamic_kind, trip, normal_z, labels, floor_id, "
+      "ramp_id; slots: (level, corners (4, 2), width) tuples; load(k) -> the "
+      "keyframe's sweep (LiDAR frame). Returns tracks (dicts), parked (boxes "
+      "per trip), moving (boxes per keyframe) and moving_points.");
+
   py::class_<SlotConfig>(m, "SlotConfig")
       .def(py::init<>())
       .def_readwrite("width_min", &SlotConfig::width_min)
@@ -168,46 +324,53 @@ void BindSemantics(py::module_& m) {
          const py::object& log) {
         Require(res > 0.0, "res must be positive");
         SlotRasters rasters;
-        const FloatImage hm = FloatImage::ensure(height_max);
-        Require(hm && hm.ndim() == 2, "height_max is an (H, W) array");
-        rasters.frame = RasterFrame{x0, y0, res, static_cast<int>(hm.shape(1)),
-                                    static_cast<int>(hm.shape(0))};
+        const FloatImage height_image = FloatImage::ensure(height_max);
+        Require(height_image && height_image.ndim() == 2,
+                "height_max is an (H, W) array");
+        rasters.frame =
+            RasterFrame{x0, y0, res, static_cast<int>(height_image.shape(1)),
+                        static_cast<int>(height_image.shape(0))};
         rasters.height_max = RasterFrom(height_max, rasters.frame, false);
         rasters.floor_z = RasterFrom(floor_z, rasters.frame, false);
         rasters.floor_count = RasterFrom(floor_count, rasters.frame, true);
         rasters.intensity = RasterFrom(intensity, rasters.frame, true);
         std::vector<Vec2> path;
-        for (const Vec3& p : PointsFrom(path_xy)) path.push_back(p.head<2>());
-        std::vector<SlotColumn> cols;
+        for (const Vec3& point : PointsFrom(path_xy))
+          path.push_back(point.head<2>());
+        std::vector<SlotColumn> slot_columns;
         for (const py::handle& item : columns) {
-          const py::tuple t = item.cast<py::tuple>();
-          Require(t.size() == 4, "columns are (cx, cy, sx, sy) tuples");
-          cols.push_back({Vec2(t[0].cast<double>(), t[1].cast<double>()),
-                          Vec2(t[2].cast<double>(), t[3].cast<double>())});
+          const py::tuple tuple = item.cast<py::tuple>();
+          Require(tuple.size() == kColumnFields,
+                  "columns are (cx, cy, sx, sy) tuples");
+          slot_columns.push_back(
+              {Vec2(tuple[0].cast<double>(), tuple[1].cast<double>()),
+               Vec2(tuple[2].cast<double>(), tuple[3].cast<double>())});
         }
-        const std::vector<MarkingSegment> segs = SegmentsFrom(segments);
+        const std::vector<MarkingSegment> marking_segments =
+            SegmentsFrom(segments);
         std::exception_ptr log_error;
         const Logger logger = MakeLogger(log, &log_error);
         std::vector<ParkingSlot> slots;
         {
           py::gil_scoped_release release;
-          slots = AssembleSlots(segs, level, yaw, path, cols, rasters, config,
-                                logger);
+          slots = AssembleSlots(marking_segments, level, yaw, path,
+                                slot_columns, rasters, config, logger);
         }
         RethrowIfSet(log_error);
         py::list out;
-        for (const ParkingSlot& s : slots) {
+        for (const ParkingSlot& slot : slots) {
           py::list corners;
-          for (const Vec2& c : s.corners) {
-            corners.append(py::make_tuple(c.x(), c.y()));
+          for (const Vec2& corner : slot.corners) {
+            corners.append(py::make_tuple(corner.x(), corner.y()));
           }
           out.append(py::dict(
-              "slot_id"_a = s.slot_id, "row"_a = s.row, "level"_a = s.level,
-              "corners"_a = corners, "z"_a = s.z, "width"_a = s.width,
-              "depth"_a = s.depth,
-              "occupied"_a = s.occupied < 0 ? py::object(py::none())
-                                            : py::object(py::bool_(s.occupied)),
-              "inferred"_a = s.inferred, "confidence"_a = s.confidence));
+              "slot_id"_a = slot.slot_id, "row"_a = slot.row,
+              "level"_a = slot.level, "corners"_a = corners, "z"_a = slot.z,
+              "width"_a = slot.width, "depth"_a = slot.depth,
+              "occupied"_a = slot.occupied == ParkingSlot::kOccupancyUnknown
+                                 ? py::object(py::none())
+                                 : py::object(py::bool_(slot.occupied)),
+              "inferred"_a = slot.inferred, "confidence"_a = slot.confidence));
         }
         return out;
       },
@@ -281,10 +444,10 @@ void BindSemantics(py::module_& m) {
         RasterFrame frame{x0, y0, res, 0, 0};
         const std::vector<uint8_t> cells = MaskFrom(floor, frame);
         std::vector<MarkingSegment> kept;
-        for (const MarkingSegment& s : SegmentsFrom(segments)) {
-          if (BothSidesObserved(s, cells, frame) &&
-              GridAligned(s, yaw, max_axis_angle)) {
-            kept.push_back(s);
+        for (const MarkingSegment& segment : SegmentsFrom(segments)) {
+          if (BothSidesObserved(segment, cells, frame) &&
+              GridAligned(segment, yaw, max_axis_angle)) {
+            kept.push_back(segment);
           }
         }
         return SegmentsTo(kept);
@@ -297,17 +460,18 @@ void BindSemantics(py::module_& m) {
       "refine_markings",
       [](const py::list& segments, const py::list& images,
          const LineFitConfig& config) {
-        std::vector<MarkingSegment> segs = SegmentsFrom(segments);
+        std::vector<MarkingSegment> marking_segments = SegmentsFrom(segments);
         std::vector<FloorImage> floors;
         for (const py::handle& item : images) floors.push_back(ImageFrom(item));
         std::vector<const FloorImage*> order;
-        for (const FloorImage& f : floors) order.push_back(&f);
+        for (const FloorImage& floor_image : floors)
+          order.push_back(&floor_image);
         int refined = 0;
         {
           py::gil_scoped_release release;
-          refined = RefineSegments(segs, order, config);
+          refined = RefineSegments(marking_segments, order, config);
         }
-        return py::make_tuple(SegmentsTo(segs), refined);
+        return py::make_tuple(SegmentsTo(marking_segments), refined);
       },
       "segments"_a, "images"_a, "config"_a = LineFitConfig(),
       "Re-measures the segments on the first image that works: (segments, "
@@ -333,17 +497,17 @@ void BindSemantics(py::module_& m) {
       "classify_markings",
       [](const py::list& segments, const py::dict& paths,
          const MarkingConfig& config) {
-        std::vector<MarkingSegment> segs = SegmentsFrom(segments);
+        std::vector<MarkingSegment> marking_segments = SegmentsFrom(segments);
         std::map<int, std::vector<Vec2>> by_level;
         for (const auto& [key, value] : paths) {
           std::vector<Vec2>& path = by_level[key.cast<int>()];
-          for (const Vec3& p : PointsFrom(
+          for (const Vec3& point : PointsFrom(
                    py::reinterpret_borrow<py::object>(value))) {
-            path.push_back(p.head<2>());
+            path.push_back(point.head<2>());
           }
         }
-        ClassifyMarkings(segs, by_level, config);
-        return SegmentsTo(segs);
+        ClassifyMarkings(marking_segments, by_level, config);
+        return SegmentsTo(marking_segments);
       },
       "segments"_a, "paths"_a, "config"_a = MarkingConfig(),
       "Lane markings (long, along the driven path of their level) and "
@@ -381,48 +545,54 @@ void BindSemantics(py::module_& m) {
          const py::object& dynamic, const std::vector<double>& level_z,
          const std::vector<double>& ceiling, const py::object& path_xy,
          const StructureConfig& config, const py::object& log) {
-        StructureInput in;
-        in.xyz = ToPoints(xyz);
-        in.normals = ToPoints(normals);
-        const size_t n = in.xyz.size();
-        in.height = ToFloatVector(height);
+        StructureInput input;
+        input.xyz = ToPoints(xyz);
+        input.normals = ToPoints(normals);
+        const size_t count = input.xyz.size();
+        input.height = ToFloatVector(height);
         const std::vector<int> levels = ToIntVector(level);
-        in.level.assign(levels.begin(), levels.end());
-        for (const int v : ToIntVector(on_ramp)) in.on_ramp.push_back(v != 0);
+        input.level.assign(levels.begin(), levels.end());
+        for (const int flag : ToIntVector(on_ramp))
+          input.on_ramp.push_back(flag != 0);
         if (!dynamic.is_none()) {
-          for (const int v : ToIntVector(dynamic)) in.dynamic.push_back(v != 0);
+          for (const int flag : ToIntVector(dynamic))
+            input.dynamic.push_back(flag != 0);
         }
-        Require(in.normals.size() == n && in.height.size() == n &&
-                    in.level.size() == n && in.on_ramp.size() == n &&
-                    (in.dynamic.empty() || in.dynamic.size() == n),
+        Require(input.normals.size() == count && input.height.size() == count &&
+                    input.level.size() == count &&
+                    input.on_ramp.size() == count &&
+                    (input.dynamic.empty() || input.dynamic.size() == count),
                 "per-point arrays must match xyz");
         Require(level_z.size() == ceiling.size(),
                 "level_z and ceiling must match");
         Require(config.raster_res > 0.0, "raster_res must be positive");
-        for (const Vec3& p : PointsFrom(path_xy)) {
-          in.path_xy.push_back(p.head<2>());
+        for (const Vec3& point : PointsFrom(path_xy)) {
+          input.path_xy.push_back(point.head<2>());
         }
-        in.level_z = level_z;
-        in.ceiling = ceiling;
+        input.level_z = level_z;
+        input.ceiling = ceiling;
         std::exception_ptr log_error;
         const Logger logger = MakeLogger(log, &log_error);
         StructureResult result;
         {
           py::gil_scoped_release release;
-          result = ExtractStructure(in, config, logger);
+          result = ExtractStructure(input, config, logger);
         }
         RethrowIfSet(log_error);
         py::list columns;
-        for (const StructureColumn& c : result.columns) {
-          columns.append(py::dict(
-              "id"_a = c.id, "level"_a = c.level, "center"_a = c.center,
-              "size"_a = c.size, "yaw"_a = c.yaw, "z0"_a = c.z0, "z1"_a = c.z1,
-              "completed"_a = c.completed, "axis_label"_a = c.axis_label));
+        for (const StructureColumn& column : result.columns) {
+          columns.append(py::dict("id"_a = column.id, "level"_a = column.level,
+                                  "center"_a = column.center,
+                                  "size"_a = column.size, "yaw"_a = column.yaw,
+                                  "z0"_a = column.z0, "z1"_a = column.z1,
+                                  "completed"_a = column.completed,
+                                  "axis_label"_a = column.axis_label));
         }
         py::list walls;
-        for (const StructureWall& w : result.walls) {
-          walls.append(py::dict("level"_a = w.level, "p0"_a = w.p0,
-                                "p1"_a = w.p1, "thickness"_a = w.thickness));
+        for (const StructureWall& wall : result.walls) {
+          walls.append(py::dict("level"_a = wall.level, "p0"_a = wall.p0,
+                                "p1"_a = wall.p1,
+                                "thickness"_a = wall.thickness));
         }
         return py::dict("labels"_a = ToArray(result.labels),
                         "columns"_a = columns, "walls"_a = walls,
@@ -449,29 +619,31 @@ void BindSemantics(py::module_& m) {
                                const py::object& rgb,
                                const py::object& texture_nobs,
                                const py::object& height_max) {
-    PaintRasters r;
-    const auto take = [&](const py::object& a, auto* out, int channels) {
-      if (a.is_none()) return;
+    PaintRasters rasters;
+    const auto take = [&](const py::object& raster, auto* out, int channels) {
+      if (raster.is_none()) return;
       using T = typename std::remove_pointer_t<decltype(out)>::value_type;
       const auto array =
-          py::array_t<T, py::array::c_style | py::array::forcecast>::ensure(a);
+          py::array_t<T, py::array::c_style | py::array::forcecast>::ensure(
+              raster);
       Require(array && array.ndim() >= 2, "rasters are (H, W) arrays");
-      const int h = static_cast<int>(array.shape(0));
-      const int w = static_cast<int>(array.shape(1));
-      Require(array.size() == static_cast<py::ssize_t>(h) * w * channels,
-              "raster shape");
-      Require((r.width == 0 && r.height == 0) ||
-                  (r.width == w && r.height == h),
+      const int height = static_cast<int>(array.shape(0));
+      const int width = static_cast<int>(array.shape(1));
+      Require(
+          array.size() == static_cast<py::ssize_t>(height) * width * channels,
+          "raster shape");
+      Require((rasters.width == 0 && rasters.height == 0) ||
+                  (rasters.width == width && rasters.height == height),
               "rasters of different sizes");
-      r.width = w;
-      r.height = h;
+      rasters.width = width;
+      rasters.height = height;
       out->assign(array.data(), array.data() + array.size());
     };
-    take(intensity, &r.intensity, 1);
-    take(rgb, &r.rgb, 3);
-    take(texture_nobs, &r.texture_nobs, 1);
-    take(height_max, &r.height_max, 1);
-    return r;
+    take(intensity, &rasters.intensity, kSingleChannel);
+    take(rgb, &rasters.rgb, kRgbChannels);
+    take(texture_nobs, &rasters.texture_nobs, kSingleChannel);
+    take(height_max, &rasters.height_max, kSingleChannel);
+    return rasters;
   };
 
   m.def(
@@ -479,18 +651,19 @@ void BindSemantics(py::module_& m) {
       [rasters_from](const py::object& intensity, const py::object& rgb,
                      const py::object& texture_nobs,
                      const py::object& height_max) {
-        const PaintRasters r =
+        const PaintRasters rasters =
             rasters_from(intensity, rgb, texture_nobs, height_max);
         std::vector<PaintLayer> layers;
         {
           py::gil_scoped_release release;
-          layers = MarkingLayers(r);
+          layers = MarkingLayers(rasters);
         }
         py::list out;
         for (const PaintLayer& layer : layers) {
           out.append(py::make_tuple(
-              layer.name, ToImage(layer.brightness, r.height, r.width),
-              ToImage(layer.valid, r.height, r.width)));
+              layer.name,
+              ToImage(layer.brightness, rasters.height, rasters.width),
+              ToImage(layer.valid, rasters.height, rasters.width)));
         }
         return out;
       },
@@ -503,18 +676,19 @@ void BindSemantics(py::module_& m) {
       [rasters_from](const py::object& intensity, const py::object& rgb,
                      const py::object& texture_nobs,
                      const py::object& height_max) {
-        const PaintRasters r =
+        const PaintRasters rasters =
             rasters_from(intensity, rgb, texture_nobs, height_max);
         std::vector<PaintLayer> images;
         {
           py::gil_scoped_release release;
-          images = FloorImages(r);
+          images = FloorImages(rasters);
         }
         py::list out;
         for (const PaintLayer& image : images) {
           out.append(py::make_tuple(
-              image.name, ToImage(image.brightness, r.height, r.width),
-              ToImage(image.valid, r.height, r.width)));
+              image.name,
+              ToImage(image.brightness, rasters.height, rasters.width),
+              ToImage(image.valid, rasters.height, rasters.width)));
         }
         return out;
       },
@@ -528,14 +702,15 @@ void BindSemantics(py::module_& m) {
                      const py::object& texture_nobs,
                      const py::object& height_max, double res,
                      const PaintConfig& config) {
-        const PaintRasters r =
+        const PaintRasters rasters =
             rasters_from(intensity, rgb, texture_nobs, height_max);
         Mask mask;
         {
           py::gil_scoped_release release;
-          mask = PaintMask(MarkingLayers(r), r.width, r.height, res, config);
+          mask = PaintMask(MarkingLayers(rasters), rasters.width,
+                           rasters.height, res, config);
         }
-        return ToImage(mask, r.height, r.width);
+        return ToImage(mask, rasters.height, rasters.width);
       },
       "intensity"_a, "rgb"_a, "texture_nobs"_a, "height_max"_a, "res"_a,
       "config"_a = PaintConfig(),
@@ -547,15 +722,15 @@ void BindSemantics(py::module_& m) {
                                         py::array::forcecast>& mask,
          double res, double yaw, const PaintConfig& config) {
         Require(mask.ndim() == 2, "mask is (H, W)");
-        const int h = static_cast<int>(mask.shape(0));
-        const int w = static_cast<int>(mask.shape(1));
-        Mask m(mask.data(), mask.data() + mask.size());
+        const int height = static_cast<int>(mask.shape(0));
+        const int width = static_cast<int>(mask.shape(1));
+        Mask cells(mask.data(), mask.data() + mask.size());
         Mask out;
         {
           py::gil_scoped_release release;
-          out = Elongated(m, w, h, res, yaw, config);
+          out = Elongated(cells, width, height, res, yaw, config);
         }
-        return ToImage(out, h, w);
+        return ToImage(out, height, width);
       },
       "mask"_a, "res"_a, "yaw"_a, "config"_a = PaintConfig(),
       "Paint along the grid axes (C++ Elongated): (H, W) uint8.");
@@ -568,18 +743,18 @@ void BindSemantics(py::module_& m) {
         Require(mask.ndim() == 2, "mask is (H, W)");
         Require(shape == "ellipse" || shape == "cross",
                 "shape is ellipse or cross");
-        const int h = static_cast<int>(mask.shape(0));
-        const int w = static_cast<int>(mask.shape(1));
-        Mask m(mask.data(), mask.data() + mask.size());
-        for (uint8_t& v : m) v = v != 0;
+        const int height = static_cast<int>(mask.shape(0));
+        const int width = static_cast<int>(mask.shape(1));
+        Mask cells(mask.data(), mask.data() + mask.size());
+        for (uint8_t& v : cells) v = v != 0;
         Mask out;
         {
           py::gil_scoped_release release;
-          out = shape == "cross"
-                    ? CloseCross(m, w, h, iterations)
-                    : CloseKernel(m, w, h, EllipseKernel(size), size);
+          out = shape == "cross" ? CloseCross(cells, width, height, iterations)
+                                 : CloseKernel(cells, width, height,
+                                               EllipseKernel(size), size);
         }
-        return ToImage(out, h, w);
+        return ToImage(out, height, width);
       },
       "mask"_a, "shape"_a, "size"_a = 3, "iterations"_a = 1,
       "Binary closing: 'ellipse' (cv2.morphologyEx with an ellipse of "
@@ -591,12 +766,13 @@ void BindSemantics(py::module_& m) {
                                         py::array::forcecast>& mask,
          int iterations) {
         Require(mask.ndim() == 2, "mask is (H, W)");
-        const int h = static_cast<int>(mask.shape(0));
-        const int w = static_cast<int>(mask.shape(1));
-        Mask m(mask.data(), mask.data() + mask.size());
-        for (uint8_t& v : m) v = v != 0;
-        for (int k = 0; k < iterations; ++k) m = DilateCross(m, w, h);
-        return ToImage(m, h, w);
+        const int height = static_cast<int>(mask.shape(0));
+        const int width = static_cast<int>(mask.shape(1));
+        Mask cells(mask.data(), mask.data() + mask.size());
+        for (uint8_t& v : cells) v = v != 0;
+        for (int iteration = 0; iteration < iterations; ++iteration)
+          cells = DilateCross(cells, width, height);
+        return ToImage(cells, height, width);
       },
       "mask"_a, "iterations"_a = 1,
       "scipy binary_dilation with the cross structure, `iterations`.");
@@ -616,15 +792,19 @@ void BindSemantics(py::module_& m) {
          const py::array_t<uint8_t, py::array::c_style |
                                         py::array::forcecast>& observed,
          double x0, double y0, double res, const SlotPaintConfig& config) {
-        Require(rgb.ndim() == 3 && rgb.shape(2) == 3, "rgb must be (H, W, 3)");
+        Require(rgb.ndim() == 3 && rgb.shape(2) == kRgbChannels,
+                "rgb must be (H, W, 3)");
         Require(observed.ndim() == 2 && observed.shape(0) == rgb.shape(0) &&
                     observed.shape(1) == rgb.shape(1),
                 "observed must be (H, W) like rgb");
-        std::vector<std::array<Vec2, 4>> corners;
+        std::vector<std::array<Vec2, kParkingSlotCorners>> corners;
         for (const py::handle& item : slots) {
-          const std::vector<Vec2> c = CornersFrom(item);
-          Require(c.size() == 4, "a slot needs 4 corners");
-          corners.push_back({c[0], c[1], c[2], c[3]});
+          const std::vector<Vec2> slot_corners = CornersFrom(item);
+          Require(slot_corners.size() == kParkingSlotCorners,
+                  "a slot needs 4 corners");
+          std::array<Vec2, kParkingSlotCorners> slot;
+          std::copy(slot_corners.begin(), slot_corners.end(), slot.begin());
+          corners.push_back(slot);
         }
         const RasterFrame frame{x0, y0, res, static_cast<int>(rgb.shape(1)),
                                 static_cast<int>(rgb.shape(0))};
@@ -638,10 +818,11 @@ void BindSemantics(py::module_& m) {
           paint = MeasureSlotPaint(corners, colours, seen, frame, config);
         }
         py::list out;
-        for (const SlotPaint& p : paint) {
-          out.append(py::dict("cells"_a = p.cells, "observed"_a = p.observed,
-                              "in_band"_a = p.in_band,
-                              "mean_rgb"_a = p.mean_rgb));
+        for (const SlotPaint& slot_paint : paint) {
+          out.append(py::dict("cells"_a = slot_paint.cells,
+                              "observed"_a = slot_paint.observed,
+                              "in_band"_a = slot_paint.in_band,
+                              "mean_rgb"_a = slot_paint.mean_rgb));
         }
         return out;
       },

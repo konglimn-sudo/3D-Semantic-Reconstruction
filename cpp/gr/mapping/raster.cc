@@ -12,22 +12,36 @@
 namespace gr {
 namespace {
 
+// Floor cells closer to the camera than this (m) are not textured.
+constexpr double kMinRange = 1e-3;
+// The occlusion depth splats the occluders as discs of 1 to 4 pixels from
+// kOccluderMinRange (m) to kOcclusionRangeMargin beyond the texture range;
+// occluders carry no label.
+constexpr int kOccluderMinRadius = 1;
+constexpr int kOccluderMaxRadius = 4;
+constexpr double kOccluderMinRange = 0.1;
+constexpr double kOcclusionRangeMargin = 2.0;
+constexpr int kNoLabel = -1;
+
 // Bilinear RGB sample at pixel coordinates (u, v), pixel centres at +0.5.
 Vec3 SampleRgb(const ImageView& image, double u, double v) {
   u -= 0.5;
   v -= 0.5;
-  const int x0 = static_cast<int>(std::floor(u));
-  const int y0 = static_cast<int>(std::floor(v));
-  const double ax = u - x0;
-  const double ay = v - y0;
+  const int left = static_cast<int>(std::floor(u));
+  const int top = static_cast<int>(std::floor(v));
+  const double fraction_x = u - left;
+  const double fraction_y = v - top;
   Vec3 rgb = Vec3::Zero();
   for (int dy = 0; dy <= 1; ++dy) {
     for (int dx = 0; dx <= 1; ++dx) {
-      const int col = std::clamp(x0 + dx, 0, image.width - 1);
-      const int row = std::clamp(y0 + dy, 0, image.height - 1);
-      const double w = (dx ? ax : 1.0 - ax) * (dy ? ay : 1.0 - ay);
-      const uint8_t* px = image.PixelAt(row, col);
-      for (int c = 0; c < 3; ++c) rgb[c] += w * px[c];
+      const int col = std::clamp(left + dx, 0, image.width - 1);
+      const int row = std::clamp(top + dy, 0, image.height - 1);
+      const double weight = (dx ? fraction_x : 1.0 - fraction_x) *
+                            (dy ? fraction_y : 1.0 - fraction_y);
+      const uint8_t* pixel = image.PixelAt(row, col);
+      for (int channel = 0; channel < kRgbChannels; ++channel) {
+        rgb[channel] += weight * pixel[channel];
+      }
     }
   }
   return rgb;
@@ -48,44 +62,46 @@ Eigen::MatrixXd Rasterize(const RowMatX2d& xy, const Eigen::VectorXd& values,
   if (reducer == Reducer::kMin) {
     accumulated.setConstant(std::numeric_limits<double>::infinity());
   }
-  const double inv = 1.0 / grid.res;
-  for (Eigen::Index n = 0; n < xy.rows(); ++n) {
-    const int i = static_cast<int>(std::floor((xy(n, 0) - grid.x0) * inv));
-    const int j = static_cast<int>(std::floor((xy(n, 1) - grid.y0) * inv));
-    if (i < 0 || j < 0 || i >= width || j >= height) continue;
-    const double v = values[n];
+  const double inverse_res = 1.0 / grid.res;
+  for (Eigen::Index point = 0; point < xy.rows(); ++point) {
+    const int col =
+        static_cast<int>(std::floor((xy(point, 0) - grid.x0) * inverse_res));
+    const int row =
+        static_cast<int>(std::floor((xy(point, 1) - grid.y0) * inverse_res));
+    if (col < 0 || row < 0 || col >= width || row >= height) continue;
+    const double value = values[point];
     switch (reducer) {
       case Reducer::kMean:
       case Reducer::kSum:
-        accumulated(j, i) += v;
+        accumulated(row, col) += value;
         break;
       case Reducer::kMax:
-        accumulated(j, i) = std::max(accumulated(j, i), v);
+        accumulated(row, col) = std::max(accumulated(row, col), value);
         break;
       case Reducer::kMin:
-        accumulated(j, i) = std::min(accumulated(j, i), v);
+        accumulated(row, col) = std::min(accumulated(row, col), value);
         break;
       case Reducer::kCount:
         break;
     }
-    count(j, i) += 1;
+    count(row, col) += 1;
   }
-  Eigen::MatrixXd out(height, width);
-  for (int j = 0; j < height; ++j) {
-    for (int i = 0; i < width; ++i) {
-      const int c = count(j, i);
+  Eigen::MatrixXd raster(height, width);
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const int cell_count = count(row, col);
       if (reducer == Reducer::kCount) {
-        out(j, i) = c;
-      } else if (c == 0) {
-        out(j, i) = fill;
+        raster(row, col) = cell_count;
+      } else if (cell_count == 0) {
+        raster(row, col) = fill;
       } else if (reducer == Reducer::kMean) {
-        out(j, i) = accumulated(j, i) / c;
+        raster(row, col) = accumulated(row, col) / cell_count;
       } else {
-        out(j, i) = accumulated(j, i);
+        raster(row, col) = accumulated(row, col);
       }
     }
   }
-  return out;
+  return raster;
 }
 
 FloorTextureFuser::FloorTextureFuser(const Grid2D& grid,
@@ -94,8 +110,8 @@ FloorTextureFuser::FloorTextureFuser(const Grid2D& grid,
   GR_CHECK(floor_z_.rows() == grid.height && floor_z_.cols() == grid.width);
   const size_t cells =
       static_cast<size_t>(grid.width) * static_cast<size_t>(grid.height);
-  scores_.assign(cells * static_cast<size_t>(top_k_), -1.0f);
-  colors_.assign(cells * static_cast<size_t>(top_k_) * 3, 0);
+  scores_.assign(cells * static_cast<size_t>(top_k_), kEmptySlot);
+  colors_.assign(cells * static_cast<size_t>(top_k_) * kRgbChannels, 0);
   observations_.assign(cells, 0);
 }
 
@@ -104,40 +120,40 @@ void FloorTextureFuser::AddFrame(const CameraModel& camera,
                                  const ImageView& image, const float* depth,
                                  double depth_tol, double max_range,
                                  double min_cos) {
-  GR_CHECK(image.channels == 3);
+  GR_CHECK(image.channels == kRgbChannels);
   if (image.empty()) return;
   const Vec3& center = exposure.center();
-  const double inv = 1.0 / grid_.res;
-  const int i0 = std::max(
-      0,
-      static_cast<int>(std::floor((center.x() - max_range - grid_.x0) * inv)));
-  const int i1 = std::min(
-      grid_.width - 1,
-      static_cast<int>(std::floor((center.x() + max_range - grid_.x0) * inv)));
-  const int j0 = std::max(
-      0,
-      static_cast<int>(std::floor((center.y() - max_range - grid_.y0) * inv)));
-  const int j1 = std::min(
-      grid_.height - 1,
-      static_cast<int>(std::floor((center.y() + max_range - grid_.y0) * inv)));
-  if (i0 > i1 || j0 > j1) return;
+  const double inverse_res = 1.0 / grid_.res;
+  const auto cell_of = [inverse_res](double coordinate, double origin) {
+    return static_cast<int>(std::floor((coordinate - origin) * inverse_res));
+  };
+  const int first_col =
+      std::max(0, cell_of(center.x() - max_range, grid_.x0));
+  const int last_col =
+      std::min(grid_.width - 1, cell_of(center.x() + max_range, grid_.x0));
+  const int first_row =
+      std::max(0, cell_of(center.y() - max_range, grid_.y0));
+  const int last_row =
+      std::min(grid_.height - 1, cell_of(center.y() + max_range, grid_.y0));
+  if (first_col > last_col || first_row > last_row) return;
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 4)
+  constexpr int kRowsPerChunk = 4;
+#pragma omp parallel for schedule(dynamic, kRowsPerChunk)
 #endif
-  for (int j = j0; j <= j1; ++j) {
-    for (int i = i0; i <= i1; ++i) {
-      const double z = floor_z_(j, i);
+  for (int row = first_row; row <= last_row; ++row) {
+    for (int col = first_col; col <= last_col; ++col) {
+      const double z = floor_z_(row, col);
       if (!std::isfinite(z)) continue;
-      const Vec3 floor_point(grid_.x0 + (i + 0.5) * grid_.res,
-                             grid_.y0 + (j + 0.5) * grid_.res, z);
+      const Vec3 floor_point(grid_.x0 + (col + 0.5) * grid_.res,
+                             grid_.y0 + (row + 0.5) * grid_.res, z);
       const double center_range = (floor_point - center).norm();
-      if (center_range > max_range || center_range < 1e-3) continue;
+      if (center_range > max_range || center_range < kMinRange) continue;
       const std::optional<CameraExposure::Projection> projection =
           exposure.Project(camera, floor_point);
       if (!projection) continue;
       const double range = projection->point_camera.norm();
-      if (range > max_range || range < 1e-3) continue;
+      if (range > max_range || range < kMinRange) continue;
       const double cos_incidence = (center.z() - z) / range;
       if (cos_incidence < min_cos) continue;
       const Vec2& uv = projection->uv;
@@ -146,30 +162,36 @@ void FloorTextureFuser::AddFrame(const CameraModel& camera,
         const size_t pixel = static_cast<size_t>(static_cast<int>(uv.y())) *
                                  static_cast<size_t>(image.width) +
                              static_cast<size_t>(static_cast<int>(uv.x()));
-        const float d = depth[pixel];
-        if (std::isfinite(d) && range > d + depth_tol) continue;  // Occluded.
+        const float occluder_depth = depth[pixel];
+        if (std::isfinite(occluder_depth) &&
+            range > occluder_depth + depth_tol) {
+          continue;  // Occluded.
+        }
       }
       const Vec3 rgb = SampleRgb(image, uv.x(), uv.y());
       const float score = static_cast<float>(cos_incidence / range);
       const size_t cell =
-          static_cast<size_t>(j) * static_cast<size_t>(grid_.width) +
-          static_cast<size_t>(i);
+          static_cast<size_t>(row) * static_cast<size_t>(grid_.width) +
+          static_cast<size_t>(col);
       float* cell_scores = &scores_[cell * static_cast<size_t>(top_k_)];
       int worst = 0;
-      for (int k = 1; k < top_k_; ++k) {
-        if (cell_scores[k] < cell_scores[worst]) worst = k;
+      for (int slot = 1; slot < top_k_; ++slot) {
+        if (cell_scores[slot] < cell_scores[worst]) worst = slot;
       }
       if (score > cell_scores[worst]) {
         cell_scores[worst] = score;
         uint8_t* color = &colors_[(cell * static_cast<size_t>(top_k_) +
                                    static_cast<size_t>(worst)) *
-                                  3];
-        for (int c = 0; c < 3; ++c) {
-          color[c] = static_cast<uint8_t>(
-              std::clamp<int64_t>(std::llround(rgb[c]), 0, 255));
+                                  kRgbChannels];
+        for (int channel = 0; channel < kRgbChannels; ++channel) {
+          color[channel] = static_cast<uint8_t>(std::clamp<int64_t>(
+              std::llround(rgb[channel]), 0,
+              std::numeric_limits<uint8_t>::max()));
         }
       }
-      if (observations_[cell] < 65535) ++observations_[cell];
+      if (observations_[cell] < std::numeric_limits<uint16_t>::max()) {
+        ++observations_[cell];
+      }
     }
   }
 }
@@ -190,9 +212,13 @@ std::vector<float> FloorTextureFuser::OcclusionDepth(
     const CameraModel& camera, const CameraExposure& exposure,
     const PointCloudIndex& occluders, double point_spacing,
     double max_range) {
-  ZBuffer buffer(camera, exposure, point_spacing, 1, 4, 0.1, max_range + 2.0);
-  for (int i : occluders.RadiusSearch(exposure.center(), max_range + 2.0)) {
-    buffer.Splat(occluders.points()[static_cast<size_t>(i)], -1, i);
+  const double occlusion_range = max_range + kOcclusionRangeMargin;
+  ZBuffer buffer(camera, exposure, point_spacing, kOccluderMinRadius,
+                 kOccluderMaxRadius, kOccluderMinRange, occlusion_range);
+  for (int index :
+       occluders.RadiusSearch(exposure.center(), occlusion_range)) {
+    buffer.Splat(occluders.points()[static_cast<size_t>(index)], kNoLabel,
+                 index);
   }
   return buffer.result().depth;
 }
@@ -200,30 +226,32 @@ std::vector<float> FloorTextureFuser::OcclusionDepth(
 FloorTextureFuser::Texture FloorTextureFuser::ComputeTexture() const {
   const size_t cells =
       static_cast<size_t>(grid_.width) * static_cast<size_t>(grid_.height);
-  const size_t k = static_cast<size_t>(top_k_);
+  const size_t top_k = static_cast<size_t>(top_k_);
+  const size_t channels = static_cast<size_t>(kRgbChannels);
   Texture texture;
-  texture.rgb.assign(cells * 3, 0);
+  texture.rgb.assign(cells * channels, 0);
   texture.score.assign(cells, 0.0f);
   texture.observations = observations_;
-  std::vector<uint8_t> channel;
+  std::vector<uint8_t> values;
   for (size_t cell = 0; cell < cells; ++cell) {
-    const float* cell_scores = &scores_[cell * k];
-    for (int c = 0; c < 3; ++c) {
-      channel.clear();
-      for (size_t a = 0; a < k; ++a) {
-        if (cell_scores[a] >= 0.0f) {
-          channel.push_back(
-              colors_[(cell * k + a) * 3 + static_cast<size_t>(c)]);
+    const float* cell_scores = &scores_[cell * top_k];
+    for (size_t channel = 0; channel < channels; ++channel) {
+      values.clear();
+      for (size_t slot = 0; slot < top_k; ++slot) {
+        if (cell_scores[slot] >= 0.0f) {
+          values.push_back(colors_[(cell * top_k + slot) * channels + channel]);
         }
       }
-      if (channel.empty()) continue;
-      const auto middle =
-          channel.begin() + static_cast<std::ptrdiff_t>(channel.size() / 2);
-      std::nth_element(channel.begin(), middle, channel.end());
-      texture.rgb[cell * 3 + static_cast<size_t>(c)] = *middle;
+      if (values.empty()) continue;
+      const auto median =
+          values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+      std::nth_element(values.begin(), median, values.end());
+      texture.rgb[cell * channels + channel] = *median;
     }
     float best = 0.0f;
-    for (size_t a = 0; a < k; ++a) best = std::max(best, cell_scores[a]);
+    for (size_t slot = 0; slot < top_k; ++slot) {
+      best = std::max(best, cell_scores[slot]);
+    }
     texture.score[cell] = best;
   }
   return texture;

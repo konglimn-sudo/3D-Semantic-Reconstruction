@@ -12,8 +12,11 @@
 namespace gr {
 
 struct RaycastHits {
+  // Box id of rays that hit nothing.
+  static constexpr int kMiss = -1;
+
   Eigen::VectorXd distance;  // +inf for misses
-  Eigen::VectorXi box_ids;   // -1 for misses
+  Eigen::VectorXi box_ids;   // kMiss for misses
   RowMatX3d normals;         // World-frame face normals.
 };
 

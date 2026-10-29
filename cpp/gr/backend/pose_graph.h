@@ -31,6 +31,7 @@
 
 namespace gr {
 
+// Factors refer to nodes by index (`i`, `j`).
 struct BetweenFactor {
   int i = 0;
   int j = 0;
@@ -97,8 +98,8 @@ struct PlaneFactor {
 
 struct PoseGraphOptions {
   int max_iterations = 50;
-  double lambda_init = 1e-4;
-  double rel_tol = 1e-10;
+  double lambda_init = 1e-4;  // Initial Levenberg-Marquardt damping.
+  double rel_tol = 1e-10;     // Stop below this relative cost decrease.
   // With plane factors, up to this many free nodes the pose block is solved
   // as a dense matrix after eliminating the inertial states; beyond it the
   // whole system goes to the sparse solver.
@@ -122,27 +123,27 @@ class PoseGraph {
 
   // Returns the node index.
   int AddNode(const Pose& initial, bool fixed = false);
-  void SetFixed(int i, bool fixed);
-  void SetPose(int i, const Pose& pose);
-  // Gives node i a body velocity (world frame) and an IMU bias [gyro, accel]
-  // to estimate; the inertial state is free even if the pose is fixed.
-  void AddInertialState(int i, const Vec3& velocity, const Vec6& bias);
+  void SetFixed(int node, bool fixed);
+  void SetPose(int node, const Pose& pose);
+  // Gives the node a body velocity (world frame) and an IMU bias [gyro,
+  // accel] to estimate; the inertial state is free even if the pose is fixed.
+  void AddInertialState(int node, const Vec3& velocity, const Vec6& bias);
 
   // Node indices must refer to existing nodes.
   void AddBetween(int i, int j, const Pose& measurement,
                   const Mat6& information, double robust_scale = 0.0);
-  void AddPrior(int i, const Pose& measurement, const Mat6& information);
-  void AddPosition(int i, const Vec3& measurement, const Mat3& information,
+  void AddPrior(int node, const Pose& measurement, const Mat6& information);
+  void AddPosition(int node, const Vec3& measurement, const Mat3& information,
                    const Vec3& lever = Vec3::Zero());
-  void AddGravity(int i, const Vec3& up_body, double sigma_rad);
+  void AddGravity(int node, const Vec3& up_body, double sigma_rad);
   // Factors on inertial states; the nodes must have one.
   void AddImu(int i, int j, const ImuPreintegration& preintegration,
               const Pose& node_from_body);
-  void AddBodyVelocity(int i, const Vec3& velocity_body, const Vec3& sigma,
+  void AddBodyVelocity(int node, const Vec3& velocity_body, const Vec3& sigma,
                        const Pose& node_from_body);
   // Random walk between the biases of i and j, standard deviation `sigma`.
   void AddBiasBetween(int i, int j, const Vec6& sigma);
-  void AddBiasPrior(int i, const Vec6& bias, const Vec6& sigma);
+  void AddBiasPrior(int node, const Vec6& bias, const Vec6& sigma);
   // `observations` must refer to distinct existing nodes and carry a positive
   // weight; `sigma` (m) is the point-to-plane noise of a unit-weight point.
   void AddPlane(std::vector<PlaneObservation> observations, double sigma,
@@ -152,10 +153,10 @@ class PoseGraph {
 
   size_t num_nodes() const { return poses_.size(); }
   const std::vector<Pose>& poses() const { return poses_; }
-  bool HasInertialState(int i) const;
+  bool HasInertialState(int node) const;
   // The node must have an inertial state.
-  const Vec3& Velocity(int i) const;
-  const Vec6& Bias(int i) const;
+  const Vec3& Velocity(int node) const;
+  const Vec6& Bias(int node) const;
   // chi2 = e^T info e of every between / IMU factor at the current estimate.
   std::vector<double> BetweenChi2() const;
   std::vector<double> ImuChi2() const;
@@ -170,6 +171,9 @@ class PoseGraph {
                               Mat6* jacobian_j = nullptr);
 
  private:
+  // inertial_index_ of a node without inertial state.
+  static constexpr int kNoInertialState = -1;
+
   struct State {
     std::vector<Pose> poses;
     std::vector<Vec3> velocities;  // Per inertial state.
@@ -186,11 +190,11 @@ class PoseGraph {
   };
   struct LinearSystem;  // Gauss-Newton normal equations, defined in the .cc.
 
-  bool HasNode(int i) const {
-    return i >= 0 && i < static_cast<int>(poses_.size());
+  bool HasNode(int node) const {
+    return node >= 0 && node < static_cast<int>(poses_.size());
   }
-  int InertialIndex(int i) const {
-    return inertial_index_[static_cast<size_t>(i)];
+  int InertialIndex(int node) const {
+    return inertial_index_[static_cast<size_t>(node)];
   }
   State CurrentState() const;
   double TotalCost(const State& state) const;
@@ -200,20 +204,21 @@ class PoseGraph {
   LinearSystem Linearize(const State& state, const Layout& layout) const;
   // Adds the plane factors to `system` (dense pose block) or `triplets`.
   void LinearizePlanes(const State& state, const Layout& layout,
-                       LinearSystem& system,
-                       std::vector<Eigen::Triplet<double>>& triplets) const;
-  // Solves the damped normal equations; false if they are not positive
-  // definite.
+                       LinearSystem* system,
+                       std::vector<Eigen::Triplet<double>>* triplets) const;
+  // Solves the damped normal equations for `step`; false if they are not
+  // positive definite.
   bool Solve(const LinearSystem& system, const Layout& layout, double lambda,
-             Eigen::VectorXd& dx) const;
+             Eigen::VectorXd* step) const;
   // Levenberg-Marquardt steps with growing damping until the cost decreases
-  // below `cost`; updates `lambda`. Returns false if no step decreases it.
+  // below `cost`; updates `lambda`, and `state` and `cost` on success.
+  // Returns false if no step decreases it.
   bool DampedStep(const LinearSystem& system, const Layout& layout,
-                  double& lambda, State& state, double& cost) const;
+                  double* lambda, State* state, double* cost) const;
 
   std::vector<Pose> poses_;
   std::vector<bool> fixed_;
-  std::vector<int> inertial_index_;  // Per node, -1 without inertial state.
+  std::vector<int> inertial_index_;  // Per node, or kNoInertialState.
   std::vector<Vec3> velocities_;
   std::vector<Vec6> biases_;
   std::vector<BetweenFactor> between_;

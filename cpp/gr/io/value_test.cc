@@ -1,6 +1,7 @@
 #include "gr/io/value.h"
 
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -42,18 +43,19 @@ empty:
 )";
 
 GR_TEST(ValueTest, ParsesTheYamlTheProjectWrites) {
-  const Value v = ParseYaml(kYaml);
-  const Value& lidar = v["lidars"]["lidar_top"];
+  constexpr double kTolerance = 1e-20;
+  const Value document = ParseYaml(kYaml);
+  const Value& lidar = document["lidars"]["lidar_top"];
   GR_ASSERT_TRUE(lidar["T_vehicle_lidar"].size() == 2);
   GR_EXPECT_NEAR(lidar["T_vehicle_lidar"][1][0].AsDouble(), 0.5, 0.0);
   GR_EXPECT_TRUE(lidar["T_vehicle_lidar"][1][1].is_integer());
   GR_EXPECT_NEAR(lidar["sweep_duration"].AsDouble(), 0.1, 0.0);
-  const Value& odometry = v["odometry"];
+  const Value& odometry = document["odometry"];
   GR_EXPECT_FALSE(odometry["use_lio"].AsBool());
   GR_EXPECT_TRUE(odometry["external_trajectory"].is_null());
   GR_EXPECT_TRUE(odometry.Find("external_trajectory") != nullptr);
   GR_EXPECT_EQ(odometry["gates"].AsDoubles().size(), size_t{2});
-  GR_EXPECT_NEAR(odometry["lr"]["means"].AsDouble(), 1.6e-5, 1e-20);
+  GR_EXPECT_NEAR(odometry["lr"]["means"].AsDouble(), 1.6e-5, kTolerance);
   GR_EXPECT_EQ(odometry["word"].AsString(), std::string("auto"));
   GR_EXPECT_EQ(odometry["quoted"].AsString(),
                std::string("a: b # not a comment"));
@@ -63,24 +65,26 @@ GR_TEST(ValueTest, ParsesTheYamlTheProjectWrites) {
   GR_EXPECT_TRUE(odometry["exponent"].is_string());
   GR_EXPECT_TRUE(odometry["flag"].AsBool());
   GR_EXPECT_TRUE(std::isinf(odometry["infinite"].AsDouble()));
-  GR_EXPECT_EQ(v["items"].size(), size_t{2});
-  GR_EXPECT_EQ(v["items"][0]["value"].AsInt(), 1);
-  GR_EXPECT_EQ(v["items"][1]["name"].AsString(), std::string("b"));
-  GR_EXPECT_TRUE(v["empty"].is_null());
-  GR_EXPECT_TRUE(v["missing"].is_null());
+  GR_EXPECT_EQ(document["items"].size(), size_t{2});
+  GR_EXPECT_EQ(document["items"][0]["value"].AsInt(), 1);
+  GR_EXPECT_EQ(document["items"][1]["name"].AsString(), std::string("b"));
+  GR_EXPECT_TRUE(document["empty"].is_null());
+  GR_EXPECT_TRUE(document["missing"].is_null());
 }
 
 GR_TEST(ValueTest, RejectsWhatItDoesNotSupport) {
+  // A block scalar, an anchor, a bad indentation and an open flow list.
+  const char* const kUnsupported[] = {"a: |\n  text\n", "a: &x 1\n",
+                                      "a: 1\n   b: 2\n", "a: [1, 2\n"};
   int errors = 0;
-  for (const char* text : {"a: |\n  text\n", "a: &x 1\n", "a: 1\n   b: 2\n",
-                           "a: [1, 2\n"}) {
+  for (const char* text : kUnsupported) {
     try {
       ParseYaml(text);
     } catch (const std::runtime_error&) {
       ++errors;
     }
   }
-  GR_EXPECT_EQ(errors, 4);
+  GR_EXPECT_EQ(errors, static_cast<int>(std::size(kUnsupported)));
 }
 
 GR_TEST(ValueTest, JsonRoundTripsAsPythonWritesIt) {
@@ -88,15 +92,16 @@ GR_TEST(ValueTest, JsonRoundTripsAsPythonWritesIt) {
       "{\n \"trip\": \"出口\",\n \"n\": 3,\n \"x\": [\n  0.0129,\n  1e-05,\n"
       "  -180.0,\n  1e+16\n ],\n \"none\": null,\n \"ok\": true,\n"
       " \"empty\": {}\n}";
-  const Value v = ParseJson(text);
-  GR_EXPECT_EQ(v["trip"].AsString(), std::string("出口"));
-  GR_EXPECT_TRUE(v["n"].is_integer());
-  GR_EXPECT_EQ(ToJson(v, 1), text);
+  const Value document = ParseJson(text);
+  GR_EXPECT_EQ(document["trip"].AsString(), std::string("出口"));
+  GR_EXPECT_TRUE(document["n"].is_integer());
+  GR_EXPECT_EQ(ToJson(document, kDefaultJsonIndent), text);
   GR_EXPECT_EQ(ParseJson("\"\\u51fa\\ud83d\\ude00\"").AsString(),
                std::string("出\xF0\x9F\x98\x80"));
-  GR_EXPECT_EQ(ToJson(Value::Number(0.1 + 0.2), -1),
+  GR_EXPECT_EQ(ToJson(Value::Number(0.1 + 0.2), kJsonOneLine),
                std::string("0.30000000000000004"));
-  GR_EXPECT_EQ(ToJson(Value::Number(1234.5), -1), std::string("1234.5"));
+  GR_EXPECT_EQ(ToJson(Value::Number(1234.5), kJsonOneLine),
+               std::string("1234.5"));
 }
 
 GR_TEST(ValueTest, DeepMergeOverridesMemberByMember) {
@@ -121,10 +126,8 @@ GR_TEST(ConfigTest, ImuGradeFillsWhatTheUserDoesNotSet) {
   const Value user =
       ParseYaml("imu_grade: tactical\nbackend: {gyro_bias_prior: 0.004}\n");
   const Value resolved = ApplyImuGrade(DeepMerge(defaults, user), user);
-  GR_EXPECT_NEAR(resolved["backend"]["gyro_bias_prior"].AsDouble(), 0.004,
-                 0.0);
-  GR_EXPECT_NEAR(resolved["backend"]["accel_bias_prior"].AsDouble(), 0.03,
-                 0.0);
+  GR_EXPECT_NEAR(resolved["backend"]["gyro_bias_prior"].AsDouble(), 0.004, 0.0);
+  GR_EXPECT_NEAR(resolved["backend"]["accel_bias_prior"].AsDouble(), 0.03, 0.0);
   GR_EXPECT_NEAR(
       resolved["odometry"]["lio"]["init_accel_bias_sigma"].AsDouble(), 0.03,
       0.0);
@@ -132,9 +135,10 @@ GR_TEST(ConfigTest, ImuGradeFillsWhatTheUserDoesNotSet) {
   // A resolved configuration loaded again keeps its values.
   Value edited = resolved;
   edited.Find("backend")->Set("accel_bias_prior", Value::Number(0.5));
-  GR_EXPECT_NEAR(ApplyImuGrade(edited, Value::Map())["backend"]
-                     ["accel_bias_prior"].AsDouble(),
-                 0.5, 0.0);
+  GR_EXPECT_NEAR(
+      ApplyImuGrade(edited, Value::Map())["backend"]["accel_bias_prior"]
+          .AsDouble(),
+      0.5, 0.0);
   const LioConfig lio = OdometryConfigFrom(resolved).lio;
   GR_EXPECT_NEAR(lio.init_accel_bias_sigma, 0.03, 0.0);
 }

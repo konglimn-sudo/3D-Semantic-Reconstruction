@@ -17,25 +17,34 @@ namespace gr {
 
 class VoxelHashMap {
  public:
-  explicit VoxelHashMap(double voxel_size, double max_distance = 1e9,
-                        int max_points_per_voxel = 20);
+  // A `max_distance` that keeps every voxel (m).
+  static constexpr double kUnbounded = 1e9;
+  static constexpr int kDefaultMaxPointsPerVoxel = 20;
+  // A frame id that belongs to no frame: AddPoints without a frame, and
+  // queries that exclude none.
+  static constexpr int kNoFrame = -1;
+  // Nearest searches this many voxels around the query by default.
+  static constexpr int kDefaultSearchVoxels = 2;
+
+  explicit VoxelHashMap(double voxel_size, double max_distance = kUnbounded,
+                        int max_points_per_voxel = kDefaultMaxPointsPerVoxel);
   VoxelHashMap(const VoxelHashMap&) = default;
   VoxelHashMap& operator=(const VoxelHashMap&) = default;
   VoxelHashMap(VoxelHashMap&&) = default;
   VoxelHashMap& operator=(VoxelHashMap&&) = default;
 
   struct Neighbor {
-    Vec3 point;
-    double distance_squared;
+    Vec3 point = Vec3::Zero();
+    double distance_squared = 0.0;
   };
 
   // Principal components of a neighbourhood.
   struct LocalPlane {
-    Vec3 centroid;
-    Vec3 normal;       // Unit.
-    double planarity;  // (l2 - l3) / l1, eigenvalues l1 >= l2 >= l3.
-    double linearity;  // (l1 - l2) / l1
-    double thickness;  // sqrt(l3)
+    Vec3 centroid = Vec3::Zero();
+    Vec3 normal = Vec3::UnitZ();  // Unit.
+    double planarity = 0.0;       // (l2 - l3) / l1, eigenvalues l1 >= l2 >= l3.
+    double linearity = 0.0;       // (l1 - l2) / l1
+    double thickness = 0.0;       // sqrt(l3)
   };
 
   void Clear() { map_.clear(); }
@@ -46,7 +55,7 @@ class VoxelHashMap {
 
   // Adds world-frame points; `frame_id` lets scan-to-map alignment ignore a
   // frame's own points.
-  void AddPoints(const Points& points, int frame_id = -1);
+  void AddPoints(const Points& points, int frame_id = kNoFrame);
   // Drops voxels farther than `max_distance` from `origin`.
   void RemoveFar(const Vec3& origin);
   Points PointCloud() const;
@@ -54,15 +63,15 @@ class VoxelHashMap {
   // Nearest map point within `max_distance` of `query`, searching at most
   // `max_search_voxels` voxels around it in each direction (KISS-ICP searches
   // only the 27-neighbourhood); a huge gate is clipped.
-  std::optional<Neighbor> Nearest(const Vec3& query, double max_distance,
-                                  int exclude_frame = -1,
-                                  int max_search_voxels = 2) const;
+  std::optional<Neighbor> Nearest(
+      const Vec3& query, double max_distance, int exclude_frame = kNoFrame,
+      int max_search_voxels = kDefaultSearchVoxels) const;
 
   // PCA of the map points within `radius` of `query`; nullopt with fewer than
   // `min_points` neighbours.
   std::optional<LocalPlane> FitLocalPlane(const Vec3& query, double radius,
                                           int min_points,
-                                          int exclude_frame = -1) const;
+                                          int exclude_frame = kNoFrame) const;
 
  private:
   struct Block {
@@ -71,7 +80,7 @@ class VoxelHashMap {
   };
 
   double voxel_size_;
-  double inv_voxel_size_;
+  double inverse_voxel_size_;
   double max_distance_;
   int max_points_per_voxel_;
   std::unordered_map<VoxelKey, Block, VoxelKeyHash> map_;
@@ -81,8 +90,8 @@ struct IcpOptions {
   double max_corr_dist = 1.0;  // Correspondence gate (m).
   double kernel = 0.3;         // Geman-McClure scale (m).
   int max_iters = 50;
-  double conv_eps = 1e-4;
-  int exclude_frame = -1;
+  double conv_eps = 1e-4;  // Stops when an update moves less (m / rad).
+  int exclude_frame = VoxelHashMap::kNoFrame;  // Map points to ignore.
   // Point-to-plane residuals where the map is locally planar; this removes
   // the bias of point-to-point matching towards zero motion on sparse LiDAR
   // rings (floors, ceilings, walls). Non-planar neighbourhoods fall back to
@@ -92,15 +101,16 @@ struct IcpOptions {
   // The radius doubles up to this until a plane spans several rings.
   double max_plane_radius = 1.2;
   int min_plane_points = 6;
-  double min_planarity = 0.5;
-  double max_plane_thickness = 0.05;
+  double min_planarity = 0.5;         // (l2 - l3) / l1 of the PCA.
+  double max_plane_thickness = 0.05;  // m
   // Neighbourhoods that stay line-like (a lone ring segment) at the largest
   // radius carry no unbiased constraint and are skipped.
   double max_linearity = 0.85;
   // Weight of point-to-point residuals used where no plane is found
   // (corners, clutter); 0 makes the alignment purely point-to-plane.
   double point_weight = 0.05;
-  int max_search_voxels = 2;  // Neighbour-search window (voxels).
+  // Neighbour-search window (voxels).
+  int max_search_voxels = VoxelHashMap::kDefaultSearchVoxels;
   // Parallelise over source points; callers that already run many alignments
   // in parallel (loop verification, scan-to-map refinement) switch it off.
   bool parallel = true;
@@ -120,6 +130,9 @@ struct IcpResult {
 IcpResult AlignToMap(const Points& source, const VoxelHashMap& map,
                      const Pose& initial_guess, const IcpOptions& options);
 
+// AlignMultiScale's ICP iterations per gate by default.
+inline constexpr int kDefaultMultiScaleIterations = 40;
+
 // Coarse-to-fine ICP of `source` against the cloud `target`: one alignment
 // per correspondence gate of `schedule` (kernel = gate / 3; the map voxel
 // follows the gate so that the neighbour search stays local), then the
@@ -127,7 +140,8 @@ IcpResult AlignToMap(const Points& source, const VoxelHashMap& map,
 IcpResult AlignMultiScale(const Points& source, const Points& target,
                           const Pose& initial_guess,
                           const std::vector<double>& schedule,
-                          double base_voxel, int max_iterations = 40,
+                          double base_voxel,
+                          int max_iterations = kDefaultMultiScaleIterations,
                           bool parallel = true);
 
 }  // namespace gr

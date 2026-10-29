@@ -14,6 +14,7 @@
 
 #include "gr/core/types.h"
 #include "gr/semantics/markings.h"
+#include "gr/semantics/slots.h"
 
 namespace gr {
 
@@ -31,10 +32,10 @@ struct SlotPaint {
   Vec3 mean_rgb = Vec3::Zero();  // Of the observed cells.
 };
 
-// `rgb` is height x width x 3 and `observed` height x width (non-zero where
-// the texture saw the floor), both row-major in `frame`.
+// `rgb` is height x width x kRgbChannels and `observed` height x width
+// (non-zero where the texture saw the floor), both row-major in `frame`.
 std::vector<SlotPaint> MeasureSlotPaint(
-    const std::vector<std::array<Vec2, 4>>& slots,
+    const std::vector<std::array<Vec2, kParkingSlotCorners>>& slots,
     const std::vector<uint8_t>& rgb, const std::vector<uint8_t>& observed,
     const RasterFrame& frame, const SlotPaintConfig& config = {});
 
