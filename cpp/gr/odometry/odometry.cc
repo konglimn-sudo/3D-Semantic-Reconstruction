@@ -5,6 +5,21 @@
 #include <utility>
 
 namespace gr {
+namespace {
+
+// Intervals shorter than this (s) give no velocity.
+constexpr double kMinInterval = 1e-6;
+// KISS-ICP: each sweep is downsampled to half a map voxel for the map and
+// to 1.5 voxels for registration; correspondences reach 3 sigma of the
+// motion model and the robust kernel scale is sigma / 3.
+constexpr double kFrameVoxelFactor = 0.5;
+constexpr double kSourceVoxelFactor = 1.5;
+constexpr double kCorrespondenceSigmas = 3.0;
+constexpr double kKernelSigmaDivisor = 3.0;
+// The first sweep of a gyro-only rig is compensated over this span (s).
+constexpr double kFirstSweepDuration = 0.1;
+
+}  // namespace
 
 Points DeskewConstantVelocity(const Points& points,
                               const std::vector<double>& times,
@@ -13,8 +28,9 @@ Points DeskewConstantVelocity(const Points& points,
   if (times.size() != points.size()) return points;
   Points out(points.size());
   for (size_t i = 0; i < points.size(); ++i) {
-    const double tau = times[i];
-    out[i] = So3Exp(angular_velocity * tau) * points[i] + linear_velocity * tau;
+    const double time = times[i];
+    out[i] =
+        So3Exp(angular_velocity * time) * points[i] + linear_velocity * time;
   }
   return out;
 }
@@ -37,20 +53,20 @@ Pose Odometry::RegisterFrame(const Points& points,
   Vec3 angular_velocity = Vec3::Zero();
   Vec3 linear_velocity = Vec3::Zero();
   Pose predicted;  // Identity.
-  const double dt_new = stamps_.empty() ? 0.0 : stamp - stamps_.back();
-  if (predicted_motion && dt_new > 1e-6) {
+  const double interval = stamps_.empty() ? 0.0 : stamp - stamps_.back();
+  if (predicted_motion && interval > kMinInterval) {
     predicted = *predicted_motion;
-    angular_velocity = So3Log(predicted.rotation) / dt_new;
-    linear_velocity = predicted.translation / dt_new;
+    angular_velocity = So3Log(predicted.rotation) / interval;
+    linear_velocity = predicted.translation / interval;
   } else if (poses_.size() >= 2) {
-    const size_t n = poses_.size();
-    const double dt = stamps_[n - 1] - stamps_[n - 2];
-    if (dt > 1e-6) {
-      const Pose delta = poses_[n - 2].Inverse() * poses_[n - 1];
-      angular_velocity = So3Log(delta.rotation) / dt;
-      linear_velocity = delta.translation / dt;
+    const size_t last = poses_.size() - 1;
+    const double last_interval = stamps_[last] - stamps_[last - 1];
+    if (last_interval > kMinInterval) {
+      const Pose delta = poses_[last - 1].Inverse() * poses_[last];
+      angular_velocity = So3Log(delta.rotation) / last_interval;
+      linear_velocity = delta.translation / last_interval;
       predicted =
-          Pose(So3Exp(angular_velocity * dt_new), linear_velocity * dt_new);
+          Pose(So3Exp(angular_velocity * interval), linear_velocity * interval);
     }
   }
 
@@ -62,16 +78,21 @@ Pose Odometry::RegisterFrame(const Points& points,
           : points;
   Points cropped;
   cropped.reserve(deskewed.size());
-  const double min_r2 = config_.min_range * config_.min_range;
-  const double max_r2 = config_.max_range * config_.max_range;
-  for (const Vec3& p : deskewed) {
-    const double r2 = p.squaredNorm();
-    if (r2 >= min_r2 && r2 <= max_r2) cropped.push_back(p);
+  const double min_squared_range = config_.min_range * config_.min_range;
+  const double max_squared_range = config_.max_range * config_.max_range;
+  for (const Vec3& point : deskewed) {
+    const double squared_range = point.squaredNorm();
+    if (squared_range >= min_squared_range &&
+        squared_range <= max_squared_range) {
+      cropped.push_back(point);
+    }
   }
   last_deskewed_ = cropped;
 
-  const Points frame = VoxelDownsample(cropped, 0.5 * config_.voxel_size);
-  const Points source = VoxelDownsample(frame, 1.5 * config_.voxel_size);
+  const Points frame =
+      VoxelDownsample(cropped, kFrameVoxelFactor * config_.voxel_size);
+  const Points source =
+      VoxelDownsample(frame, kSourceVoxelFactor * config_.voxel_size);
   const Pose guess = poses_.empty() ? initial_pose_ : poses_.back() * predicted;
   Pose pose = guess;
 
@@ -79,14 +100,16 @@ Pose Odometry::RegisterFrame(const Points& points,
   last_sigma_ = sigma;
   if (!map_.empty()) {
     IcpOptions options;
-    options.max_corr_dist = 3.0 * sigma;
-    options.kernel = sigma / 3.0;
+    options.max_corr_dist = kCorrespondenceSigmas * sigma;
+    options.kernel = sigma / kKernelSigmaDivisor;
     options.max_iters = config_.max_icp_iters;
     options.conv_eps = config_.icp_conv;
     last_icp_ = AlignToMap(source, map_, guess, options);
     pose = last_icp_.pose;
 
-    // Model deviation for the adaptive threshold.
+    // Model deviation for the adaptive threshold: the rotation angle
+    // (cos = (trace - 1) / 2) moves a point at max_range by the chord
+    // 2 max_range sin(angle / 2).
     const Pose deviation = guess.Inverse() * pose;
     const double cos_angle =
         std::clamp((deviation.rotation.trace() - 1.0) / 2.0, -1.0, 1.0);
@@ -139,19 +162,20 @@ void OdometryPipeline::FillKeyframe(const Points& points,
                                     const std::vector<double>& times,
                                     double stamp,
                                     std::optional<Points> imu_deskewed,
-                                    OdometryFrame& frame) const {
+                                    OdometryFrame* frame) const {
   Points sweep;
   if (imu_deskewed) {
     sweep = std::move(*imu_deskewed);
   } else if (config_.deskew && !poses_.empty() &&
              times.size() == points.size()) {
     // Constant velocity from the registered motion.
-    const Pose delta = poses_.back().Inverse() * frame.pose;
-    const double dt = stamp - stamps_.back();
-    sweep = dt > 1e-6 ? DeskewConstantVelocity(points, times,
-                                               So3Log(delta.rotation) / dt,
-                                               delta.translation / dt)
-                      : points;
+    const Pose delta = poses_.back().Inverse() * frame->pose;
+    const double interval = stamp - stamps_.back();
+    sweep = interval > kMinInterval
+                ? DeskewConstantVelocity(points, times,
+                                         So3Log(delta.rotation) / interval,
+                                         delta.translation / interval)
+                : points;
   } else {
     sweep = points;
   }
@@ -160,18 +184,18 @@ void OdometryPipeline::FillKeyframe(const Points& points,
   kept.reserve(sweep.size());
   kept_intensity.reserve(sweep.size());
   for (size_t i = 0; i < sweep.size(); ++i) {
-    const double r = sweep[i].norm();
-    if (r < config_.min_range || r > config_.max_range) continue;
+    const double range = sweep[i].norm();
+    if (range < config_.min_range || range > config_.max_range) continue;
     kept.push_back(sweep[i]);
     kept_intensity.push_back(i < intensity.size() ? intensity[i] : 0.0f);
   }
   const std::vector<int> indices =
       VoxelDownsampleIndices(kept, keyframe_config_.voxel);
-  frame.points.reserve(indices.size());
-  frame.intensity.reserve(indices.size());
-  for (int i : indices) {
-    frame.points.push_back(kept[static_cast<size_t>(i)]);
-    frame.intensity.push_back(kept_intensity[static_cast<size_t>(i)]);
+  frame->points.reserve(indices.size());
+  frame->intensity.reserve(indices.size());
+  for (int index : indices) {
+    frame->points.push_back(kept[static_cast<size_t>(index)]);
+    frame->intensity.push_back(kept_intensity[static_cast<size_t>(index)]);
   }
 }
 
@@ -179,11 +203,11 @@ OdometryFrame OdometryPipeline::Process(
     const Points& points, const std::vector<float>& intensity,
     const std::vector<double>& times, double stamp, bool force_keyframe,
     const std::optional<Pose>& external_pose, bool fill_sweep) {
-  const size_t k = poses_.size();
+  const size_t sweep_index = poses_.size();
   // Wheel / gyro prediction of the motion since the previous sweep (LiDAR
   // frame).
   std::optional<Pose> predicted;
-  if (use_prior_ && k > 0) {
+  if (use_prior_ && sweep_index > 0) {
     if (const std::optional<Pose> delta = prior_.Delta(stamps_.back(), stamp)) {
       predicted = lidar_from_vehicle_ * *delta * vehicle_from_lidar_;
     }
@@ -195,22 +219,27 @@ OdometryFrame OdometryPipeline::Process(
   if (use_gyro_) {
     Vec3 world_velocity = Vec3::Zero();
     Mat3 world_from_previous = Mat3::Identity();
-    if (k > 0) {
-      const Pose previous = poses_[k - 1] * lidar_from_vehicle_;
+    if (sweep_index > 0) {
+      const size_t previous_index = sweep_index - 1;
+      const Pose previous = poses_[previous_index] * lidar_from_vehicle_;
       world_from_previous = previous.rotation;
-      if (k > 1 && stamps_[k - 1] - stamps_[k - 2] > 1e-6) {
-        const Pose before = poses_[k - 2] * lidar_from_vehicle_;
-        world_velocity = (previous.translation - before.translation) /
-                         (stamps_[k - 1] - stamps_[k - 2]);
+      if (sweep_index > 1 &&
+          stamps_[previous_index] - stamps_[previous_index - 1] >
+              kMinInterval) {
+        const Pose before = poses_[previous_index - 1] * lidar_from_vehicle_;
+        world_velocity =
+            (previous.translation - before.translation) /
+            (stamps_[previous_index] - stamps_[previous_index - 1]);
       }
     }
     const std::optional<Pose> turn =
-        k > 0 ? prior_.GyroDelta(stamps_.back(), stamp, Vec3::Zero())
-              : prior_.GyroDelta(stamp - 0.1, stamp, Vec3::Zero());
+        sweep_index > 0 ? prior_.GyroDelta(stamps_.back(), stamp, Vec3::Zero())
+                        : prior_.GyroDelta(stamp - kFirstSweepDuration, stamp,
+                                           Vec3::Zero());
     if (turn) {
       velocity =
           (world_from_previous * turn->rotation).transpose() * world_velocity;
-      if (k > 0) {
+      if (sweep_index > 0) {
         predicted = lidar_from_vehicle_ *
                     *prior_.GyroDelta(stamps_.back(), stamp, *velocity) *
                     vehicle_from_lidar_;
@@ -221,8 +250,9 @@ OdometryFrame OdometryPipeline::Process(
   // differs strongly from the rate during the sweep when turning.
   std::optional<Points> imu_deskewed;
   if (config_.deskew && (use_prior_ || velocity)) {
-    imu_deskewed = DeskewWithPrior(points, times, stamp, prior_,
-                                   vehicle_from_lidar_, 16, velocity);
+    imu_deskewed =
+        DeskewWithPrior(points, times, stamp, prior_, vehicle_from_lidar_,
+                        kDefaultDeskewSamples, velocity);
   }
 
   OdometryFrame frame;
@@ -238,14 +268,15 @@ OdometryFrame OdometryPipeline::Process(
     frame.pose = odometry_.RegisterFrame(points, times, stamp, predicted);
   }
 
-  frame.is_keyframe = k == 0 || force_keyframe || IsKeyframe(frame.pose);
+  frame.is_keyframe =
+      sweep_index == 0 || force_keyframe || IsKeyframe(frame.pose);
   if (frame.is_keyframe || fill_sweep) {
     FillKeyframe(points, intensity, times, stamp, std::move(imu_deskewed),
-                 frame);
+                 &frame);
   }
   if (frame.is_keyframe) {
     last_keyframe_pose_ = frame.pose;
-    keyframes_.push_back(static_cast<int>(k));
+    keyframes_.push_back(static_cast<int>(sweep_index));
   }
   poses_.push_back(frame.pose);
   stamps_.push_back(stamp);

@@ -19,25 +19,25 @@ namespace gr {
 
 struct LoopConfig {
   bool enabled = true;
-  int stride = 2;          // Test every n-th keyframe.
-  int min_index_gap = 30;  // Same-trip separation (keyframes).
-  double search_radius = 12.0;
-  double level_gate = 1.5;  // |dz| allowed between candidates.
-  int sc_rings = 20;
+  int stride = 2;               // Test every n-th keyframe.
+  int min_index_gap = 30;       // Same-trip separation (keyframes).
+  double search_radius = 12.0;  // m, horizontal, around the query estimate.
+  double level_gate = 1.5;      // |dz| (m) allowed between candidates.
+  int sc_rings = 20;            // Scan Context layout (ScanContextConfig).
   int sc_sectors = 60;
-  double sc_max_radius = 30.0;
-  double sc_voxel = 0.2;  // Sweep resolution for the descriptors.
-  double sc_threshold = 0.35;
-  int top_k = 3;
-  int submap_half_window = 3;  // Keyframes on each side of the target.
-  double icp_voxel = 0.2;
-  std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};
-  int icp_iters = 40;
+  double sc_max_radius = 30.0;  // m
+  double sc_voxel = 0.2;        // Sweep resolution for the descriptors (m).
+  double sc_threshold = 0.35;   // Largest Scan Context distance kept.
+  int top_k = 3;                // Candidates verified per query.
+  int submap_half_window = 3;   // Keyframes on each side of the target.
+  double icp_voxel = 0.2;       // m
+  std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};  // m, per level.
+  int icp_iters = 40;                                       // Per level.
   double min_fitness = 0.55;
-  double max_rmse = 0.12;
+  double max_rmse = 0.12;       // m
   double max_correction = 4.0;  // m between the graph prior and the ICP result.
   double pcm_threshold = 0.5;   // Metres-equivalent cycle error.
-  double pcm_drift_per_m = 0.01;
+  double pcm_drift_per_m = 0.01;  // Extra tolerance per metre travelled.
 };
 
 struct LoopConstraint {
@@ -46,7 +46,7 @@ struct LoopConstraint {
   Pose j_from_i;  // Measured T_j^-1 T_i (LiDAR frames).
   double fitness = 0.0;
   double rmse = 0.0;
-  double sc_distance = 1.0;
+  double sc_distance = 1.0;  // 1 (the largest) for appearance loops.
 };
 
 struct LoopStats {
@@ -69,11 +69,12 @@ std::vector<LoopConstraint> DetectLoops(const KeyframeSet& keyframes,
 // and the pair is accepted if the best one passes the loop gates and beats
 // every distinct hypothesis by `min_fitness_gap` (repeated layouts).
 struct AppearanceLoopConfig {
-  double coarse_voxel = 0.2;   // Submaps for the coarse search (m).
-  double z_peak_ratio = 0.5;   // Height hypotheses (AlignGravityAligned...).
-  int max_hypotheses = 8;  // Every yaw first, then more heights.
+  double coarse_voxel = 0.2;  // Submaps for the coarse search (m).
+  double z_peak_ratio = 0.5;  // Height hypotheses (AlignGravityAligned...).
+  int max_hypotheses = 8;     // Every yaw first, then more heights.
   double min_fitness_gap = 0.03;
-  double distinct_t = 1.0;     // m / deg: another solution.
+  // A solution this far from the best one (m, deg) is another solution.
+  double distinct_t = 1.0;
   double distinct_r = 5.0;
 };
 
@@ -84,6 +85,11 @@ std::vector<LoopConstraint> VerifyAppearanceLoops(
     const std::vector<std::pair<int, int>>& candidates,
     const LoopConfig& config, const AppearanceLoopConfig& appearance,
     int* tested = nullptr);
+
+// A loop needs two keyframes; pairwise consistency needs three loops to
+// outvote one (fewer pass unchanged).
+inline constexpr int kMinLoopKeyframes = 2;
+inline constexpr size_t kMinConsistencyLoops = 3;
 
 // Pairwise consistency maximisation (Mangelson et al., ICRA 2018) with a
 // greedy clique: two loops between the same pair of trips must agree with

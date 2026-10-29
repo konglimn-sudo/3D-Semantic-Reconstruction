@@ -18,6 +18,36 @@
 namespace gr {
 namespace {
 
+// GNSS fixes without a std column (TripInputs) have kDefaultGnssStd; no fix
+// is trusted beyond kMinGnssStd (m).
+constexpr double kDefaultGnssStd = 0.05;
+constexpr double kMinGnssStd = 0.01;
+// The same defaults of the control points (m).
+constexpr double kDefaultControlStd = 0.01;
+constexpr double kMinControlStd = 1e-3;
+// Interpolation and finite differences need two samples.
+constexpr size_t kMinSamples = 2;
+// Bias random walks span at least this long (s).
+constexpr double kMinBiasWalkInterval = 1e-3;
+// The prior of a trip without any anchor: anywhere near its odometry start.
+constexpr double kWeakAnchorSigmaT = 50.0;  // m
+constexpr double kWeakAnchorSigmaR = 90.0;  // deg
+// Hierarchical BA: windows hold kMinWindowSize keyframes at least, and only
+// windows of kMinRefinedWindowSize get their own BA (a shorter trip tail
+// joins the window before it). Their first keyframe is held by a stiff prior.
+constexpr int kMinWindowSize = 2;
+constexpr size_t kMinRefinedWindowSize = 3;
+constexpr double kHoldSigmaT = 1e-4;  // m
+constexpr double kHoldSigmaR = 1e-3;  // deg
+// A window_of entry before the windows are cut.
+constexpr int kNoWindow = -1;
+// Scan-to-map refinement: points per map voxel, and the ICP kernel as a
+// fraction of the correspondence gate.
+constexpr int kRefineMaxPointsPerVoxel = 60;
+constexpr double kGatePerKernel = 3.0;
+// Upper percentile of the BA plane RMS reports.
+constexpr double kReportPercentile = 90.0;
+
 // LiDAR pose of a trip's odometry at time `t`: interpolated between the
 // frames; before the first / after the last frame extended with the wheel /
 // gyro prior (nullopt if the prior does not reach `t`).
@@ -44,22 +74,26 @@ std::optional<Pose> OdometryAt(const TripInputs& inputs,
 // Position anchors from the GNSS fixes of one trip.
 void AddGnssAnchors(const KeyframeSet& keyframes, const std::vector<int>& trip,
                     const TripInputs& inputs, const Vec3& lever,
-                    const BackendConfig& config, std::vector<Anchor>& anchors) {
+                    const BackendConfig& config, std::vector<Anchor>* anchors) {
   const Eigen::MatrixXd& gnss = inputs.gnss;
-  if (gnss.rows() == 0 || gnss.cols() < 4 || inputs.frame_stamps.empty()) {
+  if (gnss.rows() == 0 || gnss.cols() < kGnssStdColumn ||
+      inputs.frame_stamps.empty()) {
     return;
   }
   const MotionPrior prior(inputs.imu, inputs.wheel);
-  for (Eigen::Index r = 0; r < gnss.rows(); ++r) {
-    const double fix_time = gnss(r, 0);
-    const Vec3 position(gnss(r, 1), gnss(r, 2), gnss(r, 3));
-    const double std_m = gnss.cols() > 4 ? gnss(r, 4) : 0.05;
-    const auto time_gap = [&](int k) {
-      return std::abs(keyframes[static_cast<size_t>(k)].stamp - fix_time);
+  for (Eigen::Index row = 0; row < gnss.rows(); ++row) {
+    const double fix_time = gnss(row, kGnssTimeColumn);
+    const Vec3 position =
+        gnss.block<1, kSpaceDim>(row, kGnssPositionColumn).transpose();
+    const double std_dev = gnss.cols() > kGnssStdColumn
+                               ? gnss(row, kGnssStdColumn)
+                               : kDefaultGnssStd;
+    const auto time_gap = [&](int index) {
+      return std::abs(keyframes[static_cast<size_t>(index)].stamp - fix_time);
     };
     size_t best = 0;
-    for (size_t a = 1; a < trip.size(); ++a) {
-      if (time_gap(trip[a]) < time_gap(trip[best])) best = a;
+    for (size_t member = 1; member < trip.size(); ++member) {
+      if (time_gap(trip[member]) < time_gap(trip[best])) best = member;
     }
     if (time_gap(trip[best]) > config.gnss_max_dt) continue;
     const Keyframe& keyframe = keyframes[static_cast<size_t>(trip[best])];
@@ -73,8 +107,8 @@ void AddGnssAnchors(const KeyframeSet& keyframes, const std::vector<int>& trip,
     anchor.keyframe = trip[best];
     anchor.position = position + (keyframe.odom * lever - *at_fix * lever);
     anchor.lever = lever;
-    anchor.sigma = std::max(std_m, 0.01) * config.gnss_sigma_scale;
-    anchors.push_back(anchor);
+    anchor.sigma = std::max(std_dev, kMinGnssStd) * config.gnss_sigma_scale;
+    anchors->push_back(anchor);
   }
 }
 
@@ -83,41 +117,47 @@ void AddGnssAnchors(const KeyframeSet& keyframes, const std::vector<int>& trip,
 void AddControlPoints(const KeyframeSet& keyframes,
                       const std::vector<int>& trip, const TripInputs& inputs,
                       const BackendConfig& config,
-                      std::vector<Anchor>& anchors) {
-  const Eigen::MatrixXd& rows = inputs.control_points;
-  if (rows.rows() == 0 || rows.cols() < 7 || inputs.frame_stamps.empty()) {
+                      std::vector<Anchor>* anchors) {
+  const Eigen::MatrixXd& control = inputs.control_points;
+  if (control.rows() == 0 || control.cols() < kControlStdColumn ||
+      inputs.frame_stamps.empty()) {
     return;
   }
   const MotionPrior prior(inputs.imu, inputs.wheel);
-  for (Eigen::Index r = 0; r < rows.rows(); ++r) {
-    const double t = rows(r, 0);
-    const auto time_gap = [&](int k) {
-      return std::abs(keyframes[static_cast<size_t>(k)].stamp - t);
+  for (Eigen::Index row = 0; row < control.rows(); ++row) {
+    const double stamp = control(row, kControlTimeColumn);
+    const auto time_gap = [&](int index) {
+      return std::abs(keyframes[static_cast<size_t>(index)].stamp - stamp);
     };
     size_t best = 0;
-    for (size_t a = 1; a < trip.size(); ++a) {
-      if (time_gap(trip[a]) < time_gap(trip[best])) best = a;
+    for (size_t member = 1; member < trip.size(); ++member) {
+      if (time_gap(trip[member]) < time_gap(trip[best])) best = member;
     }
     if (time_gap(trip[best]) > config.control_max_dt) continue;
-    const std::optional<Pose> seen_from = OdometryAt(inputs, prior, t);
+    const std::optional<Pose> seen_from = OdometryAt(inputs, prior, stamp);
     if (!seen_from) continue;
     const Keyframe& keyframe = keyframes[static_cast<size_t>(trip[best])];
+    const Vec3 target_lidar =
+        control.block<1, kSpaceDim>(row, kControlLidarColumn).transpose();
     Anchor anchor;
     anchor.type = Anchor::Type::kPosition;
     anchor.keyframe = trip[best];
-    anchor.position = Vec3(rows(r, 4), rows(r, 5), rows(r, 6));
-    anchor.lever = keyframe.odom.Inverse() *
-                   (*seen_from * Vec3(rows(r, 1), rows(r, 2), rows(r, 3)));
-    anchor.sigma = rows.cols() > 7 ? std::max(rows(r, 7), 1e-3) : 0.01;
-    anchors.push_back(anchor);
+    anchor.position =
+        control.block<1, kSpaceDim>(row, kControlWorldColumn).transpose();
+    anchor.lever = keyframe.odom.Inverse() * (*seen_from * target_lidar);
+    anchor.sigma =
+        control.cols() > kControlStdColumn
+            ? std::max(control(row, kControlStdColumn), kMinControlStd)
+            : kDefaultControlStd;
+    anchors->push_back(anchor);
   }
 }
 
 // The wheel speed (vehicle x axis at the vehicle origin) moved to the
 // inertial body origin, the IMU: v + w x p, in the vehicle axes.
 Vec3 BodyVelocityFromWheel(const TripInputs& inputs, double stamp) {
-  const Vec3 wheel(Interp1(inputs.wheel.stamps, inputs.wheel.speed, stamp),
-                   0.0, 0.0);
+  const Vec3 wheel(Interp1(inputs.wheel.stamps, inputs.wheel.speed, stamp), 0.0,
+                   0.0);
   const Vec3 omega =
       InterpolateSeries(inputs.imu.stamps, inputs.imu.gyro, stamp);
   return wheel + omega.cross(inputs.imu.position);
@@ -125,27 +165,28 @@ Vec3 BodyVelocityFromWheel(const TripInputs& inputs, double stamp) {
 
 // Start velocity of a keyframe's inertial body without an estimate: from the
 // wheel speed, else the finite difference of neighbouring keyframes.
+// `member` is the keyframe's position in `trip`.
 Vec3 InitialVelocity(const KeyframeSet& keyframes, const std::vector<int>& trip,
-                     size_t a, const std::vector<Pose>& poses,
+                     size_t member, const std::vector<Pose>& poses,
                      const TripInputs& inputs, const Pose& lidar_from_body) {
-  const int k = trip[a];
-  const Pose body = poses[static_cast<size_t>(k)] * lidar_from_body;
-  const double stamp = keyframes[static_cast<size_t>(k)].stamp;
+  const size_t keyframe = static_cast<size_t>(trip[member]);
+  const Pose body = poses[keyframe] * lidar_from_body;
+  const double stamp = keyframes[keyframe].stamp;
   const WheelSamples& wheel = inputs.wheel;
-  if (wheel.size() > 1 && stamp >= wheel.stamps.front() &&
+  if (wheel.size() >= kMinSamples && stamp >= wheel.stamps.front() &&
       stamp <= wheel.stamps.back()) {
     return body.rotation * BodyVelocityFromWheel(inputs, stamp);
   }
-  if (trip.size() < 2) return Vec3::Zero();
-  const size_t a0 = a == 0 ? 0 : a - 1;
-  const size_t a1 = a + 1 == trip.size() ? a : a + 1;
-  const size_t k0 = static_cast<size_t>(trip[a0]);
-  const size_t k1 = static_cast<size_t>(trip[a1]);
-  const double dt = keyframes[k1].stamp - keyframes[k0].stamp;
-  if (dt <= 0.0) return Vec3::Zero();
-  return ((poses[k1] * lidar_from_body).translation -
-          (poses[k0] * lidar_from_body).translation) /
-         dt;
+  if (trip.size() < kMinSamples) return Vec3::Zero();
+  const size_t previous_member = member == 0 ? 0 : member - 1;
+  const size_t next_member = member + 1 == trip.size() ? member : member + 1;
+  const size_t previous = static_cast<size_t>(trip[previous_member]);
+  const size_t next = static_cast<size_t>(trip[next_member]);
+  const double interval = keyframes[next].stamp - keyframes[previous].stamp;
+  if (interval <= 0.0) return Vec3::Zero();
+  return ((poses[next] * lidar_from_body).translation -
+          (poses[previous] * lidar_from_body).translation) /
+         interval;
 }
 
 // Inertial states for the keyframes inside each trip's IMU span, with IMU
@@ -155,42 +196,44 @@ int AddInertialFactors(const KeyframeSet& keyframes,
                        const std::vector<TripInputs>& trips,
                        const BackendConfig& config,
                        const std::vector<Pose>& poses,
-                       const InertialEstimate* start, PoseGraph& graph) {
+                       const InertialEstimate* start, PoseGraph* graph) {
   const ImuNoise noise = config.ToImuNoise();
   const bool has_start = start != nullptr &&
                          start->valid.size() == keyframes.size() &&
                          start->velocities.size() == keyframes.size() &&
                          start->biases.size() == keyframes.size();
   int num_imu = 0;
-  for (size_t t = 0; t < trips.size(); ++t) {
-    const TripInputs& inputs = trips[t];
-    const std::vector<int>& trip = keyframes.TripIndices(static_cast<int>(t));
+  for (size_t trip_index = 0; trip_index < trips.size(); ++trip_index) {
+    const TripInputs& inputs = trips[trip_index];
+    const std::vector<int>& trip =
+        keyframes.TripIndices(static_cast<int>(trip_index));
     const ImuSamples& imu = inputs.imu;
-    if (trip.empty() || imu.size() < 2) continue;
+    if (trip.empty() || imu.size() < kMinSamples) continue;
     // The inertial body: vehicle axes at the IMU, where the accelerometer
     // measures (ImuSamples::position).
     const Pose lidar_from_body =
         inputs.vehicle_from_lidar.Inverse() * imu.VehicleFromBody();
     const WheelSamples& wheel = inputs.wheel;
     std::vector<int> nodes;
-    for (size_t a = 0; a < trip.size(); ++a) {
-      const int k = trip[a];
-      const size_t kk = static_cast<size_t>(k);
-      const double stamp = keyframes[kk].stamp;
+    for (size_t member = 0; member < trip.size(); ++member) {
+      const int node = trip[member];
+      const size_t keyframe = static_cast<size_t>(node);
+      const double stamp = keyframes[keyframe].stamp;
       if (stamp < imu.stamps.front() || stamp > imu.stamps.back()) continue;
-      if (has_start && start->valid[kk]) {
-        graph.AddInertialState(k, start->velocities[kk], start->biases[kk]);
+      if (has_start && start->valid[keyframe]) {
+        graph->AddInertialState(node, start->velocities[keyframe],
+                                start->biases[keyframe]);
       } else {
-        graph.AddInertialState(k,
-                               InitialVelocity(keyframes, trip, a, poses,
-                                               inputs, lidar_from_body),
-                               Vec6::Zero());
+        graph->AddInertialState(node,
+                                InitialVelocity(keyframes, trip, member, poses,
+                                                inputs, lidar_from_body),
+                                Vec6::Zero());
       }
-      nodes.push_back(k);
-      if (config.wheel_factors && wheel.size() > 1 &&
+      nodes.push_back(node);
+      if (config.wheel_factors && wheel.size() >= kMinSamples &&
           stamp >= wheel.stamps.front() && stamp <= wheel.stamps.back()) {
-        graph.AddBodyVelocity(
-            k, BodyVelocityFromWheel(inputs, stamp),
+        graph->AddBodyVelocity(
+            node, BodyVelocityFromWheel(inputs, stamp),
             Vec3(config.wheel_sigma, config.wheel_lateral_sigma,
                  config.wheel_lateral_sigma),
             lidar_from_body);
@@ -200,22 +243,23 @@ int AddInertialFactors(const KeyframeSet& keyframes,
     Vec6 prior_sigma;
     prior_sigma << Vec3::Constant(config.gyro_bias_prior),
         Vec3::Constant(config.accel_bias_prior);
-    graph.AddBiasPrior(nodes.front(), Vec6::Zero(), prior_sigma);
-    for (size_t a = 1; a < nodes.size(); ++a) {
-      const int i = nodes[a - 1];
-      const int j = nodes[a];
-      const double t0 = keyframes[static_cast<size_t>(i)].stamp;
-      const double t1 = keyframes[static_cast<size_t>(j)].stamp;
-      const double root_dt = std::sqrt(std::max(t1 - t0, 1e-3));
+    graph->AddBiasPrior(nodes.front(), Vec6::Zero(), prior_sigma);
+    for (size_t member = 1; member < nodes.size(); ++member) {
+      const int node_i = nodes[member - 1];
+      const int node_j = nodes[member];
+      const double start_stamp = keyframes[static_cast<size_t>(node_i)].stamp;
+      const double end_stamp = keyframes[static_cast<size_t>(node_j)].stamp;
+      const double root_interval =
+          std::sqrt(std::max(end_stamp - start_stamp, kMinBiasWalkInterval));
       Vec6 walk;
-      walk << Vec3::Constant(noise.gyro_bias_walk * root_dt),
-          Vec3::Constant(noise.accel_bias_walk * root_dt);
-      graph.AddBiasBetween(i, j, walk);
-      if (t1 - t0 > config.imu_max_dt) continue;
-      const std::optional<ImuPreintegration> preintegration =
-          PreintegrateImu(imu, t0, t1, graph.Bias(i), noise);
+      walk << Vec3::Constant(noise.gyro_bias_walk * root_interval),
+          Vec3::Constant(noise.accel_bias_walk * root_interval);
+      graph->AddBiasBetween(node_i, node_j, walk);
+      if (end_stamp - start_stamp > config.imu_max_dt) continue;
+      const std::optional<ImuPreintegration> preintegration = PreintegrateImu(
+          imu, start_stamp, end_stamp, graph->Bias(node_i), noise);
       if (!preintegration) continue;
-      graph.AddImu(i, j, *preintegration, lidar_from_body);
+      graph->AddImu(node_i, node_j, *preintegration, lidar_from_body);
       ++num_imu;
     }
   }
@@ -263,10 +307,11 @@ std::vector<Anchor> MakeAnchors(const KeyframeSet& keyframes,
                                 const BackendConfig& config,
                                 const Logger& log) {
   std::vector<Anchor> anchors;
-  for (size_t t = 0; t < trips.size(); ++t) {
-    const std::vector<int>& trip = keyframes.TripIndices(static_cast<int>(t));
+  for (size_t trip_index = 0; trip_index < trips.size(); ++trip_index) {
+    const std::vector<int>& trip =
+        keyframes.TripIndices(static_cast<int>(trip_index));
     if (trip.empty()) continue;
-    const TripInputs& inputs = trips[t];
+    const TripInputs& inputs = trips[trip_index];
     // The vehicle origin in the LiDAR frame.
     const Vec3 lever = inputs.vehicle_from_lidar.Inverse().translation;
     const size_t before = anchors.size();
@@ -279,19 +324,19 @@ std::vector<Anchor> MakeAnchors(const KeyframeSet& keyframes,
       anchor.sigma_r = config.anchor_sigma_r;
       anchors.push_back(anchor);
     }
-    AddGnssAnchors(keyframes, trip, inputs, lever, config, anchors);
-    AddControlPoints(keyframes, trip, inputs, config, anchors);
+    AddGnssAnchors(keyframes, trip, inputs, lever, config, &anchors);
+    AddControlPoints(keyframes, trip, inputs, config, &anchors);
     if (anchors.size() == before) {
       Anchor anchor;
       anchor.type = Anchor::Type::kPose;
       anchor.keyframe = trip.front();
       anchor.pose = keyframes[static_cast<size_t>(trip.front())].odom;
-      anchor.sigma_t = 50.0;
-      anchor.sigma_r = 90.0;
+      anchor.sigma_t = kWeakAnchorSigmaT;
+      anchor.sigma_r = kWeakAnchorSigmaR;
       anchor.weak = true;
       anchors.push_back(anchor);
       LogLine(log, StringPrintf("[backend] trip %zu: no entrance anchor",
-                                t));
+                                trip_index));
     }
   }
   return anchors;
@@ -303,11 +348,11 @@ namespace {
 Points TripMap(const KeyframeSet& keyframes, const std::vector<Pose>& poses,
                const std::vector<int>& trips, double voxel) {
   Points merged;
-  for (int t : trips) {
-    for (int k : keyframes.TripIndices(t)) {
-      const size_t kk = static_cast<size_t>(k);
-      const Points world = TransformPoints(keyframes.Cloud(kk, voxel),
-                                           poses[kk]);
+  for (int trip : trips) {
+    for (int index : keyframes.TripIndices(trip)) {
+      const size_t keyframe = static_cast<size_t>(index);
+      const Points world =
+          TransformPoints(keyframes.Cloud(keyframe, voxel), poses[keyframe]);
       merged.insert(merged.end(), world.begin(), world.end());
     }
   }
@@ -318,40 +363,42 @@ Points TripMap(const KeyframeSet& keyframes, const std::vector<Pose>& poses,
 
 std::vector<TripAlignment> AlignTrips(const KeyframeSet& keyframes,
                                       const TripAlignConfig& config,
-                                      std::vector<Pose>& poses,
-                                      std::vector<Anchor>& anchors,
+                                      std::vector<Pose>* poses,
+                                      std::vector<Anchor>* anchors,
                                       const Logger& log) {
-  GR_CHECK(poses.size() == keyframes.size());
+  GR_CHECK(poses->size() == keyframes.size());
   GR_CHECK(keyframes.HasVoxel(config.voxel));
   const int num_trips = keyframes.num_trips();
   std::vector<uint8_t> anchored(static_cast<size_t>(num_trips), 0);
-  for (const Anchor& anchor : anchors) {
+  for (const Anchor& anchor : *anchors) {
     if (!anchor.weak) {
       anchored[static_cast<size_t>(
           keyframes[static_cast<size_t>(anchor.keyframe)].trip)] = 1;
     }
   }
   std::vector<int> placed;
-  for (int t = 0; t < num_trips; ++t) {
-    if (anchored[static_cast<size_t>(t)] && !keyframes.TripIndices(t).empty()) {
-      placed.push_back(t);
+  for (int trip_index = 0; trip_index < num_trips; ++trip_index) {
+    if (anchored[static_cast<size_t>(trip_index)] &&
+        !keyframes.TripIndices(trip_index).empty()) {
+      placed.push_back(trip_index);
     }
   }
-  std::vector<TripAlignment> out;
-  for (int t = 0; t < num_trips; ++t) {
-    const std::vector<int>& trip = keyframes.TripIndices(t);
-    if (anchored[static_cast<size_t>(t)] || trip.empty()) continue;
+  std::vector<TripAlignment> alignments;
+  for (int trip_index = 0; trip_index < num_trips; ++trip_index) {
+    const std::vector<int>& trip = keyframes.TripIndices(trip_index);
+    if (anchored[static_cast<size_t>(trip_index)] || trip.empty()) continue;
     if (placed.empty()) {
-      placed.push_back(t);
+      placed.push_back(trip_index);
       LogLine(log, StringPrintf("[align] trip %d: reference frame (no trip "
                                 "has an anchor)",
-                                t));
+                                trip_index));
       continue;
     }
     TripAlignment alignment;
-    alignment.trip = t;
-    const Points source = TripMap(keyframes, poses, {t}, config.voxel);
-    const Points reference = TripMap(keyframes, poses, placed, config.voxel);
+    alignment.trip = trip_index;
+    const Points source =
+        TripMap(keyframes, *poses, {trip_index}, config.voxel);
+    const Points reference = TripMap(keyframes, *poses, placed, config.voxel);
     const Placement placement =
         PlaceGravityAligned(source, reference, config.ToPlacementConfig());
     alignment.hypotheses = placement.hypotheses;
@@ -363,58 +410,63 @@ std::vector<TripAlignment> AlignTrips(const KeyframeSet& keyframes,
     alignment.aligned = placement.placed;
     const std::string& verdict = placement.verdict;
     const double moved = alignment.correction.translation.norm();
-    const double turned = RadToDeg(
-        Eigen::AngleAxisd(alignment.correction.rotation).angle());
-    LogLine(log, StringPrintf("[align] trip %d onto %zu trip(s): %d "
-                              "hypotheses, best ICP fitness %.3f (coarse "
-                              "score %.2f, rmse %.1f cm), distinct runner-up "
-                              "%.3f: %s (%.2f m, %.1f deg)",
-                              t, placed.size(), alignment.hypotheses,
-                              alignment.fitness, alignment.score,
-                              100.0 * alignment.rmse, alignment.runner_up,
-                              verdict.c_str(), moved, turned));
+    const double turned =
+        RadToDeg(Eigen::AngleAxisd(alignment.correction.rotation).angle());
+    LogLine(log,
+            StringPrintf("[align] trip %d onto %zu trip(s): %d "
+                         "hypotheses, best ICP fitness %.3f (coarse "
+                         "score %.2f, rmse %.1f cm), distinct runner-up "
+                         "%.3f: %s (%.2f m, %.1f deg)",
+                         trip_index, placed.size(), alignment.hypotheses,
+                         alignment.fitness, alignment.score,
+                         kCentimetresPerMetre * alignment.rmse,
+                         alignment.runner_up, verdict.c_str(), moved, turned));
     if (alignment.aligned) {
-      for (int k : trip) {
-        const size_t kk = static_cast<size_t>(k);
-        poses[kk] = alignment.correction * poses[kk];
+      for (int index : trip) {
+        const size_t keyframe = static_cast<size_t>(index);
+        (*poses)[keyframe] = alignment.correction * (*poses)[keyframe];
       }
-      for (Anchor& anchor : anchors) {
+      for (Anchor& anchor : *anchors) {
         if (!anchor.weak ||
-            keyframes[static_cast<size_t>(anchor.keyframe)].trip != t) {
+            keyframes[static_cast<size_t>(anchor.keyframe)].trip !=
+                trip_index) {
           continue;
         }
-        anchor.pose = poses[static_cast<size_t>(anchor.keyframe)];
+        anchor.pose = (*poses)[static_cast<size_t>(anchor.keyframe)];
         anchor.sigma_t = config.sigma_t;
         anchor.sigma_r = config.sigma_r;
       }
-      placed.push_back(t);
+      placed.push_back(trip_index);
     }
-    out.push_back(alignment);
+    alignments.push_back(alignment);
   }
-  return out;
+  return alignments;
 }
 
 std::vector<GravityMeasurement> MeasureKeyframeGravity(
     const KeyframeSet& keyframes, const std::vector<TripInputs>& trips,
     const BackendConfig& config) {
-  std::vector<GravityMeasurement> out;
-  for (size_t t = 0; t < trips.size(); ++t) {
-    const std::vector<int>& trip = keyframes.TripIndices(static_cast<int>(t));
+  std::vector<GravityMeasurement> measurements;
+  for (size_t trip_index = 0; trip_index < trips.size(); ++trip_index) {
+    const std::vector<int>& trip =
+        keyframes.TripIndices(static_cast<int>(trip_index));
     if (trip.empty()) continue;
     std::vector<double> stamps;
     stamps.reserve(trip.size());
-    for (int k : trip)
-      stamps.push_back(keyframes[static_cast<size_t>(k)].stamp);
+    for (int keyframe : trip) {
+      stamps.push_back(keyframes[static_cast<size_t>(keyframe)].stamp);
+    }
+    const TripInputs& inputs = trips[trip_index];
     const Mat3 lidar_from_vehicle_rotation =
-        trips[t].vehicle_from_lidar.Inverse().rotation;
-    for (GravityMeasurement g : MeasureGravity(
-             trips[t].imu, trips[t].wheel, lidar_from_vehicle_rotation, stamps,
-             config.ToGravityConfig())) {
-      g.index = trip[static_cast<size_t>(g.index)];
-      out.push_back(g);
+        inputs.vehicle_from_lidar.Inverse().rotation;
+    for (GravityMeasurement measurement :
+         MeasureGravity(inputs.imu, inputs.wheel, lidar_from_vehicle_rotation,
+                        stamps, config.ToGravityConfig())) {
+      measurement.index = trip[static_cast<size_t>(measurement.index)];
+      measurements.push_back(measurement);
     }
   }
-  return out;
+  return measurements;
 }
 
 namespace {
@@ -427,33 +479,34 @@ PoseGraph BuildGraph(
     const std::vector<GravityMeasurement>& gravity, const BackendConfig& config,
     const std::vector<Pose>* initial_poses,
     const std::vector<UnaryPrior>* unary, const std::vector<TripInputs>* trips,
-    const InertialEstimate* inertial, size_t& num_odometry, int& num_imu) {
+    const InertialEstimate* inertial, size_t* num_odometry, int* num_imu) {
   const size_t num_keyframes = keyframes.size();
   GR_CHECK(initial_poses == nullptr || initial_poses->size() == num_keyframes);
   PoseGraph graph;
-  for (size_t k = 0; k < num_keyframes; ++k) {
-    graph.AddNode(initial_poses != nullptr ? (*initial_poses)[k]
-                                           : keyframes[k].odom);
+  for (size_t keyframe = 0; keyframe < num_keyframes; ++keyframe) {
+    graph.AddNode(initial_poses != nullptr ? (*initial_poses)[keyframe]
+                                           : keyframes[keyframe].odom);
   }
-  num_imu = 0;
+  *num_imu = 0;
   if (config.imu_factors && trips != nullptr) {
-    num_imu = AddInertialFactors(keyframes, *trips, config, graph.poses(),
-                                 inertial, graph);
+    *num_imu = AddInertialFactors(keyframes, *trips, config, graph.poses(),
+                                  inertial, &graph);
   }
-  num_odometry = 0;
-  for (int t = 0; t < keyframes.num_trips(); ++t) {
-    const std::vector<int>& trip = keyframes.TripIndices(t);
-    for (size_t a = 1; a < trip.size(); ++a) {
-      const int i = trip[a - 1];
-      const int j = trip[a];
-      const Pose step = keyframes[static_cast<size_t>(i)].odom.Inverse() *
-                        keyframes[static_cast<size_t>(j)].odom;
-      const double d = step.translation.norm();
+  *num_odometry = 0;
+  for (int trip_index = 0; trip_index < keyframes.num_trips(); ++trip_index) {
+    const std::vector<int>& trip = keyframes.TripIndices(trip_index);
+    for (size_t member = 1; member < trip.size(); ++member) {
+      const int node_i = trip[member - 1];
+      const int node_j = trip[member];
+      const Pose step = keyframes[static_cast<size_t>(node_i)].odom.Inverse() *
+                        keyframes[static_cast<size_t>(node_j)].odom;
+      const double distance = step.translation.norm();
       graph.AddBetween(
-          i, j, step,
-          PoseInformation(config.odom_sigma_t + config.odom_sigma_t_per_m * d,
-                          config.odom_sigma_r + config.odom_sigma_r_per_m * d));
-      ++num_odometry;
+          node_i, node_j, step,
+          PoseInformation(
+              config.odom_sigma_t + config.odom_sigma_t_per_m * distance,
+              config.odom_sigma_r + config.odom_sigma_r_per_m * distance));
+      ++*num_odometry;
     }
   }
   for (const LoopConstraint& loop : loops) {
@@ -476,8 +529,8 @@ PoseGraph BuildGraph(
       graph.AddPrior(prior.keyframe, prior.pose, prior.information);
     }
   }
-  for (const GravityMeasurement& g : gravity) {
-    graph.AddGravity(g.index, g.up, g.sigma_rad);
+  for (const GravityMeasurement& measurement : gravity) {
+    graph.AddGravity(measurement.index, measurement.up, measurement.sigma_rad);
   }
   return graph;
 }
@@ -491,12 +544,12 @@ void CollectGraph(const PoseGraph& graph, const PoseGraphSummary& result,
     inertial->velocities.assign(num_keyframes, Vec3::Zero());
     inertial->biases.assign(num_keyframes, Vec6::Zero());
     inertial->valid.assign(num_keyframes, 0);
-    for (size_t k = 0; k < num_keyframes; ++k) {
-      const int node = static_cast<int>(k);
+    for (size_t keyframe = 0; keyframe < num_keyframes; ++keyframe) {
+      const int node = static_cast<int>(keyframe);
       if (!graph.HasInertialState(node)) continue;
-      inertial->velocities[k] = graph.Velocity(node);
-      inertial->biases[k] = graph.Bias(node);
-      inertial->valid[k] = 1;
+      inertial->velocities[keyframe] = graph.Velocity(node);
+      inertial->biases[keyframe] = graph.Bias(node);
+      inertial->valid[keyframe] = 1;
     }
   }
   if (summary == nullptr) return;
@@ -530,7 +583,7 @@ std::vector<Pose> OptimizeGraph(
   int num_imu = 0;
   PoseGraph graph =
       BuildGraph(keyframes, loops, anchors, gravity, config, initial_poses,
-                 unary, trips, inertial, num_odometry, num_imu);
+                 unary, trips, inertial, &num_odometry, &num_imu);
   PoseGraphOptions options;
   options.max_iterations = config.iterations;
   const PoseGraphSummary result = graph.Optimize(options);
@@ -556,7 +609,7 @@ std::vector<Pose> RunLidarBa(
     int num_imu = 0;
     PoseGraph graph =
         BuildGraph(keyframes, loops, anchors, gravity, backend_config, &current,
-                   nullptr, trips, inertial, num_odometry, num_imu);
+                   nullptr, trips, inertial, &num_odometry, &num_imu);
     LidarBaRound stats;
     for (const BaPlane& plane : planes) {
       graph.AddPlane(plane.observations, ba_config.point_sigma,
@@ -571,15 +624,16 @@ std::vector<Pose> RunLidarBa(
     const std::vector<double> rms_after = graph.PlaneRms();
     if (!planes.empty()) {
       stats.rms_median_before = Median(rms_before);
-      stats.rms_p90_before = Percentile(rms_before, 90.0);
+      stats.rms_p90_before = Percentile(rms_before, kReportPercentile);
       stats.rms_median_after = Median(rms_after);
-      stats.rms_p90_after = Percentile(rms_after, 90.0);
+      stats.rms_p90_after = Percentile(rms_after, kReportPercentile);
     }
     stats.iterations = result.iterations;
     std::vector<double> shifts;
-    for (size_t k = 0; k < current.size(); ++k) {
+    for (size_t keyframe = 0; keyframe < current.size(); ++keyframe) {
       shifts.push_back(
-          (graph.poses()[k].translation - current[k].translation).norm());
+          (graph.poses()[keyframe].translation - current[keyframe].translation)
+              .norm());
     }
     if (!shifts.empty()) {
       stats.shift_median = Median(shifts);
@@ -589,16 +643,17 @@ std::vector<Pose> RunLidarBa(
                  inertial);
     current = graph.poses();
     if (ba_summary != nullptr) ba_summary->rounds.push_back(stats);
-    LogLine(log,
-            StringPrintf(
-                "[ba] round %d: %d planes (%d scan clusters), plane "
-                "RMS median %.2f -> %.2f cm, p90 %.2f -> %.2f cm, "
-                "keyframe shift median %.2f cm, max %.2f cm, %d it",
-                round + 1, stats.planes, stats.observations,
-                100.0 * stats.rms_median_before, 100.0 * stats.rms_median_after,
-                100.0 * stats.rms_p90_before, 100.0 * stats.rms_p90_after,
-                100.0 * stats.shift_median, 100.0 * stats.shift_max,
-                stats.iterations));
+    LogLine(log, StringPrintf(
+                     "[ba] round %d: %d planes (%d scan clusters), plane "
+                     "RMS median %.2f -> %.2f cm, p90 %.2f -> %.2f cm, "
+                     "keyframe shift median %.2f cm, max %.2f cm, %d it",
+                     round + 1, stats.planes, stats.observations,
+                     kCentimetresPerMetre * stats.rms_median_before,
+                     kCentimetresPerMetre * stats.rms_median_after,
+                     kCentimetresPerMetre * stats.rms_p90_before,
+                     kCentimetresPerMetre * stats.rms_p90_after,
+                     kCentimetresPerMetre * stats.shift_median,
+                     kCentimetresPerMetre * stats.shift_max, stats.iterations));
   }
   return current;
 }
@@ -615,21 +670,24 @@ std::vector<Pose> HierarchicalLidarBa(
   const double voxel = ba_config.sweep_voxel;
   // 1. Windows of consecutive keyframes per trip, each refined alone.
   std::vector<std::vector<int>> windows;
-  std::vector<int> window_of(keyframes.size(), -1);
-  const size_t size = static_cast<size_t>(std::max(ba_config.window, 2));
-  for (int t = 0; t < keyframes.num_trips(); ++t) {
-    const std::vector<int>& trip = keyframes.TripIndices(t);
+  std::vector<int> window_of(keyframes.size(), kNoWindow);
+  const size_t window_size =
+      static_cast<size_t>(std::max(ba_config.window, kMinWindowSize));
+  for (int trip_index = 0; trip_index < keyframes.num_trips(); ++trip_index) {
+    const std::vector<int>& trip = keyframes.TripIndices(trip_index);
     size_t begin = 0;
     while (begin < trip.size()) {
       // A short tail joins the window before it.
-      size_t end = std::min(begin + size, trip.size());
-      if (trip.size() - end < std::max<size_t>(3, size / 2)) {
+      size_t end = std::min(begin + window_size, trip.size());
+      if (trip.size() - end <
+          std::max(kMinRefinedWindowSize, window_size / 2)) {
         end = trip.size();
       }
-      std::vector<int> members(trip.begin() + static_cast<long>(begin),
-                               trip.begin() + static_cast<long>(end));
-      for (int k : members) {
-        window_of[static_cast<size_t>(k)] = static_cast<int>(windows.size());
+      std::vector<int> members(trip.begin() + static_cast<int64_t>(begin),
+                               trip.begin() + static_cast<int64_t>(end));
+      for (int member : members) {
+        window_of[static_cast<size_t>(member)] =
+            static_cast<int>(windows.size());
       }
       windows.push_back(std::move(members));
       begin = end;
@@ -642,27 +700,28 @@ std::vector<Pose> HierarchicalLidarBa(
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
-  for (int64_t w = 0; w < num_windows; ++w) {
-    const std::vector<int>& members = windows[static_cast<size_t>(w)];
-    if (members.size() < 3) continue;
-    KeyframeSet sub({voxel});
+  for (int64_t window = 0; window < num_windows; ++window) {
+    const std::vector<int>& members = windows[static_cast<size_t>(window)];
+    if (members.size() < kMinRefinedWindowSize) continue;
+    KeyframeSet window_keyframes({voxel});
     std::vector<Pose> start;
-    for (int k : members) {
-      Keyframe keyframe = keyframes[static_cast<size_t>(k)];
+    for (int member : members) {
+      const size_t index = static_cast<size_t>(member);
+      Keyframe keyframe = keyframes[index];
       keyframe.trip = 0;
-      keyframe.odom = poses[static_cast<size_t>(k)];
-      sub.Add(keyframe, keyframes.Cloud(static_cast<size_t>(k), voxel));
-      start.push_back(poses[static_cast<size_t>(k)]);
+      keyframe.odom = poses[index];
+      window_keyframes.Add(keyframe, keyframes.Cloud(index, voxel));
+      start.push_back(poses[index]);
     }
     Anchor hold;  // The first keyframe stays.
     hold.keyframe = 0;
     hold.pose = start.front();
-    hold.sigma_t = 1e-4;
-    hold.sigma_r = 1e-3;
-    const std::vector<Pose> refined =
-        RunLidarBa(sub, start, {}, {hold}, {}, backend_config, window_config);
-    for (size_t m = 0; m < members.size(); ++m) {
-      local[static_cast<size_t>(members[m])] = refined[m];
+    hold.sigma_t = kHoldSigmaT;
+    hold.sigma_r = kHoldSigmaR;
+    const std::vector<Pose> refined = RunLidarBa(
+        window_keyframes, start, {}, {hold}, {}, backend_config, window_config);
+    for (size_t member = 0; member < members.size(); ++member) {
+      local[static_cast<size_t>(members[member])] = refined[member];
     }
   }
   // 2. The windows as rigid super-keyframes.
@@ -672,10 +731,10 @@ std::vector<Pose> HierarchicalLidarBa(
     const Pose frame = local[static_cast<size_t>(members.front())];
     const Pose window_from_world = frame.Inverse();
     Points merged;
-    for (int k : members) {
+    for (int member : members) {
       const Points cloud = TransformPoints(
-          keyframes.Cloud(static_cast<size_t>(k), voxel),
-          window_from_world * local[static_cast<size_t>(k)]);
+          keyframes.Cloud(static_cast<size_t>(member), voxel),
+          window_from_world * local[static_cast<size_t>(member)]);
       merged.insert(merged.end(), cloud.begin(), cloud.end());
     }
     Keyframe keyframe = keyframes[static_cast<size_t>(members.front())];
@@ -684,19 +743,19 @@ std::vector<Pose> HierarchicalLidarBa(
     frames.push_back(frame);
   }
   // window_from_keyframe within its window.
-  const auto in_window = [&](int k) {
-    const int w = window_of[static_cast<size_t>(k)];
-    return frames[static_cast<size_t>(w)].Inverse() *
-           local[static_cast<size_t>(k)];
+  const auto in_window = [&](int keyframe) {
+    const int window = window_of[static_cast<size_t>(keyframe)];
+    return frames[static_cast<size_t>(window)].Inverse() *
+           local[static_cast<size_t>(keyframe)];
   };
   std::vector<LoopConstraint> super_loops;
   for (const LoopConstraint& loop : loops) {
-    const int a = window_of[static_cast<size_t>(loop.i)];
-    const int b = window_of[static_cast<size_t>(loop.j)];
-    if (a == b) continue;
+    const int window_i = window_of[static_cast<size_t>(loop.i)];
+    const int window_j = window_of[static_cast<size_t>(loop.j)];
+    if (window_i == window_j) continue;
     LoopConstraint moved = loop;
-    moved.i = a;
-    moved.j = b;
+    moved.i = window_i;
+    moved.j = window_j;
     // T_b^-1 T_a = (T_b^-1 T_j)(T_j^-1 T_i)(T_i^-1 T_a).
     moved.j_from_i =
         in_window(loop.j) * loop.j_from_i * in_window(loop.i).Inverse();
@@ -716,13 +775,13 @@ std::vector<Pose> HierarchicalLidarBa(
   }
   std::vector<GravityMeasurement> super_gravity;
   std::vector<uint8_t> has_gravity(windows.size(), 0);
-  for (const GravityMeasurement& g : gravity) {
-    const int w = window_of[static_cast<size_t>(g.index)];
-    if (has_gravity[static_cast<size_t>(w)]) continue;  // One per window.
-    has_gravity[static_cast<size_t>(w)] = 1;
-    GravityMeasurement moved = g;
-    moved.index = w;
-    moved.up = in_window(g.index).rotation * g.up;
+  for (const GravityMeasurement& measurement : gravity) {
+    const int window = window_of[static_cast<size_t>(measurement.index)];
+    if (has_gravity[static_cast<size_t>(window)]) continue;  // One per window.
+    has_gravity[static_cast<size_t>(window)] = 1;
+    GravityMeasurement moved = measurement;
+    moved.index = window;
+    moved.up = in_window(measurement.index).rotation * measurement.up;
     super_gravity.push_back(moved);
   }
   if (trips != nullptr && backend_config.imu_factors &&
@@ -730,16 +789,16 @@ std::vector<Pose> HierarchicalLidarBa(
     // The super-keyframes have no IMU factors: each keeps the roll / pitch
     // the inertial graph gave its keyframes (their mean up direction in the
     // window frame; single keyframes are off by up to 0.2 deg).
-    for (size_t w = 0; w < windows.size(); ++w) {
-      if (has_gravity[w]) continue;
+    for (size_t window = 0; window < windows.size(); ++window) {
+      if (has_gravity[window]) continue;
       Vec3 up = Vec3::Zero();
-      for (int k : windows[w]) {
-        up += in_window(k).rotation *
-              (poses[static_cast<size_t>(k)].rotation.transpose() *
+      for (int member : windows[window]) {
+        up += in_window(member).rotation *
+              (poses[static_cast<size_t>(member)].rotation.transpose() *
                Vec3::UnitZ());
       }
       GravityMeasurement tilt;
-      tilt.index = static_cast<int>(w);
+      tilt.index = static_cast<int>(window);
       tilt.up = up.normalized();
       tilt.sigma_rad = DegToRad(ba_config.window_gravity_sigma_deg);
       super_gravity.push_back(tilt);
@@ -755,10 +814,11 @@ std::vector<Pose> HierarchicalLidarBa(
   std::vector<UnaryPrior> priors;
   const Mat6 information = PoseInformation(ba_config.window_prior_sigma_t,
                                            ba_config.window_prior_sigma_r);
-  for (size_t k = 0; k < keyframes.size(); ++k) {
-    const int w = window_of[k];
-    rigid[k] = placed[static_cast<size_t>(w)] * in_window(static_cast<int>(k));
-    priors.push_back({static_cast<int>(k), rigid[k], information});
+  for (size_t keyframe = 0; keyframe < keyframes.size(); ++keyframe) {
+    const int window = window_of[keyframe];
+    const int node = static_cast<int>(keyframe);
+    rigid[keyframe] = placed[static_cast<size_t>(window)] * in_window(node);
+    priors.push_back({node, rigid[keyframe], information});
   }
   return OptimizeGraph(keyframes, loops, anchors, gravity, backend_config,
                        &rigid, &priors, summary, trips, inertial);
@@ -778,46 +838,49 @@ std::vector<Pose> RefineScanToMap(
   const Mat6 information =
       PoseInformation(refine_config.sigma_t, refine_config.sigma_r);
   for (int iteration = 0; iteration < refine_config.iterations; ++iteration) {
-    VoxelHashMap map(voxel, 1e9, 60);
-    for (int64_t k = 0; k < num_keyframes; ++k) {
-      const size_t kk = static_cast<size_t>(k);
-      map.AddPoints(TransformPoints(keyframes.Cloud(kk, voxel), refined[kk]),
-                    static_cast<int>(k));
+    VoxelHashMap map(voxel, VoxelHashMap::kUnbounded, kRefineMaxPointsPerVoxel);
+    for (int64_t frame = 0; frame < num_keyframes; ++frame) {
+      const size_t keyframe = static_cast<size_t>(frame);
+      map.AddPoints(
+          TransformPoints(keyframes.Cloud(keyframe, voxel), refined[keyframe]),
+          static_cast<int>(frame));
     }
     std::vector<IcpResult> alignments(static_cast<size_t>(num_keyframes));
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 4)
+    constexpr int kKeyframesPerChunk = 4;
+#pragma omp parallel for schedule(dynamic, kKeyframesPerChunk)
 #endif
-    for (int64_t k = 0; k < num_keyframes; ++k) {
-      const size_t kk = static_cast<size_t>(k);
+    for (int64_t frame = 0; frame < num_keyframes; ++frame) {
+      const size_t keyframe = static_cast<size_t>(frame);
       IcpOptions options;
       options.max_corr_dist = refine_config.max_corr;
-      options.kernel = refine_config.max_corr / 3.0;
+      options.kernel = refine_config.max_corr / kGatePerKernel;
       options.max_iters = refine_config.icp_iters;
-      options.exclude_frame = static_cast<int>(k);  // Other keyframes only.
+      options.exclude_frame = static_cast<int>(frame);  // Other keyframes only.
       options.parallel = false;
-      alignments[kk] =
-          AlignToMap(keyframes.Cloud(kk, voxel), map, refined[kk], options);
+      alignments[keyframe] = AlignToMap(keyframes.Cloud(keyframe, voxel), map,
+                                        refined[keyframe], options);
     }
     std::vector<UnaryPrior> unary;
     std::vector<double> shifts;
-    for (size_t k = 0; k < alignments.size(); ++k) {
-      const IcpResult& alignment = alignments[k];
+    for (size_t keyframe = 0; keyframe < alignments.size(); ++keyframe) {
+      const IcpResult& alignment = alignments[keyframe];
       if (alignment.fitness < refine_config.min_fitness) continue;
       UnaryPrior prior;
-      prior.keyframe = static_cast<int>(k);
+      prior.keyframe = static_cast<int>(keyframe);
       prior.pose = alignment.pose;
       prior.information = information;
       unary.push_back(prior);
       shifts.push_back(
-          (alignment.pose.translation - refined[k].translation).norm());
+          (alignment.pose.translation - refined[keyframe].translation).norm());
     }
     refined = OptimizeGraph(keyframes, loops, anchors, gravity, backend_config,
                             &refined, &unary, summary, trips, inertial);
-    LogLine(log, StringPrintf("[refine] iteration %d: median scan-to-map shift "
-                              "%.1f cm, %zu/%zu keyframes aligned",
-                              iteration + 1, Median(shifts) * 100.0,
-                              unary.size(), keyframes.size()));
+    LogLine(log,
+            StringPrintf("[refine] iteration %d: median scan-to-map shift "
+                         "%.1f cm, %zu/%zu keyframes aligned",
+                         iteration + 1, Median(shifts) * kCentimetresPerMetre,
+                         unary.size(), keyframes.size()));
   }
   return refined;
 }
@@ -830,10 +893,10 @@ GraphStageResult RunGraphStage(
     GR_CHECK(keyframes.HasVoxel(voxel));
   }
   GraphStageResult result;
-  const auto log_cost = [&](const GraphSummary& s, size_t num_loops) {
+  const auto log_cost = [&](const GraphSummary& summary, size_t num_loops) {
     LogLine(log, StringPrintf("[backend] cost %.1f -> %.1f in %d it, %zu loops",
-                              s.initial_cost, s.final_cost, s.iterations,
-                              num_loops));
+                              summary.initial_cost, summary.final_cost,
+                              summary.iterations, num_loops));
   };
   result.anchors = MakeAnchors(keyframes, trips, config.backend, log);
   if (config.backend.gravity) {
@@ -860,7 +923,7 @@ GraphStageResult RunGraphStage(
   }
   if (config.trip_align.enabled) {
     result.trip_alignments =
-        AlignTrips(keyframes, config.trip_align, poses, result.anchors, log);
+        AlignTrips(keyframes, config.trip_align, &poses, &result.anchors, log);
     const bool moved = std::any_of(
         result.trip_alignments.begin(), result.trip_alignments.end(),
         [](const TripAlignment& alignment) { return alignment.aligned; });
@@ -908,10 +971,10 @@ GraphStageResult RunGraphStage(
       config.ba.hierarchical_above >= 0 &&
       static_cast<int>(keyframes.size()) > config.ba.hierarchical_above;
   if (config.ba.enabled && hierarchical) {
-    poses = HierarchicalLidarBa(keyframes, poses, result.loops,
-                                result.anchors, result.gravity, config.backend,
-                                config.ba, &result.summary, &result.ba, log,
-                                imu_trips, &result.inertial);
+    poses = HierarchicalLidarBa(keyframes, poses, result.loops, result.anchors,
+                                result.gravity, config.backend, config.ba,
+                                &result.summary, &result.ba, log, imu_trips,
+                                &result.inertial);
   } else if (config.ba.enabled) {
     poses =
         RunLidarBa(keyframes, poses, result.loops, result.anchors,
@@ -937,15 +1000,16 @@ std::vector<Pose> CorrectFramePoses(const std::vector<double>& kf_stamps,
   if (kf_stamps.empty()) return frame_odom;
   // World-frame corrections at the keyframes.
   std::vector<Pose> corrections(kf_stamps.size());
-  for (size_t a = 0; a < corrections.size(); ++a) {
-    corrections[a] = kf_poses[a] * kf_odom[a].Inverse();
+  for (size_t keyframe = 0; keyframe < corrections.size(); ++keyframe) {
+    corrections[keyframe] = kf_poses[keyframe] * kf_odom[keyframe].Inverse();
   }
-  std::vector<Pose> out(frame_stamps.size());
-  for (size_t f = 0; f < out.size(); ++f) {
-    out[f] = InterpolatePose(kf_stamps, corrections, frame_stamps[f]) *
-             frame_odom[f];
+  std::vector<Pose> frame_poses(frame_stamps.size());
+  for (size_t frame = 0; frame < frame_poses.size(); ++frame) {
+    frame_poses[frame] =
+        InterpolatePose(kf_stamps, corrections, frame_stamps[frame]) *
+        frame_odom[frame];
   }
-  return out;
+  return frame_poses;
 }
 
 }  // namespace gr

@@ -12,13 +12,28 @@ namespace gr {
 namespace {
 
 constexpr double kInf = std::numeric_limits<double>::infinity();
-// 8-neighbourhood from east, alternating straight and diagonal steps.
-constexpr int kDu[8] = {1, 1, 0, -1, -1, -1, 0, 1};
-constexpr int kDv[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+// The diagonal step of the 8-neighbourhood (std::sqrt(2.0)).
+constexpr double kSqrt2 = 1.41421356237309504880;
+// 8-neighbourhood from east, alternating straight (even) and diagonal (odd)
+// steps.
+constexpr int kNeighbourCount = 8;
+constexpr int kStepX[kNeighbourCount] = {1, 1, 0, -1, -1, -1, 0, 1};
+constexpr int kStepY[kNeighbourCount] = {0, 1, 1, 1, 0, -1, -1, -1};
+// Skeleton cells with this many skeleton neighbours are chain cells; the
+// others belong to nodes. kOffSkeleton marks the cells off the skeleton.
+constexpr int8_t kChainNeighbours = 2;
+constexpr int8_t kOffSkeleton = -1;
+// Node degrees: an end point and the least of a junction.
+constexpr int kEndPointDegree = 1;
+constexpr int kMinJunctionDegree = 3;
+// A cell, node or parent that is not set.
+constexpr int kNone = -1;
+// Chords shorter than this (cells, m) measure distances to their start.
+constexpr double kMinChordLength = 1e-12;
 
-size_t Index(int u, int v, int width) {
-  return static_cast<size_t>(v) * static_cast<size_t>(width) +
-         static_cast<size_t>(u);
+size_t Index(int x, int y, int width) {
+  return static_cast<size_t>(y) * static_cast<size_t>(width) +
+         static_cast<size_t>(x);
 }
 
 }  // namespace
@@ -26,86 +41,95 @@ size_t Index(int u, int v, int width) {
 SkeletonGraph ExtractSkeletonGraph(const std::vector<uint8_t>& skeleton,
                                    int width, int height, double min_spur) {
   GR_CHECK(skeleton.size() == static_cast<size_t>(width) * height);
-  auto on = [&](int u, int v) {
-    return u >= 0 && v >= 0 && u < width && v < height &&
-           skeleton[Index(u, v, width)] != 0;
+  const auto on = [&](int x, int y) {
+    return x >= 0 && y >= 0 && x < width && y < height &&
+           skeleton[Index(x, y, width)] != 0;
   };
   const size_t num_cells = skeleton.size();
-  std::vector<int8_t> count(num_cells, -1);
-  for (int v = 0; v < height; ++v) {
-    for (int u = 0; u < width; ++u) {
-      if (!on(u, v)) continue;
-      int8_t c = 0;
-      for (int k = 0; k < 8; ++k) c += on(u + kDu[k], v + kDv[k]) ? 1 : 0;
-      count[Index(u, v, width)] = c;
+  // Skeleton neighbours per cell.
+  std::vector<int8_t> neighbours(num_cells, kOffSkeleton);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      if (!on(x, y)) continue;
+      int8_t count = 0;
+      for (int step = 0; step < kNeighbourCount; ++step) {
+        count += on(x + kStepX[step], y + kStepY[step]) ? 1 : 0;
+      }
+      neighbours[Index(x, y, width)] = count;
     }
   }
   // Node clusters.
-  std::vector<int> cluster(num_cells, -1);
+  std::vector<int> cluster(num_cells, kNone);
   std::vector<std::vector<Eigen::Vector2i>> members;
-  for (int v = 0; v < height; ++v) {
-    for (int u = 0; u < width; ++u) {
-      const size_t i = Index(u, v, width);
-      if (count[i] < 0 || count[i] == 2 || cluster[i] >= 0) continue;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t cell = Index(x, y, width);
+      if (neighbours[cell] == kOffSkeleton ||
+          neighbours[cell] == kChainNeighbours || cluster[cell] != kNone) {
+        continue;
+      }
       const int id = static_cast<int>(members.size());
       members.emplace_back();
-      std::vector<Eigen::Vector2i> stack = {{u, v}};
-      cluster[i] = id;
+      std::vector<Eigen::Vector2i> stack = {{x, y}};
+      cluster[cell] = id;
       while (!stack.empty()) {
-        const Eigen::Vector2i c = stack.back();
+        const Eigen::Vector2i current = stack.back();
         stack.pop_back();
-        members[static_cast<size_t>(id)].push_back(c);
-        for (int k = 0; k < 8; ++k) {
-          const int uu = c.x() + kDu[k];
-          const int vv = c.y() + kDv[k];
-          if (!on(uu, vv)) continue;
-          const size_t j = Index(uu, vv, width);
-          if (count[j] == 2 || cluster[j] >= 0) continue;
-          cluster[j] = id;
-          stack.emplace_back(uu, vv);
+        members[static_cast<size_t>(id)].push_back(current);
+        for (int step = 0; step < kNeighbourCount; ++step) {
+          const int next_x = current.x() + kStepX[step];
+          const int next_y = current.y() + kStepY[step];
+          if (!on(next_x, next_y)) continue;
+          const size_t next = Index(next_x, next_y, width);
+          if (neighbours[next] == kChainNeighbours || cluster[next] != kNone) {
+            continue;
+          }
+          cluster[next] = id;
+          stack.emplace_back(next_x, next_y);
         }
       }
     }
   }
   struct RawEdge {
-    int a;
-    int b;
+    int start_node;
+    int end_node;
     std::vector<Vec2> cells;
     double length;
     bool alive;
   };
-  std::vector<Vec2> node_pos;
+  std::vector<Vec2> node_position;
   for (const auto& cells : members) {
     Vec2 mean = Vec2::Zero();
-    for (const Eigen::Vector2i& c : cells) mean += c.cast<double>();
-    node_pos.push_back(mean / static_cast<double>(cells.size()));
+    for (const Eigen::Vector2i& cell : cells) mean += cell.cast<double>();
+    node_position.push_back(mean / static_cast<double>(cells.size()));
   }
   std::vector<RawEdge> edges;
   std::vector<uint8_t> visited(num_cells, 0);
   // Walks a chain from `start` (a node cell or the loop seed) into `first`.
-  auto walk = [&](const Eigen::Vector2i& start, const Eigen::Vector2i& first,
-                  int from_node) {
+  const auto walk = [&](const Eigen::Vector2i& start,
+                        const Eigen::Vector2i& first, int from_node) {
     RawEdge edge{from_node, from_node, {start.cast<double>()}, 0.0, true};
-    Eigen::Vector2i prev = start;
-    Eigen::Vector2i cur = first;
+    Eigen::Vector2i previous = start;
+    Eigen::Vector2i current = first;
     while (true) {
-      edge.length += (cur - prev).cast<double>().norm();
-      edge.cells.push_back(cur.cast<double>());
-      const size_t ci = Index(cur.x(), cur.y(), width);
-      if (cluster[ci] >= 0) {
-        edge.b = cluster[ci];
+      edge.length += (current - previous).cast<double>().norm();
+      edge.cells.push_back(current.cast<double>());
+      const size_t current_cell = Index(current.x(), current.y(), width);
+      if (cluster[current_cell] != kNone) {
+        edge.end_node = cluster[current_cell];
         break;
       }
-      if (cur == start) break;  // Closed loop back at the seed.
-      visited[ci] = 1;
+      if (current == start) break;  // Closed loop back at the seed.
+      visited[current_cell] = 1;
       bool advanced = false;
-      for (int k = 0; k < 8; ++k) {
-        const Eigen::Vector2i next(cur.x() + kDu[k], cur.y() + kDv[k]);
-        if (next == prev || !on(next.x(), next.y())) continue;
-        const size_t ni = Index(next.x(), next.y(), width);
-        if (visited[ni] && next != start) continue;
-        prev = cur;
-        cur = next;
+      for (int step = 0; step < kNeighbourCount; ++step) {
+        const Eigen::Vector2i next(current.x() + kStepX[step],
+                                   current.y() + kStepY[step]);
+        if (next == previous || !on(next.x(), next.y())) continue;
+        const size_t next_cell = Index(next.x(), next.y(), width);
+        if (visited[next_cell] && next != start) continue;
+        previous = current;
+        current = next;
         advanced = true;
         break;
       }
@@ -114,41 +138,45 @@ SkeletonGraph ExtractSkeletonGraph(const std::vector<uint8_t>& skeleton,
     edges.push_back(std::move(edge));
   };
   for (size_t id = 0; id < members.size(); ++id) {
-    for (const Eigen::Vector2i& c : members[id]) {
-      for (int k = 0; k < 8; ++k) {
-        const Eigen::Vector2i n(c.x() + kDu[k], c.y() + kDv[k]);
-        if (!on(n.x(), n.y())) continue;
-        const size_t ni = Index(n.x(), n.y(), width);
-        if (cluster[ni] >= 0 || visited[ni]) continue;
-        walk(c, n, static_cast<int>(id));
+    for (const Eigen::Vector2i& member : members[id]) {
+      for (int step = 0; step < kNeighbourCount; ++step) {
+        const Eigen::Vector2i next(member.x() + kStepX[step],
+                                   member.y() + kStepY[step]);
+        if (!on(next.x(), next.y())) continue;
+        const size_t next_cell = Index(next.x(), next.y(), width);
+        if (cluster[next_cell] != kNone || visited[next_cell]) continue;
+        walk(member, next, static_cast<int>(id));
       }
     }
   }
   // Closed loops without any node.
-  for (int v = 0; v < height; ++v) {
-    for (int u = 0; u < width; ++u) {
-      const size_t i = Index(u, v, width);
-      if (count[i] != 2 || visited[i]) continue;
-      const int id = static_cast<int>(node_pos.size());
-      node_pos.emplace_back(u, v);
-      cluster[i] = id;  // The seed acts as the node.
-      for (int k = 0; k < 8; ++k) {
-        const Eigen::Vector2i n(u + kDu[k], v + kDv[k]);
-        if (!on(n.x(), n.y()) || visited[Index(n.x(), n.y(), width)]) continue;
-        walk({u, v}, n, id);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t cell = Index(x, y, width);
+      if (neighbours[cell] != kChainNeighbours || visited[cell]) continue;
+      const int id = static_cast<int>(node_position.size());
+      node_position.emplace_back(x, y);
+      cluster[cell] = id;  // The seed acts as the node.
+      for (int step = 0; step < kNeighbourCount; ++step) {
+        const Eigen::Vector2i next(x + kStepX[step], y + kStepY[step]);
+        if (!on(next.x(), next.y()) ||
+            visited[Index(next.x(), next.y(), width)]) {
+          continue;
+        }
+        walk({x, y}, next, id);
         break;
       }
-      visited[i] = 1;
+      visited[cell] = 1;
     }
   }
 
-  const size_t num_nodes = node_pos.size();
-  auto degrees = [&]() {
+  const size_t num_nodes = node_position.size();
+  const auto degrees = [&]() {
     std::vector<int> degree(num_nodes, 0);
-    for (const RawEdge& e : edges) {
-      if (!e.alive) continue;
-      ++degree[static_cast<size_t>(e.a)];
-      ++degree[static_cast<size_t>(e.b)];
+    for (const RawEdge& edge : edges) {
+      if (!edge.alive) continue;
+      ++degree[static_cast<size_t>(edge.start_node)];
+      ++degree[static_cast<size_t>(edge.end_node)];
     }
     return degree;
   };
@@ -157,18 +185,23 @@ SkeletonGraph ExtractSkeletonGraph(const std::vector<uint8_t>& skeleton,
   while (changed) {
     changed = false;
     const std::vector<int> degree = degrees();
-    for (RawEdge& e : edges) {
-      if (!e.alive || e.length >= min_spur) continue;
-      if (e.a == e.b) {  // Tiny loop around a staircase of node cells.
-        e.alive = false;
+    for (RawEdge& edge : edges) {
+      if (!edge.alive || edge.length >= min_spur) continue;
+      if (edge.start_node == edge.end_node) {
+        // Tiny loop around a staircase of node cells.
+        edge.alive = false;
         changed = true;
         break;
       }
-      const int da = degree[static_cast<size_t>(e.a)];
-      const int db = degree[static_cast<size_t>(e.b)];
-      if ((da == 1 && db >= 3) || (db == 1 && da >= 3) ||
-          (da == 1 && db == 1)) {
-        e.alive = false;
+      const int start_degree = degree[static_cast<size_t>(edge.start_node)];
+      const int end_degree = degree[static_cast<size_t>(edge.end_node)];
+      if ((start_degree == kEndPointDegree &&
+           end_degree >= kMinJunctionDegree) ||
+          (end_degree == kEndPointDegree &&
+           start_degree >= kMinJunctionDegree) ||
+          (start_degree == kEndPointDegree &&
+           end_degree == kEndPointDegree)) {
+        edge.alive = false;
         changed = true;
         break;  // Degrees changed.
       }
@@ -179,54 +212,60 @@ SkeletonGraph ExtractSkeletonGraph(const std::vector<uint8_t>& skeleton,
   while (changed) {
     changed = false;
     std::vector<std::vector<int>> incident(num_nodes);
-    for (size_t k = 0; k < edges.size(); ++k) {
-      const RawEdge& e = edges[k];
-      if (!e.alive) continue;
-      incident[static_cast<size_t>(e.a)].push_back(static_cast<int>(k));
-      if (e.b != e.a) {
-        incident[static_cast<size_t>(e.b)].push_back(static_cast<int>(k));
+    for (size_t index = 0; index < edges.size(); ++index) {
+      const RawEdge& edge = edges[index];
+      if (!edge.alive) continue;
+      incident[static_cast<size_t>(edge.start_node)].push_back(
+          static_cast<int>(index));
+      if (edge.end_node != edge.start_node) {
+        incident[static_cast<size_t>(edge.end_node)].push_back(
+            static_cast<int>(index));
       }
     }
     for (size_t node = 0; node < num_nodes; ++node) {
-      if (incident[node].size() != 2) continue;
-      RawEdge& e1 = edges[static_cast<size_t>(incident[node][0])];
-      RawEdge& e2 = edges[static_cast<size_t>(incident[node][1])];
-      if (e1.a == e1.b || e2.a == e2.b) continue;
-      // Orient e1 to end at `node` and e2 to start there.
-      if (e1.b != static_cast<int>(node)) {
-        std::reverse(e1.cells.begin(), e1.cells.end());
-        std::swap(e1.a, e1.b);
+      if (incident[node].size() != kChainNeighbours) continue;
+      RawEdge& incoming = edges[static_cast<size_t>(incident[node][0])];
+      RawEdge& outgoing = edges[static_cast<size_t>(incident[node][1])];
+      if (incoming.start_node == incoming.end_node ||
+          outgoing.start_node == outgoing.end_node) {
+        continue;
       }
-      if (e2.a != static_cast<int>(node)) {
-        std::reverse(e2.cells.begin(), e2.cells.end());
-        std::swap(e2.a, e2.b);
+      // Orient `incoming` to end at `node` and `outgoing` to start there.
+      if (incoming.end_node != static_cast<int>(node)) {
+        std::reverse(incoming.cells.begin(), incoming.cells.end());
+        std::swap(incoming.start_node, incoming.end_node);
       }
-      e1.cells.insert(e1.cells.end(), e2.cells.begin() + 1, e2.cells.end());
-      e1.length += e2.length;
-      e1.b = e2.b;
-      e2.alive = false;
+      if (outgoing.start_node != static_cast<int>(node)) {
+        std::reverse(outgoing.cells.begin(), outgoing.cells.end());
+        std::swap(outgoing.start_node, outgoing.end_node);
+      }
+      incoming.cells.insert(incoming.cells.end(), outgoing.cells.begin() + 1,
+                            outgoing.cells.end());
+      incoming.length += outgoing.length;
+      incoming.end_node = outgoing.end_node;
+      outgoing.alive = false;
       changed = true;
       break;
     }
   }
   // Drop isolated short components and compact.
   SkeletonGraph graph;
-  std::vector<int> remap(num_nodes, -1);
-  for (RawEdge& e : edges) {
-    if (!e.alive) continue;
-    if (e.a == e.b && e.length < min_spur) continue;
-    for (int end : {e.a, e.b}) {
+  std::vector<int> remap(num_nodes, kNone);
+  for (RawEdge& edge : edges) {
+    if (!edge.alive) continue;
+    if (edge.start_node == edge.end_node && edge.length < min_spur) continue;
+    for (int end : {edge.start_node, edge.end_node}) {
       int& id = remap[static_cast<size_t>(end)];
-      if (id < 0) {
+      if (id == kNone) {
         id = static_cast<int>(graph.nodes.size());
-        graph.nodes.push_back(node_pos[static_cast<size_t>(end)]);
+        graph.nodes.push_back(node_position[static_cast<size_t>(end)]);
       }
     }
     SkeletonEdge out;
-    out.a = remap[static_cast<size_t>(e.a)];
-    out.b = remap[static_cast<size_t>(e.b)];
-    out.cells = std::move(e.cells);
-    out.length = e.length;
+    out.start_node = remap[static_cast<size_t>(edge.start_node)];
+    out.end_node = remap[static_cast<size_t>(edge.end_node)];
+    out.cells = std::move(edge.cells);
+    out.length = edge.length;
     graph.edges.push_back(std::move(out));
   }
   return graph;
@@ -234,26 +273,28 @@ SkeletonGraph ExtractSkeletonGraph(const std::vector<uint8_t>& skeleton,
 
 std::vector<Vec2> SimplifyPolyline(const std::vector<Vec2>& points,
                                    double tolerance) {
-  const size_t n = points.size();
-  if (n <= 2) return points;
-  std::vector<uint8_t> keep(n, 0);
-  keep[0] = keep[n - 1] = 1;
-  std::vector<std::pair<size_t, size_t>> stack = {{0, n - 1}};
+  const size_t count = points.size();
+  if (count <= 2) return points;
+  std::vector<uint8_t> keep(count, 0);
+  keep[0] = keep[count - 1] = 1;
+  std::vector<std::pair<size_t, size_t>> stack = {{0, count - 1}};
   while (!stack.empty()) {
     const auto [first, last] = stack.back();
     stack.pop_back();
-    const Vec2 a = points[first];
-    const Vec2 ab = points[last] - a;
-    const double length = ab.norm();
-    double worst = -1.0;
+    const Vec2 start = points[first];
+    const Vec2 chord = points[last] - start;
+    const double length = chord.norm();
+    double worst = -1.0;  // Below any distance.
     size_t worst_index = first;
     for (size_t i = first + 1; i < last; ++i) {
-      const Vec2 ap = points[i] - a;
-      const double d =
-          length > 1e-12 ? std::abs(ab.x() * ap.y() - ab.y() * ap.x()) / length
-                         : ap.norm();
-      if (d > worst) {
-        worst = d;
+      const Vec2 offset = points[i] - start;
+      const double distance =
+          length > kMinChordLength
+              ? std::abs(chord.x() * offset.y() - chord.y() * offset.x()) /
+                    length
+              : offset.norm();
+      if (distance > worst) {
+        worst = distance;
         worst_index = i;
       }
     }
@@ -264,7 +305,7 @@ std::vector<Vec2> SimplifyPolyline(const std::vector<Vec2>& points,
     }
   }
   std::vector<Vec2> out;
-  for (size_t i = 0; i < n; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     if (keep[i]) out.push_back(points[i]);
   }
   return out;
@@ -275,13 +316,13 @@ RouteGraph::RouteGraph(int num_nodes)
   GR_CHECK(num_nodes >= 0);
 }
 
-int RouteGraph::AddEdge(int a, int b, double cost, bool one_way) {
-  GR_CHECK(a >= 0 && a < num_nodes_ && b >= 0 && b < num_nodes_);
+int RouteGraph::AddEdge(int from, int to, double cost, bool one_way) {
+  GR_CHECK(from >= 0 && from < num_nodes_ && to >= 0 && to < num_nodes_);
   GR_CHECK(cost >= 0.0);
   const int edge = static_cast<int>(costs_.size());
   costs_.push_back(cost);
-  arcs_[static_cast<size_t>(a)].push_back({b, edge});
-  if (!one_way) arcs_[static_cast<size_t>(b)].push_back({a, edge});
+  arcs_[static_cast<size_t>(from)].push_back({to, edge});
+  if (!one_way) arcs_[static_cast<size_t>(to)].push_back({from, edge});
   return edge;
 }
 
@@ -290,19 +331,20 @@ std::vector<double> RouteGraph::Run(int source, int target,
   GR_CHECK(source >= 0 && source < num_nodes_);
   std::vector<double> distance(static_cast<size_t>(num_nodes_), kInf);
   if (parent != nullptr) {
-    parent->assign(static_cast<size_t>(num_nodes_), Arc{-1, -1});
+    parent->assign(static_cast<size_t>(num_nodes_), Arc{kNone, kNone});
   }
   using Item = std::pair<double, int>;
   std::priority_queue<Item, std::vector<Item>, std::greater<Item>> queue;
   distance[static_cast<size_t>(source)] = 0.0;
   queue.emplace(0.0, source);
   while (!queue.empty()) {
-    const auto [d, node] = queue.top();
+    const auto [node_distance, node] = queue.top();
     queue.pop();
-    if (d > distance[static_cast<size_t>(node)]) continue;
+    if (node_distance > distance[static_cast<size_t>(node)]) continue;
     if (node == target) break;
     for (const Arc& arc : arcs_[static_cast<size_t>(node)]) {
-      const double candidate = d + costs_[static_cast<size_t>(arc.edge)];
+      const double candidate =
+          node_distance + costs_[static_cast<size_t>(arc.edge)];
       if (candidate < distance[static_cast<size_t>(arc.to)]) {
         distance[static_cast<size_t>(arc.to)] = candidate;
         if (parent != nullptr) {
@@ -316,7 +358,7 @@ std::vector<double> RouteGraph::Run(int source, int target,
 }
 
 std::vector<double> RouteGraph::Distances(int source) const {
-  return Run(source, -1, nullptr);
+  return Run(source, kNone, nullptr);
 }
 
 GraphPath RouteGraph::ShortestPath(int source, int target) const {
@@ -344,57 +386,62 @@ std::vector<Eigen::Vector2i> GridAStar(const std::vector<float>& cost,
                                        const Eigen::Vector2i& start,
                                        const Eigen::Vector2i& goal) {
   GR_CHECK(cost.size() == static_cast<size_t>(width) * height);
-  auto inside = [&](const Eigen::Vector2i& c) {
-    return c.x() >= 0 && c.y() >= 0 && c.x() < width && c.y() < height;
+  const auto inside = [&](const Eigen::Vector2i& cell) {
+    return cell.x() >= 0 && cell.y() >= 0 && cell.x() < width &&
+           cell.y() < height;
   };
-  auto blocked = [&](size_t i) {
-    return !std::isfinite(cost[i]) || cost[i] < 0.0f;
+  const auto blocked = [&](size_t cell) {
+    return !std::isfinite(cost[cell]) || cost[cell] < 0.0f;
   };
   if (!inside(start) || !inside(goal)) return {};
-  const size_t s = Index(start.x(), start.y(), width);
-  const size_t g = Index(goal.x(), goal.y(), width);
-  if (blocked(s) || blocked(g)) return {};
-  auto heuristic = [&](int u, int v) {
-    const double dx = std::abs(u - goal.x());
-    const double dy = std::abs(v - goal.y());
-    return std::max(dx, dy) + (std::sqrt(2.0) - 1.0) * std::min(dx, dy);
+  const size_t start_cell = Index(start.x(), start.y(), width);
+  const size_t goal_cell = Index(goal.x(), goal.y(), width);
+  if (blocked(start_cell) || blocked(goal_cell)) return {};
+  // Octile distance to the goal.
+  const auto heuristic = [&](int x, int y) {
+    const double dx = std::abs(x - goal.x());
+    const double dy = std::abs(y - goal.y());
+    return std::max(dx, dy) + (kSqrt2 - 1.0) * std::min(dx, dy);
   };
-  std::vector<double> g_cost(cost.size(), kInf);
-  std::vector<int64_t> parent(cost.size(), -1);
+  std::vector<double> cost_so_far(cost.size(), kInf);
+  std::vector<int64_t> parent(cost.size(), kNone);
   std::vector<uint8_t> closed(cost.size(), 0);
   using Item = std::pair<double, int64_t>;
   std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
-  g_cost[s] = 0.0;
-  open.emplace(heuristic(start.x(), start.y()), static_cast<int64_t>(s));
+  cost_so_far[start_cell] = 0.0;
+  open.emplace(heuristic(start.x(), start.y()),
+               static_cast<int64_t>(start_cell));
   while (!open.empty()) {
-    const size_t i = static_cast<size_t>(open.top().second);
+    const size_t cell = static_cast<size_t>(open.top().second);
     open.pop();
-    if (closed[i]) continue;
-    closed[i] = 1;
-    if (i == g) break;
-    const int u = static_cast<int>(i % static_cast<size_t>(width));
-    const int v = static_cast<int>(i / static_cast<size_t>(width));
-    for (int k = 0; k < 8; ++k) {
-      const Eigen::Vector2i n(u + kDu[k], v + kDv[k]);
-      if (!inside(n)) continue;
-      const size_t j = Index(n.x(), n.y(), width);
-      if (closed[j] || blocked(j)) continue;
-      const double step = (k % 2 == 0) ? 1.0 : std::sqrt(2.0);
-      const double candidate = g_cost[i] + step * (1.0 + cost[j]);
-      if (candidate < g_cost[j]) {
-        g_cost[j] = candidate;
-        parent[j] = static_cast<int64_t>(i);
-        open.emplace(candidate + heuristic(n.x(), n.y()),
-                     static_cast<int64_t>(j));
+    if (closed[cell]) continue;
+    closed[cell] = 1;
+    if (cell == goal_cell) break;
+    const int x = static_cast<int>(cell % static_cast<size_t>(width));
+    const int y = static_cast<int>(cell / static_cast<size_t>(width));
+    for (int step = 0; step < kNeighbourCount; ++step) {
+      const Eigen::Vector2i next(x + kStepX[step], y + kStepY[step]);
+      if (!inside(next)) continue;
+      const size_t next_cell = Index(next.x(), next.y(), width);
+      if (closed[next_cell] || blocked(next_cell)) continue;
+      const double length = step % 2 == 0 ? 1.0 : kSqrt2;
+      const double candidate =
+          cost_so_far[cell] + length * (1.0 + cost[next_cell]);
+      if (candidate < cost_so_far[next_cell]) {
+        cost_so_far[next_cell] = candidate;
+        parent[next_cell] = static_cast<int64_t>(cell);
+        open.emplace(candidate + heuristic(next.x(), next.y()),
+                     static_cast<int64_t>(next_cell));
       }
     }
   }
-  if (!std::isfinite(g_cost[g])) return {};
+  if (!std::isfinite(cost_so_far[goal_cell])) return {};
   std::vector<Eigen::Vector2i> path;
-  for (int64_t i = static_cast<int64_t>(g); i >= 0;
-       i = parent[static_cast<size_t>(i)]) {
-    path.emplace_back(static_cast<int>(i % width), static_cast<int>(i / width));
-    if (static_cast<size_t>(i) == s) break;
+  for (int64_t cell = static_cast<int64_t>(goal_cell); cell >= 0;
+       cell = parent[static_cast<size_t>(cell)]) {
+    path.emplace_back(static_cast<int>(cell % width),
+                      static_cast<int>(cell / width));
+    if (static_cast<size_t>(cell) == start_cell) break;
   }
   std::reverse(path.begin(), path.end());
   return path;

@@ -30,7 +30,7 @@ struct ClockSyncConfig {
   // (rad/s) at the best lag are rejected.
   double min_rate = 0.1;
   double max_residual = 0.1;
-  int min_samples = 200;
+  int min_samples = 200;  // `other` samples a window needs.
 };
 
 struct ClockSyncWindow {

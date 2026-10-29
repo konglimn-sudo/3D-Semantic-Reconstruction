@@ -2,6 +2,7 @@
 
 #include <zlib.h>
 
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <regex>
@@ -10,6 +11,129 @@
 
 namespace gr {
 namespace {
+
+// --- The .npy format (numpy/lib/format.py) ----------------------------------
+
+// "\x93NUMPY", the major and minor version, then the length of the header
+// text: 2 bytes in version 1, 4 from version 2 on.
+constexpr char kNpyMagic[] = "\x93NUMPY";
+constexpr size_t kNpyMagicSize = sizeof(kNpyMagic) - 1;
+constexpr size_t kNpyMajorVersionAt = kNpyMagicSize;
+constexpr size_t kNpyHeaderLengthAt = kNpyMagicSize + 2;
+constexpr size_t kNpyV1LengthBytes = 2;
+constexpr size_t kNpyV2LengthBytes = 4;
+constexpr size_t kNpyMinSize = kNpyHeaderLengthAt + kNpyV1LengthBytes;
+// The version written, and the alignment numpy pads the header to.
+constexpr uint8_t kNpyWrittenMajor = 1;
+constexpr uint8_t kNpyWrittenMinor = 0;
+constexpr size_t kNpyHeaderAlignment = 64;
+
+// The item size of a dtype stored as T (float16 is stored as 16 bits).
+template <typename T>
+constexpr int kSizeOf = static_cast<int>(sizeof(T));
+
+// --- IEEE 754 binary16 and binary32
+// -------------------------------------------
+
+constexpr int kHalfMantissaBits = 10;
+constexpr int kFloatMantissaBits = 23;
+// Shift between the mantissas, and between the sign bits.
+constexpr int kMantissaShift = kFloatMantissaBits - kHalfMantissaBits;
+constexpr int kSignShift = 16;
+constexpr int kHalfExponentBias = 15;
+constexpr int kFloatExponentBias = 127;
+constexpr uint32_t kHalfSignBit = 0x8000;
+constexpr uint32_t kHalfExponentMask = 0x1F;  // After the mantissa shift.
+constexpr uint32_t kHalfMantissaMask = (1u << kHalfMantissaBits) - 1;
+constexpr uint32_t kHalfImplicitBit = 1u << kHalfMantissaBits;
+constexpr uint32_t kHalfInfinity = kHalfExponentMask << kHalfMantissaBits;
+constexpr uint32_t kHalfQuietNan = kHalfInfinity | (kHalfImplicitBit >> 1);
+constexpr uint32_t kFloatMagnitudeMask = 0x7FFFFFFF;
+constexpr uint32_t kFloatMantissaMask = (1u << kFloatMantissaBits) - 1;
+constexpr uint32_t kFloatImplicitBit = 1u << kFloatMantissaBits;
+constexpr uint32_t kFloatInfinity = 0xFFu << kFloatMantissaBits;
+// The float mantissa bits a half drops, and half of their range (the
+// rounding point).
+constexpr uint32_t kDroppedBitsMask = (1u << kMantissaShift) - 1;
+constexpr uint32_t kDroppedHalfway = 1u << (kMantissaShift - 1);
+// Biased float exponents: from this one on a float overflows a half; from
+// this one on it is a normal half; and the float exponent that becomes the
+// half exponent 0 after rebiasing.
+constexpr uint32_t kFirstOverflowExponent =
+    kFloatExponentBias + kHalfExponentBias + 1;
+constexpr uint32_t kFirstNormalHalfExponent =
+    kFloatExponentBias - kHalfExponentBias + 1;
+constexpr uint32_t kHalfRebias = kFloatExponentBias - kHalfExponentBias;
+// Subnormal halves count units of 2^-24; the shift that turns a float
+// mantissa (with its implicit bit) into such units is
+// kSubnormalShiftBase - exponent, and floats shifted further are zero.
+constexpr int kHalfSubnormalUnitExponent = 24;
+constexpr int kSubnormalShiftBase =
+    kFloatExponentBias + kFloatMantissaBits - kHalfSubnormalUnitExponent;
+
+// --- The zip format (PKWARE APPNOTE.TXT)
+// --------------------------------------
+
+namespace zip {
+
+constexpr uint64_t kLocalHeaderSignature = 0x04034b50;
+constexpr uint64_t kCentralHeaderSignature = 0x02014b50;
+constexpr uint64_t kEndRecordSignature = 0x06054b50;
+constexpr uint64_t kZip64EndRecordSignature = 0x06064b50;
+constexpr uint64_t kZip64LocatorSignature = 0x07064b50;
+
+// Local file header: fixed part, then the name and the extra field.
+constexpr size_t kLocalHeaderSize = 30;
+constexpr size_t kLocalNameLengthAt = 26;
+constexpr size_t kLocalExtraLengthAt = 28;
+
+// Central directory file header.
+constexpr size_t kCentralHeaderSize = 46;
+constexpr size_t kCentralMethodAt = 10;
+constexpr size_t kCentralCrcAt = 16;
+constexpr size_t kCentralPackedSizeAt = 20;
+constexpr size_t kCentralSizeAt = 24;
+constexpr size_t kCentralNameLengthAt = 28;
+constexpr size_t kCentralExtraLengthAt = 30;
+constexpr size_t kCentralCommentLengthAt = 32;
+constexpr size_t kCentralLocalHeaderAt = 42;
+
+// End of central directory record, followed by a comment of at most
+// kMaxCommentSize bytes.
+constexpr size_t kEndRecordSize = 22;
+constexpr size_t kEndEntriesAt = 10;
+constexpr size_t kEndDirectoryAt = 16;
+constexpr size_t kMaxCommentSize = 0xFFFF;
+
+// ZIP64 end of central directory locator (just before the end record) and
+// record.
+constexpr size_t kZip64LocatorSize = 20;
+constexpr size_t kZip64LocatorRecordAt = 8;
+constexpr size_t kZip64RecordSize = 56;
+constexpr size_t kZip64EntriesAt = 32;
+constexpr size_t kZip64DirectoryAt = 48;
+
+// Extra fields: an id and a length (2 bytes each), then the data.
+constexpr size_t kExtraHeaderSize = 4;
+constexpr size_t kExtraLengthAt = 2;
+constexpr uint64_t kZip64ExtraId = 0x0001;
+
+// Fields that hold these values are saturated: the ZIP64 records have them.
+constexpr uint64_t kSaturated16 = 0xFFFF;
+constexpr uint64_t kSaturated32 = 0xFFFFFFFF;
+
+constexpr int kStored = 0;
+constexpr int kDeflated = 8;
+
+// What WriteNpz records: version 2.0 (to make and to extract), no flags,
+// the DOS time 00:00 of the DOS date 1980-01-01.
+constexpr uint64_t kVersion = 20;
+constexpr uint64_t kDosDate1980 = 0x21;
+
+}  // namespace zip
+
+// zlib's default memory level for deflate.
+constexpr int kDeflateMemoryLevel = 8;
 
 [[noreturn]] void Fail(const std::string& message) {
   throw std::runtime_error(message);
@@ -29,105 +153,147 @@ void WriteBytes(const std::string& path, const std::vector<uint8_t>& bytes) {
   if (!out) Fail("cannot write " + path);
 }
 
-uint64_t Le(const uint8_t* p, int bytes) {
-  uint64_t v = 0;
-  for (int k = bytes - 1; k >= 0; --k) v = (v << 8) | p[k];
-  return v;
+// The little-endian unsigned number of `width` bytes at `bytes`.
+uint64_t LoadLittleEndian(const uint8_t* bytes, size_t width) {
+  uint64_t value = 0;
+  for (size_t k = width; k-- > 0;) value = (value << CHAR_BIT) | bytes[k];
+  return value;
+}
+uint64_t Load16(const uint8_t* bytes) {
+  return LoadLittleEndian(bytes, sizeof(uint16_t));
+}
+uint64_t Load32(const uint8_t* bytes) {
+  return LoadLittleEndian(bytes, sizeof(uint32_t));
+}
+uint64_t Load64(const uint8_t* bytes) {
+  return LoadLittleEndian(bytes, sizeof(uint64_t));
 }
 
-void PutLe(uint64_t v, int bytes, std::vector<uint8_t>* out) {
-  for (int k = 0; k < bytes; ++k) {
-    out->push_back(static_cast<uint8_t>(v >> (8 * k)));
+// Appends `value` as a little-endian number of `width` bytes.
+void StoreLittleEndian(uint64_t value, size_t width,
+                       std::vector<uint8_t>* out) {
+  for (size_t k = 0; k < width; ++k) {
+    out->push_back(static_cast<uint8_t>(value >> (CHAR_BIT * k)));
   }
 }
+void Store16(uint64_t value, std::vector<uint8_t>* out) {
+  StoreLittleEndian(value, sizeof(uint16_t), out);
+}
+void Store32(uint64_t value, std::vector<uint8_t>* out) {
+  StoreLittleEndian(value, sizeof(uint32_t), out);
+}
 
-float HalfToFloat(uint16_t h) {
-  const uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
-  const uint32_t exponent = (h >> 10) & 0x1F;
-  uint32_t mantissa = h & 0x3FF;
-  uint32_t bits;
+float HalfToFloat(uint16_t half) {
+  const uint32_t sign = static_cast<uint32_t>(half & kHalfSignBit)
+                        << kSignShift;
+  const uint32_t exponent = (half >> kHalfMantissaBits) & kHalfExponentMask;
+  uint32_t mantissa = half & kHalfMantissaMask;
+  uint32_t bits = 0;
   if (exponent == 0) {
     if (mantissa == 0) {
       bits = sign;
     } else {  // Subnormal: normalise.
-      int e = -1;
+      int shifts = -1;
       do {
-        ++e;
+        ++shifts;
         mantissa <<= 1;
-      } while ((mantissa & 0x400) == 0);
-      bits = sign | static_cast<uint32_t>(127 - 15 - e) << 23 |
-             (mantissa & 0x3FF) << 13;
+      } while ((mantissa & kHalfImplicitBit) == 0);
+      bits =
+          sign |
+          static_cast<uint32_t>(kFloatExponentBias - kHalfExponentBias - shifts)
+              << kFloatMantissaBits |
+          (mantissa & kHalfMantissaMask) << kMantissaShift;
     }
-  } else if (exponent == 0x1F) {
-    bits = sign | 0x7F800000 | mantissa << 13;
+  } else if (exponent == kHalfExponentMask) {  // Infinity or NaN.
+    bits = sign | kFloatInfinity | mantissa << kMantissaShift;
   } else {
-    bits = sign | (exponent + 127 - 15) << 23 | mantissa << 13;
+    bits = sign |
+           (exponent + kFloatExponentBias - kHalfExponentBias)
+               << kFloatMantissaBits |
+           mantissa << kMantissaShift;
   }
-  float f;
-  std::memcpy(&f, &bits, sizeof(f));
-  return f;
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 // Round to nearest even, as numpy's float -> float16 cast.
-uint16_t FloatToHalf(float f) {
-  uint32_t x;
-  std::memcpy(&x, &f, sizeof(x));
-  const uint16_t sign = static_cast<uint16_t>((x >> 16) & 0x8000);
-  const uint32_t magnitude = x & 0x7FFFFFFF;
-  const uint32_t exponent = magnitude >> 23;
-  if (magnitude > 0x7F800000) {  // NaN: keep it quiet.
-    return static_cast<uint16_t>(sign | 0x7E00 | ((magnitude >> 13) & 0x3FF));
+uint16_t FloatToHalf(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint16_t sign =
+      static_cast<uint16_t>((bits >> kSignShift) & kHalfSignBit);
+  const uint32_t magnitude = bits & kFloatMagnitudeMask;
+  const uint32_t exponent = magnitude >> kFloatMantissaBits;
+  if (magnitude > kFloatInfinity) {  // NaN: keep it quiet.
+    return static_cast<uint16_t>(
+        sign | kHalfQuietNan |
+        ((magnitude >> kMantissaShift) & kHalfMantissaMask));
   }
-  if (exponent >= 143) return static_cast<uint16_t>(sign | 0x7C00);  // Inf.
-  if (exponent >= 113) {  // Normal half (a carry may round up to Inf).
-    uint32_t h = ((exponent - 112) << 10) | ((magnitude >> 13) & 0x3FF);
-    const uint32_t rest = magnitude & 0x1FFF;
-    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) ++h;
-    return static_cast<uint16_t>(sign | h);
+  if (exponent >= kFirstOverflowExponent) {
+    return static_cast<uint16_t>(sign | kHalfInfinity);
+  }
+  if (exponent >= kFirstNormalHalfExponent) {
+    // Normal half (a carry may round up to infinity).
+    uint32_t half = ((exponent - kHalfRebias) << kHalfMantissaBits) |
+                    ((magnitude >> kMantissaShift) & kHalfMantissaMask);
+    const uint32_t dropped = magnitude & kDroppedBitsMask;
+    if (dropped > kDroppedHalfway ||
+        (dropped == kDroppedHalfway && (half & 1))) {
+      ++half;
+    }
+    return static_cast<uint16_t>(sign | half);
   }
   // Subnormal half: units of 2^-24.
-  const int shift = 126 - static_cast<int>(exponent);
-  if (exponent == 0 || shift > 24) return sign;
-  const uint32_t mantissa = (magnitude & 0x7FFFFF) | 0x800000;
-  uint32_t h = mantissa >> shift;
-  const uint32_t rest = mantissa & ((1u << shift) - 1);
-  const uint32_t half = 1u << (shift - 1);
-  if (rest > half || (rest == half && (h & 1))) ++h;
-  return static_cast<uint16_t>(sign | h);
+  const int shift = kSubnormalShiftBase - static_cast<int>(exponent);
+  if (exponent == 0 || shift > kHalfSubnormalUnitExponent) return sign;
+  const uint32_t mantissa =
+      (magnitude & kFloatMantissaMask) | kFloatImplicitBit;
+  uint32_t half = mantissa >> shift;
+  const uint32_t dropped = mantissa & ((1u << shift) - 1);
+  const uint32_t halfway = 1u << (shift - 1);
+  if (dropped > halfway || (dropped == halfway && (half & 1))) ++half;
+  return static_cast<uint16_t>(sign | half);
 }
 
 template <typename T>
-T Load(const uint8_t* p) {
-  T v;
-  std::memcpy(&v, p, sizeof(T));
-  return v;
+T Load(const uint8_t* bytes) {
+  T value;
+  std::memcpy(&value, bytes, sizeof(T));
+  return value;
 }
 
-// Element k as a double.
-double Element(const NpyArray& a, int64_t k) {
-  const uint8_t* p = a.data.data() + k * a.item_size;
-  switch (a.kind) {
+// Element `index` as a double.
+double Element(const NpyArray& array, int64_t index) {
+  const uint8_t* bytes = array.data.data() + index * array.item_size;
+  switch (array.kind) {
     case 'f':
-      if (a.item_size == 2) return HalfToFloat(Load<uint16_t>(p));
-      if (a.item_size == 4) return Load<float>(p);
-      if (a.item_size == 8) return Load<double>(p);
+      if (array.item_size == kSizeOf<uint16_t>) {
+        return HalfToFloat(Load<uint16_t>(bytes));
+      }
+      if (array.item_size == kSizeOf<float>) return Load<float>(bytes);
+      if (array.item_size == kSizeOf<double>) return Load<double>(bytes);
       break;
     case 'i':
-      if (a.item_size == 1) return Load<int8_t>(p);
-      if (a.item_size == 2) return Load<int16_t>(p);
-      if (a.item_size == 4) return Load<int32_t>(p);
-      if (a.item_size == 8) return static_cast<double>(Load<int64_t>(p));
+      if (array.item_size == kSizeOf<int8_t>) return Load<int8_t>(bytes);
+      if (array.item_size == kSizeOf<int16_t>) return Load<int16_t>(bytes);
+      if (array.item_size == kSizeOf<int32_t>) return Load<int32_t>(bytes);
+      if (array.item_size == kSizeOf<int64_t>) {
+        return static_cast<double>(Load<int64_t>(bytes));
+      }
       break;
     case 'u':
     case 'b':
-      if (a.item_size == 1) return Load<uint8_t>(p);
-      if (a.item_size == 2) return Load<uint16_t>(p);
-      if (a.item_size == 4) return Load<uint32_t>(p);
-      if (a.item_size == 8) return static_cast<double>(Load<uint64_t>(p));
+      if (array.item_size == kSizeOf<uint8_t>) return Load<uint8_t>(bytes);
+      if (array.item_size == kSizeOf<uint16_t>) return Load<uint16_t>(bytes);
+      if (array.item_size == kSizeOf<uint32_t>) return Load<uint32_t>(bytes);
+      if (array.item_size == kSizeOf<uint64_t>) {
+        return static_cast<double>(Load<uint64_t>(bytes));
+      }
       break;
   }
-  Fail(std::string("unsupported dtype ") + a.kind +
-       std::to_string(a.item_size));
+  Fail(std::string("unsupported dtype ") + array.kind +
+       std::to_string(array.item_size));
 }
 
 std::string ShapeText(const std::vector<int64_t>& shape) {
@@ -144,6 +310,7 @@ std::vector<uint8_t> Inflate(const uint8_t* data, size_t size,
                              size_t expected) {
   std::vector<uint8_t> out(expected);
   z_stream stream{};
+  // A negative window size: raw deflate data, as zip members hold.
   if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) Fail("inflateInit2 failed");
   stream.next_in = const_cast<Bytef*>(data);
   stream.avail_in = static_cast<uInt>(size);
@@ -159,8 +326,8 @@ std::vector<uint8_t> Inflate(const uint8_t* data, size_t size,
 
 std::vector<uint8_t> Deflate(const std::vector<uint8_t>& data) {
   z_stream stream{};
-  if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8,
-                   Z_DEFAULT_STRATEGY) != Z_OK) {
+  if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS,
+                   kDeflateMemoryLevel, Z_DEFAULT_STRATEGY) != Z_OK) {
     Fail("deflateInit2 failed");
   }
   std::vector<uint8_t> out(deflateBound(&stream, data.size()));
@@ -175,18 +342,34 @@ std::vector<uint8_t> Deflate(const std::vector<uint8_t>& data) {
   return out;
 }
 
+// An array of `kind` with the item size of T, holding `values`.
+template <typename T>
+NpyArray FromValues(char kind, const std::vector<T>& values,
+                    std::vector<int64_t> shape) {
+  NpyArray array;
+  array.kind = kind;
+  array.item_size = static_cast<int>(sizeof(T));
+  array.shape = std::move(shape);
+  if (array.size() != static_cast<int64_t>(values.size())) {
+    Fail("shape mismatch");
+  }
+  array.data.resize(values.size() * sizeof(T));
+  std::memcpy(array.data.data(), values.data(), array.data.size());
+  return array;
+}
+
 }  // namespace
 
 int64_t NpyArray::size() const {
-  int64_t n = 1;
-  for (int64_t d : shape) n *= d;
-  return n;
+  int64_t count = 1;
+  for (int64_t dimension : shape) count *= dimension;
+  return count;
 }
 
 int64_t NpyArray::columns() const {
-  int64_t n = 1;
-  for (size_t k = 1; k < shape.size(); ++k) n *= shape[k];
-  return n;
+  int64_t count = 1;
+  for (size_t k = 1; k < shape.size(); ++k) count *= shape[k];
+  return count;
 }
 
 std::vector<double> NpyArray::ToDoubles() const {
@@ -206,141 +389,142 @@ std::vector<float> NpyArray::ToFloats() const {
 std::vector<int64_t> NpyArray::ToInts() const {
   if (kind == 'f') Fail("integer array expected");
   std::vector<int64_t> out(static_cast<size_t>(size()));
-  const bool wide = item_size == 8;
+  // 64-bit integers are copied: a double cannot hold them all.
+  const bool wide = item_size == kSizeOf<int64_t>;
   for (int64_t k = 0; k < size(); ++k) {
-    const uint8_t* p = data.data() + k * item_size;
-    out[k] = wide ? Load<int64_t>(p)
-                  : static_cast<int64_t>(Element(*this, k));
+    const uint8_t* bytes = data.data() + k * item_size;
+    out[k] =
+        wide ? Load<int64_t>(bytes) : static_cast<int64_t>(Element(*this, k));
   }
   return out;
 }
 
 NpyArray NpyArray::FromDoubles(const std::vector<double>& values,
                                std::vector<int64_t> shape) {
-  NpyArray a;
-  a.kind = 'f';
-  a.item_size = 8;
-  a.shape = std::move(shape);
-  if (a.size() != static_cast<int64_t>(values.size())) Fail("shape mismatch");
-  a.data.resize(values.size() * sizeof(double));
-  std::memcpy(a.data.data(), values.data(), a.data.size());
-  return a;
+  return FromValues('f', values, std::move(shape));
 }
 
 NpyArray NpyArray::FromFloats(const std::vector<float>& values,
                               std::vector<int64_t> shape) {
-  NpyArray a;
-  a.kind = 'f';
-  a.item_size = 4;
-  a.shape = std::move(shape);
-  if (a.size() != static_cast<int64_t>(values.size())) Fail("shape mismatch");
-  a.data.resize(values.size() * sizeof(float));
-  std::memcpy(a.data.data(), values.data(), a.data.size());
-  return a;
+  return FromValues('f', values, std::move(shape));
 }
 
 NpyArray NpyArray::FromInts(const std::vector<int32_t>& values,
                             std::vector<int64_t> shape) {
-  NpyArray a;
-  a.kind = 'i';
-  a.item_size = 4;
-  a.shape = std::move(shape);
-  if (a.size() != static_cast<int64_t>(values.size())) Fail("shape mismatch");
-  a.data.resize(values.size() * sizeof(int32_t));
-  std::memcpy(a.data.data(), values.data(), a.data.size());
-  return a;
+  return FromValues('i', values, std::move(shape));
 }
 
 NpyArray NpyArray::FromHalfs(const std::vector<float>& values,
                              std::vector<int64_t> shape) {
   std::vector<uint16_t> bits(values.size());
   for (size_t k = 0; k < values.size(); ++k) bits[k] = FloatToHalf(values[k]);
-  NpyArray a = Of(bits, std::move(shape));
-  a.kind = 'f';
-  return a;
+  NpyArray array = Of(bits, std::move(shape));
+  array.kind = 'f';
+  return array;
 }
 
 NpyArray NpyArray::FromBools(const std::vector<uint8_t>& values,
                              std::vector<int64_t> shape) {
   std::vector<uint8_t> bytes(values.size());
   for (size_t k = 0; k < values.size(); ++k) bytes[k] = values[k] != 0;
-  NpyArray a = Of(bytes, std::move(shape));
-  a.kind = 'b';
-  return a;
+  NpyArray array = Of(bytes, std::move(shape));
+  array.kind = 'b';
+  return array;
 }
 
 NpyArray ParseNpy(const std::vector<uint8_t>& bytes) {
-  static const char kMagic[] = "\x93NUMPY";
-  if (bytes.size() < 10 || std::memcmp(bytes.data(), kMagic, 6) != 0) {
+  if (bytes.size() < kNpyMinSize ||
+      std::memcmp(bytes.data(), kNpyMagic, kNpyMagicSize) != 0) {
     Fail("not a .npy file");
   }
-  const int major = bytes[6];
-  const size_t length_bytes = major == 1 ? 2 : 4;
-  if (bytes.size() < 8 + length_bytes) Fail("truncated .npy header");
-  const size_t header_length =
-      static_cast<size_t>(Le(bytes.data() + 8, static_cast<int>(length_bytes)));
-  const size_t data_start = 8 + length_bytes + header_length;
+  const int major = bytes[kNpyMajorVersionAt];
+  const size_t length_bytes =
+      major == 1 ? kNpyV1LengthBytes : kNpyV2LengthBytes;
+  if (bytes.size() < kNpyHeaderLengthAt + length_bytes) {
+    Fail("truncated .npy header");
+  }
+  const size_t header_length = static_cast<size_t>(
+      LoadLittleEndian(bytes.data() + kNpyHeaderLengthAt, length_bytes));
+  const size_t header_start = kNpyHeaderLengthAt + length_bytes;
+  const size_t data_start = header_start + header_length;
   if (bytes.size() < data_start) Fail("truncated .npy header");
-  const std::string header(bytes.begin() + 8 + length_bytes,
+  const std::string header(bytes.begin() + header_start,
                            bytes.begin() + data_start);
   static const std::regex kDescr("'descr':\\s*'([<>|=])([a-zA-Z])(\\d+)'");
   static const std::regex kFortran("'fortran_order':\\s*(True|False)");
   static const std::regex kShape("'shape':\\s*\\(([^)]*)\\)");
-  std::smatch descr, fortran, shape;
+  // The capture groups of kDescr.
+  constexpr int kByteOrderGroup = 1;
+  constexpr int kKindGroup = 2;
+  constexpr int kItemSizeGroup = 3;
+  std::smatch descr;
+  std::smatch fortran;
+  std::smatch shape;
   if (!std::regex_search(header, descr, kDescr) ||
       !std::regex_search(header, fortran, kFortran) ||
       !std::regex_search(header, shape, kShape)) {
     Fail("unsupported .npy header " + header);
   }
-  if (descr[1] == ">") Fail("big-endian .npy arrays are not supported");
-  NpyArray a;
-  a.kind = descr[2].str()[0];
-  a.item_size = std::stoi(descr[3]);
-  if (a.kind != 'f' && a.kind != 'i' && a.kind != 'u' && a.kind != 'b') {
-    Fail("unsupported dtype " + descr[2].str() + descr[3].str());
+  if (descr[kByteOrderGroup] == ">") {
+    Fail("big-endian .npy arrays are not supported");
   }
-  std::istringstream dims(shape[1].str());
-  std::string dim;
-  while (std::getline(dims, dim, ',')) {
-    if (dim.find_first_not_of(" ") != std::string::npos) {
-      a.shape.push_back(std::stoll(dim));
+  NpyArray array;
+  array.kind = descr[kKindGroup].str()[0];
+  array.item_size = std::stoi(descr[kItemSizeGroup]);
+  if (array.kind != 'f' && array.kind != 'i' && array.kind != 'u' &&
+      array.kind != 'b') {
+    Fail("unsupported dtype " + descr[kKindGroup].str() +
+         descr[kItemSizeGroup].str());
+  }
+  std::istringstream dimensions(shape[1].str());
+  std::string dimension;
+  while (std::getline(dimensions, dimension, ',')) {
+    if (dimension.find_first_not_of(" ") != std::string::npos) {
+      array.shape.push_back(std::stoll(dimension));
     }
   }
-  const size_t n = static_cast<size_t>(a.size()) * a.item_size;
-  if (bytes.size() < data_start + n) Fail("truncated .npy data");
-  a.data.assign(bytes.begin() + data_start, bytes.begin() + data_start + n);
-  if (fortran[1] == "True" && a.shape.size() > 1) {
+  const size_t data_size = static_cast<size_t>(array.size()) * array.item_size;
+  if (bytes.size() < data_start + data_size) Fail("truncated .npy data");
+  array.data.assign(bytes.begin() + data_start,
+                    bytes.begin() + data_start + data_size);
+  if (fortran[1] == "True" && array.shape.size() > 1) {
     // Column-major (numpy saves transposed views so): reorder to C order.
-    const std::vector<uint8_t> column_major = std::move(a.data);
-    a.data.assign(n, 0);
-    const size_t dims = a.shape.size();
-    std::vector<int64_t> index(dims, 0);
-    for (int64_t c = 0; c < a.size(); ++c) {
-      int64_t f = 0;  // Fortran offset of the C-order element `c`.
-      for (size_t d = dims; d-- > 0;) f = f * a.shape[d] + index[d];
-      std::memcpy(a.data.data() + c * a.item_size,
-                  column_major.data() + f * a.item_size, a.item_size);
-      for (size_t d = dims; d-- > 0;) {  // Next C-order index.
-        if (++index[d] < a.shape[d]) break;
-        index[d] = 0;
+    const std::vector<uint8_t> column_major = std::move(array.data);
+    array.data.assign(data_size, 0);
+    const size_t rank = array.shape.size();
+    std::vector<int64_t> index(rank, 0);
+    for (int64_t c_offset = 0; c_offset < array.size(); ++c_offset) {
+      int64_t fortran_offset = 0;  // Of the C-order element `c_offset`.
+      for (size_t axis = rank; axis-- > 0;) {
+        fortran_offset = fortran_offset * array.shape[axis] + index[axis];
+      }
+      std::memcpy(array.data.data() + c_offset * array.item_size,
+                  column_major.data() + fortran_offset * array.item_size,
+                  array.item_size);
+      for (size_t axis = rank; axis-- > 0;) {  // Next C-order index.
+        if (++index[axis] < array.shape[axis]) break;
+        index[axis] = 0;
       }
     }
   }
-  return a;
+  return array;
 }
 
 std::vector<uint8_t> SerializeNpy(const NpyArray& array) {
-  std::string header = std::string("{'descr': '") +
-                       (array.item_size == 1 ? '|' : '<') + array.kind +
-                       std::to_string(array.item_size) +
-                       "', 'fortran_order': False, 'shape': " +
-                       ShapeText(array.shape) + ", }";
-  // Magic, version and length take 10 bytes; pad to a multiple of 64.
-  const size_t total = 10 + header.size() + 1;
-  header.append((64 - total % 64) % 64, ' ');
+  std::string header =
+      std::string("{'descr': '") + (array.item_size == 1 ? '|' : '<') +
+      array.kind + std::to_string(array.item_size) +
+      "', 'fortran_order': False, 'shape': " + ShapeText(array.shape) + ", }";
+  // The preamble, the header and its newline: padded to the alignment.
+  const size_t total = kNpyMinSize + header.size() + 1;
+  header.append(
+      (kNpyHeaderAlignment - total % kNpyHeaderAlignment) % kNpyHeaderAlignment,
+      ' ');
   header.push_back('\n');
-  std::vector<uint8_t> out = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
-  PutLe(header.size(), 2, &out);
+  std::vector<uint8_t> out(kNpyMagic, kNpyMagic + kNpyMagicSize);
+  out.push_back(kNpyWrittenMajor);
+  out.push_back(kNpyWrittenMinor);
+  Store16(header.size(), &out);
   out.insert(out.end(), header.begin(), header.end());
   out.insert(out.end(), array.data.begin(), array.data.end());
   return out;
@@ -349,8 +533,8 @@ std::vector<uint8_t> SerializeNpy(const NpyArray& array) {
 NpyArray ReadNpy(const std::string& path) {
   try {
     return ParseNpy(ReadBytes(path));
-  } catch (const std::runtime_error& e) {
-    throw std::runtime_error(path + ": " + e.what());
+  } catch (const std::runtime_error& error) {
+    throw std::runtime_error(path + ": " + error.what());
   }
 }
 
@@ -359,92 +543,109 @@ void WriteNpy(const std::string& path, const NpyArray& array) {
 }
 
 NpzArchive ReadNpz(const std::string& path) {
-  const std::vector<uint8_t> zip = ReadBytes(path);
-  const uint8_t* z = zip.data();
+  const std::vector<uint8_t> archive = ReadBytes(path);
+  const uint8_t* bytes = archive.data();
   const auto fail = [&](const std::string& message) {
     Fail(path + ": " + message);
   };
-  // End of central directory (followed by a comment of up to 64 KiB).
-  if (zip.size() < 22) fail("not a zip archive");
-  size_t eocd = zip.size() - 22;
-  while (Le(z + eocd, 4) != 0x06054b50) {
-    if (eocd == 0 || zip.size() - eocd > 22 + 0xFFFF) {
+  // The end record, searched backwards over the comment.
+  if (archive.size() < zip::kEndRecordSize) fail("not a zip archive");
+  size_t end_record = archive.size() - zip::kEndRecordSize;
+  while (Load32(bytes + end_record) != zip::kEndRecordSignature) {
+    if (end_record == 0 || archive.size() - end_record >
+                               zip::kEndRecordSize + zip::kMaxCommentSize) {
       fail("not a zip archive");
     }
-    --eocd;
+    --end_record;
   }
-  uint64_t entries = Le(z + eocd + 10, 2);
-  uint64_t directory = Le(z + eocd + 16, 4);
-  if ((entries == 0xFFFF || directory == 0xFFFFFFFF) && eocd >= 20 &&
-      Le(z + eocd - 20, 4) == 0x07064b50) {
-    const uint64_t record = Le(z + eocd - 20 + 8, 8);
-    if (record + 56 > zip.size() || Le(z + record, 4) != 0x06064b50) {
+  uint64_t entries = Load16(bytes + end_record + zip::kEndEntriesAt);
+  uint64_t directory = Load32(bytes + end_record + zip::kEndDirectoryAt);
+  if ((entries == zip::kSaturated16 || directory == zip::kSaturated32) &&
+      end_record >= zip::kZip64LocatorSize &&
+      Load32(bytes + end_record - zip::kZip64LocatorSize) ==
+          zip::kZip64LocatorSignature) {
+    const uint64_t record = Load64(bytes + end_record - zip::kZip64LocatorSize +
+                                   zip::kZip64LocatorRecordAt);
+    if (record + zip::kZip64RecordSize > archive.size() ||
+        Load32(bytes + record) != zip::kZip64EndRecordSignature) {
       fail("bad ZIP64 end record");
     }
-    entries = Le(z + record + 32, 8);
-    directory = Le(z + record + 48, 8);
+    entries = Load64(bytes + record + zip::kZip64EntriesAt);
+    directory = Load64(bytes + record + zip::kZip64DirectoryAt);
   }
   NpzArchive out;
-  size_t at = static_cast<size_t>(directory);
+  size_t header = static_cast<size_t>(directory);
   for (uint64_t k = 0; k < entries; ++k) {
-    if (at + 46 > zip.size() || Le(z + at, 4) != 0x02014b50) {
+    if (header + zip::kCentralHeaderSize > archive.size() ||
+        Load32(bytes + header) != zip::kCentralHeaderSignature) {
       fail("bad central directory");
     }
-    const int method = static_cast<int>(Le(z + at + 10, 2));
-    const uint32_t crc = static_cast<uint32_t>(Le(z + at + 16, 4));
-    uint64_t packed = Le(z + at + 20, 4);
-    uint64_t size = Le(z + at + 24, 4);
-    const size_t name_length = Le(z + at + 28, 2);
-    const size_t extra_length = Le(z + at + 30, 2);
-    const size_t comment_length = Le(z + at + 32, 2);
-    uint64_t local = Le(z + at + 42, 4);
-    const std::string name(reinterpret_cast<const char*>(z + at + 46),
-                           name_length);
+    const int method =
+        static_cast<int>(Load16(bytes + header + zip::kCentralMethodAt));
+    const uint32_t crc =
+        static_cast<uint32_t>(Load32(bytes + header + zip::kCentralCrcAt));
+    uint64_t packed = Load32(bytes + header + zip::kCentralPackedSizeAt);
+    uint64_t size = Load32(bytes + header + zip::kCentralSizeAt);
+    const size_t name_length =
+        Load16(bytes + header + zip::kCentralNameLengthAt);
+    const size_t extra_length =
+        Load16(bytes + header + zip::kCentralExtraLengthAt);
+    const size_t comment_length =
+        Load16(bytes + header + zip::kCentralCommentLengthAt);
+    uint64_t local = Load32(bytes + header + zip::kCentralLocalHeaderAt);
+    const std::string name(
+        reinterpret_cast<const char*>(bytes + header + zip::kCentralHeaderSize),
+        name_length);
     // ZIP64 extra field: the 8-byte values of the saturated fields.
-    size_t e = at + 46 + name_length;
-    const size_t extra_end = e + extra_length;
-    while (e + 4 <= extra_end) {
-      const uint64_t id = Le(z + e, 2);
-      const size_t length = Le(z + e + 2, 2);
-      if (id == 0x0001) {
-        size_t f = e + 4;
-        if (size == 0xFFFFFFFF) {
-          size = Le(z + f, 8);
-          f += 8;
+    size_t extra = header + zip::kCentralHeaderSize + name_length;
+    const size_t extra_end = extra + extra_length;
+    while (extra + zip::kExtraHeaderSize <= extra_end) {
+      const uint64_t id = Load16(bytes + extra);
+      const size_t length = Load16(bytes + extra + zip::kExtraLengthAt);
+      if (id == zip::kZip64ExtraId) {
+        size_t field = extra + zip::kExtraHeaderSize;
+        if (size == zip::kSaturated32) {
+          size = Load64(bytes + field);
+          field += sizeof(uint64_t);
         }
-        if (packed == 0xFFFFFFFF) {
-          packed = Le(z + f, 8);
-          f += 8;
+        if (packed == zip::kSaturated32) {
+          packed = Load64(bytes + field);
+          field += sizeof(uint64_t);
         }
-        if (local == 0xFFFFFFFF) local = Le(z + f, 8);
+        if (local == zip::kSaturated32) local = Load64(bytes + field);
       }
-      e += 4 + length;
+      extra += zip::kExtraHeaderSize + length;
     }
-    at = extra_end + comment_length;
-    if (local + 30 > zip.size() || Le(z + local, 4) != 0x04034b50) {
+    header = extra_end + comment_length;
+    if (local + zip::kLocalHeaderSize > archive.size() ||
+        Load32(bytes + local) != zip::kLocalHeaderSignature) {
       fail("bad local header of " + name);
     }
-    const size_t data = static_cast<size_t>(local) + 30 +
-                        Le(z + local + 26, 2) + Le(z + local + 28, 2);
-    if (data + packed > zip.size()) fail("truncated member " + name);
-    std::vector<uint8_t> bytes;
-    if (method == 0) {
-      bytes.assign(z + data, z + data + packed);
-    } else if (method == 8) {
-      bytes = Inflate(z + data, static_cast<size_t>(packed),
-                      static_cast<size_t>(size));
+    const size_t data = static_cast<size_t>(local) + zip::kLocalHeaderSize +
+                        Load16(bytes + local + zip::kLocalNameLengthAt) +
+                        Load16(bytes + local + zip::kLocalExtraLengthAt);
+    if (data + packed > archive.size()) fail("truncated member " + name);
+    std::vector<uint8_t> member;
+    if (method == zip::kStored) {
+      member.assign(bytes + data, bytes + data + packed);
+    } else if (method == zip::kDeflated) {
+      member = Inflate(bytes + data, static_cast<size_t>(packed),
+                       static_cast<size_t>(size));
     } else {
       fail("unsupported compression of " + name);
     }
-    if (crc32(0L, bytes.data(), static_cast<uInt>(bytes.size())) != crc) {
+    if (crc32(0L, member.data(), static_cast<uInt>(member.size())) != crc) {
       fail("CRC mismatch in " + name);
     }
+    static const std::string kNpySuffix = ".npy";
     std::string key = name;
-    if (key.size() > 4 && key.compare(key.size() - 4, 4, ".npy") == 0) {
-      key.resize(key.size() - 4);
+    if (key.size() > kNpySuffix.size() &&
+        key.compare(key.size() - kNpySuffix.size(), kNpySuffix.size(),
+                    kNpySuffix) == 0) {
+      key.resize(key.size() - kNpySuffix.size());
     }
     try {
-      out[key] = ParseNpy(bytes);
+      out[key] = ParseNpy(member);
     } catch (const std::runtime_error& error) {
       fail(name + ": " + error.what());
     }
@@ -454,63 +655,63 @@ NpzArchive ReadNpz(const std::string& path) {
 
 void WriteNpz(const std::string& path, const NpzArchive& arrays,
               bool compress) {
-  std::vector<uint8_t> zip;
+  std::vector<uint8_t> archive;
   std::vector<uint8_t> directory;
-  const uint16_t method = compress ? 8 : 0;
+  const uint16_t method = compress ? zip::kDeflated : zip::kStored;
   for (const auto& [key, array] : arrays) {
     const std::string name = key + ".npy";
     const std::vector<uint8_t> raw = SerializeNpy(array);
     const std::vector<uint8_t> packed = compress ? Deflate(raw) : raw;
     const uint32_t crc = static_cast<uint32_t>(
         crc32(0L, raw.data(), static_cast<uInt>(raw.size())));
-    if (raw.size() >= 0xFFFFFFFFu || zip.size() >= 0xFFFFFFFFu) {
+    if (raw.size() >= zip::kSaturated32 ||
+        archive.size() >= zip::kSaturated32) {
       Fail(path + ": members of 4 GiB or more are not supported");
     }
-    const size_t local = zip.size();
-    // Local header: version 2.0, no flags, DOS date 1980-01-01.
-    PutLe(0x04034b50, 4, &zip);
-    PutLe(20, 2, &zip);
-    PutLe(0, 2, &zip);
-    PutLe(method, 2, &zip);
-    PutLe(0, 2, &zip);
-    PutLe(0x21, 2, &zip);
-    PutLe(crc, 4, &zip);
-    PutLe(packed.size(), 4, &zip);
-    PutLe(raw.size(), 4, &zip);
-    PutLe(name.size(), 2, &zip);
-    PutLe(0, 2, &zip);
-    zip.insert(zip.end(), name.begin(), name.end());
-    zip.insert(zip.end(), packed.begin(), packed.end());
-    PutLe(0x02014b50, 4, &directory);
-    PutLe(20, 2, &directory);
-    PutLe(20, 2, &directory);
-    PutLe(0, 2, &directory);
-    PutLe(method, 2, &directory);
-    PutLe(0, 2, &directory);
-    PutLe(0x21, 2, &directory);
-    PutLe(crc, 4, &directory);
-    PutLe(packed.size(), 4, &directory);
-    PutLe(raw.size(), 4, &directory);
-    PutLe(name.size(), 2, &directory);
-    PutLe(0, 2, &directory);  // Extra.
-    PutLe(0, 2, &directory);  // Comment.
-    PutLe(0, 2, &directory);  // Disk.
-    PutLe(0, 2, &directory);  // Internal attributes.
-    PutLe(0, 4, &directory);  // External attributes.
-    PutLe(local, 4, &directory);
+    const size_t local = archive.size();
+    Store32(zip::kLocalHeaderSignature, &archive);
+    Store16(zip::kVersion, &archive);  // Needed to extract.
+    Store16(0, &archive);              // Flags.
+    Store16(method, &archive);
+    Store16(0, &archive);  // Time.
+    Store16(zip::kDosDate1980, &archive);
+    Store32(crc, &archive);
+    Store32(packed.size(), &archive);
+    Store32(raw.size(), &archive);
+    Store16(name.size(), &archive);
+    Store16(0, &archive);  // Extra.
+    archive.insert(archive.end(), name.begin(), name.end());
+    archive.insert(archive.end(), packed.begin(), packed.end());
+    Store32(zip::kCentralHeaderSignature, &directory);
+    Store16(zip::kVersion, &directory);  // Made by.
+    Store16(zip::kVersion, &directory);  // Needed to extract.
+    Store16(0, &directory);              // Flags.
+    Store16(method, &directory);
+    Store16(0, &directory);  // Time.
+    Store16(zip::kDosDate1980, &directory);
+    Store32(crc, &directory);
+    Store32(packed.size(), &directory);
+    Store32(raw.size(), &directory);
+    Store16(name.size(), &directory);
+    Store16(0, &directory);  // Extra.
+    Store16(0, &directory);  // Comment.
+    Store16(0, &directory);  // Disk.
+    Store16(0, &directory);  // Internal attributes.
+    Store32(0, &directory);  // External attributes.
+    Store32(local, &directory);
     directory.insert(directory.end(), name.begin(), name.end());
   }
-  const size_t start = zip.size();
-  zip.insert(zip.end(), directory.begin(), directory.end());
-  PutLe(0x06054b50, 4, &zip);
-  PutLe(0, 2, &zip);
-  PutLe(0, 2, &zip);
-  PutLe(arrays.size(), 2, &zip);
-  PutLe(arrays.size(), 2, &zip);
-  PutLe(directory.size(), 4, &zip);
-  PutLe(start, 4, &zip);
-  PutLe(0, 2, &zip);
-  WriteBytes(path, zip);
+  const size_t directory_start = archive.size();
+  archive.insert(archive.end(), directory.begin(), directory.end());
+  Store32(zip::kEndRecordSignature, &archive);
+  Store16(0, &archive);              // This disk.
+  Store16(0, &archive);              // The disk of the directory.
+  Store16(arrays.size(), &archive);  // Entries on this disk.
+  Store16(arrays.size(), &archive);  // Entries.
+  Store32(directory.size(), &archive);
+  Store32(directory_start, &archive);
+  Store16(0, &archive);  // Comment.
+  WriteBytes(path, archive);
 }
 
 }  // namespace gr

@@ -7,11 +7,41 @@
 #include "gr/core/numeric.h"
 
 namespace gr {
+namespace {
+
+// A voxel's centre, in voxels from its corner.
+constexpr double kVoxelCentre = 0.5;
+// The keyframe takes the bits above the point index in a sequence number.
+constexpr int kSequenceKeyframeShift = 32;
+// Ranges below this (m) carry no elevation.
+constexpr double kMinRange = 1e-6;
+// Elevations are rounded to 1 / this of a degree before beams are found.
+constexpr double kElevationStepsPerDegree = 10.0;
+// Elevation gaps wider than this (deg) separate two beams.
+constexpr double kBeamGap = 0.35;
+// Beams needed to measure their spacing, and the spacing (deg) without, and
+// its plausible range.
+constexpr size_t kMinBeamsForSpacing = 3;
+constexpr double kDefaultBeamSpacing = 1.0;
+constexpr double kMinBeamSpacing = 0.3;
+constexpr double kMaxBeamSpacing = 4.0;
+// No path sample is near a map point.
+constexpr int kNoSample = -1;
+// Path samples within the ego radius of a point lie in its cell or in the
+// cells this many steps around it (cells of the ego radius).
+constexpr int kCellNeighbourhood = 1;
+
+// The centre of a voxel of size `voxel`.
+Vec3 VoxelCentre(const VoxelKey& key, double voxel) {
+  return (Vec3(key.x, key.y, key.z) + Vec3::Constant(kVoxelCentre)) * voxel;
+}
+
+}  // namespace
 
 MapAccumulator::MapAccumulator(double voxel, double max_range,
                                const MapFusionConfig& fusion)
     : voxel_(voxel),
-      inv_voxel_(1.0 / voxel),
+      inverse_voxel_(1.0 / voxel),
       max_range_(max_range),
       fusion_(fusion) {
   GR_CHECK(voxel > 0.0);
@@ -19,14 +49,16 @@ MapAccumulator::MapAccumulator(double voxel, double max_range,
 
 void MapAccumulator::AddRanges(const Pose& world_from_lidar,
                                const Points& sweep) {
-  for (const Vec3& p : sweep) {
-    const double range = p.norm();
+  for (const Vec3& point : sweep) {
+    const double range = point.norm();
     if (range > max_range_) continue;
-    const VoxelKey key = VoxelOf(world_from_lidar * p, inv_voxel_);
+    const VoxelKey key = VoxelOf(world_from_lidar * point, inverse_voxel_);
     if (region_ && !region_->Contains(key)) continue;
-    const auto [it, inserted] =
+    const auto [entry, inserted] =
         nearest_.try_emplace(key, static_cast<float>(range));
-    if (!inserted) it->second = std::min(it->second, static_cast<float>(range));
+    if (!inserted) {
+      entry->second = std::min(entry->second, static_cast<float>(range));
+    }
   }
 }
 
@@ -34,42 +66,46 @@ void MapAccumulator::Add(int keyframe, const Pose& world_from_lidar,
                          const Points& sweep,
                          const std::vector<float>& intensity) {
   const double angle_sigma = DegToRad(fusion_.angle_sigma_deg);
-  const double reference = fusion_.range_sigma * fusion_.range_sigma;
+  const double range_variance = fusion_.range_sigma * fusion_.range_sigma;
   for (size_t i = 0; i < sweep.size(); ++i) {
     const double range = sweep[i].norm();
     if (range > max_range_) continue;
     const Vec3 point = world_from_lidar * sweep[i];
-    const VoxelKey key = VoxelOf(point, inv_voxel_);
+    const VoxelKey key = VoxelOf(point, inverse_voxel_);
     if (region_ && !region_->Contains(key)) continue;
     const float value = i < intensity.size() ? intensity[i] : 0.0f;
     Cell& cell = cells_[key];
-    if (cell.keyframe < 0 || range < cell.range) {
+    if (cell.keyframe == kNoKeyframe || range < cell.range) {
       cell.range = range;
       // Increases with every Add (keyframes in order) and point, whatever
       // the region.
-      cell.sequence = (static_cast<int64_t>(keyframe) << 32) |
-                      static_cast<int64_t>(i);
+      cell.sequence =
+          (static_cast<int64_t>(keyframe) << kSequenceKeyframeShift) |
+          static_cast<int64_t>(i);
       cell.point = point;
       cell.intensity = value;
       cell.keyframe = keyframe;
     }
     if (!fusion_.fuse) continue;
     const auto nearest = nearest_.find(key);
-    const double best = nearest == nearest_.end() ? range : nearest->second;
-    if (range > fusion_.range_ratio * best + fusion_.range_margin) continue;
-    const double angular = range * angle_sigma;
-    const float weight =
-        static_cast<float>(reference / (reference + angular * angular));
-    const Vec3 center =
-        (Vec3(key.x, key.y, key.z) + Vec3::Constant(0.5)) * voxel_;
-    const Vec3 d = point - center;
+    const double nearest_range =
+        nearest == nearest_.end() ? range : nearest->second;
+    if (range > fusion_.range_ratio * nearest_range + fusion_.range_margin) {
+      continue;
+    }
+    const double angular_sigma = range * angle_sigma;
+    const float weight = static_cast<float>(
+        range_variance / (range_variance + angular_sigma * angular_sigma));
+    const Vec3 offset = point - VoxelCentre(key, voxel_);
     cell.weight += weight;
-    for (int a = 0; a < 3; ++a)
-      cell.sum[a] += weight * static_cast<float>(d[a]);
-    int k = 0;
-    for (int a = 0; a < 3; ++a) {
-      for (int b = a; b < 3; ++b) {
-        cell.outer[k++] += weight * static_cast<float>(d[a] * d[b]);
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      cell.sum[axis] += weight * static_cast<float>(offset[axis]);
+    }
+    int term = 0;
+    for (int row = 0; row < kSpaceDim; ++row) {
+      for (int column = row; column < kSpaceDim; ++column) {
+        cell.outer[term++] +=
+            weight * static_cast<float>(offset[row] * offset[column]);
       }
     }
     cell.weighted_intensity += weight * value;
@@ -107,30 +143,31 @@ MapAccumulator::Cloud MapAccumulator::Collect() const {
       cloud.intensity.push_back(cell->intensity);
       cloud.observations.push_back(1);
       cloud.spread.push_back({});
-      const double angular = cell->range * angle_sigma;
-      cloud.model_sigma.push_back(static_cast<float>(std::sqrt(
-          fusion_.range_sigma * fusion_.range_sigma + angular * angular)));
+      const double angular_sigma = cell->range * angle_sigma;
+      cloud.model_sigma.push_back(static_cast<float>(
+          std::sqrt(fusion_.range_sigma * fusion_.range_sigma +
+                    angular_sigma * angular_sigma)));
       continue;
     }
-    const double w = cell->weight;
-    const Vec3 mean(cell->sum[0] / w, cell->sum[1] / w, cell->sum[2] / w);
-    const Vec3 center =
-        (Vec3(key->x, key->y, key->z) + Vec3::Constant(0.5)) * voxel_;
-    cloud.points.push_back(center + mean);
-    cloud.intensity.push_back(static_cast<float>(cell->weighted_intensity / w));
+    const double weight = cell->weight;
+    const Vec3 mean(cell->sum[0] / weight, cell->sum[1] / weight,
+                    cell->sum[2] / weight);
+    cloud.points.push_back(VoxelCentre(*key, voxel_) + mean);
+    cloud.intensity.push_back(
+        static_cast<float>(cell->weighted_intensity / weight));
     cloud.observations.push_back(cell->count);
-    std::array<float, 6> spread{};
-    int k = 0;
-    for (int a = 0; a < 3; ++a) {
-      for (int b = a; b < 3; ++b) {
-        double value = cell->outer[k] / w - mean[a] * mean[b];
-        if (a == b) value = std::max(value, 0.0);
-        spread[k++] = static_cast<float>(value);
+    std::array<float, kSymmetricTerms> spread{};
+    int term = 0;
+    for (int row = 0; row < kSpaceDim; ++row) {
+      for (int column = row; column < kSpaceDim; ++column) {
+        double value = cell->outer[term] / weight - mean[row] * mean[column];
+        if (row == column) value = std::max(value, 0.0);
+        spread[term++] = static_cast<float>(value);
       }
     }
     cloud.spread.push_back(spread);
     cloud.model_sigma.push_back(
-        static_cast<float>(fusion_.range_sigma / std::sqrt(w)));
+        static_cast<float>(fusion_.range_sigma / std::sqrt(weight)));
   }
   return cloud;
 }
@@ -140,17 +177,21 @@ std::vector<float> PointSigmas(const MapAccumulator::Cloud& cloud,
   GR_CHECK(normals.size() == cloud.points.size());
   std::vector<float> out(cloud.points.size());
   for (size_t i = 0; i < out.size(); ++i) {
-    const std::array<float, 6>& c = cloud.spread[i];
-    const Mat3 covariance = (Mat3() << c[0], c[1], c[2],  //
-                             c[1], c[3], c[4],            //
-                             c[2], c[4], c[5])
-                                .finished();
-    const Vec3& n = normals[i];
-    const double along = n.isZero() ? covariance.trace() / 3.0
-                                    : n.dot(covariance * n) / n.squaredNorm();
+    const std::array<float, kSymmetricTerms>& spread = cloud.spread[i];
+    const Mat3 covariance =
+        (Mat3() << spread[0], spread[1], spread[2],  //
+         spread[1], spread[3], spread[4],            //
+         spread[2], spread[4], spread[5])
+            .finished();
+    const Vec3& normal = normals[i];
+    const double along_normal =
+        normal.isZero() ? covariance.trace() / kSpaceDim
+                        : normal.dot(covariance * normal) /
+                              normal.squaredNorm();
     const double model = cloud.model_sigma[i];
     const double variance =
-        std::max(along / std::max(cloud.observations[i], 1), model * model) +
+        std::max(along_normal / std::max(cloud.observations[i], 1),
+                 model * model) +
         sigma_floor * sigma_floor;
     out[i] = static_cast<float>(std::sqrt(variance));
   }
@@ -166,9 +207,9 @@ NormalsResult EstimateOrientedNormals(const Points& points,
   NormalsResult result =
       EstimateNormals(points, radius, min_neighbors, max_neighbors);
   for (size_t i = 0; i < points.size(); ++i) {
-    const size_t k = static_cast<size_t>(keyframe[i]);
-    GR_CHECK(k < keyframe_origins.size());
-    if (result.normals[i].dot(keyframe_origins[k] - points[i]) < 0.0) {
+    const size_t observer = static_cast<size_t>(keyframe[i]);
+    GR_CHECK(observer < keyframe_origins.size());
+    if (result.normals[i].dot(keyframe_origins[observer] - points[i]) < 0.0) {
       result.normals[i] = -result.normals[i];
     }
   }
@@ -178,37 +219,41 @@ NormalsResult EstimateOrientedNormals(const Points& points,
 double EstimateBeamSpacing(const std::vector<Points>& sweeps) {
   std::vector<double> elevations;
   for (const Points& sweep : sweeps) {
-    for (const Vec3& p : sweep) {
-      const double r = std::max(p.norm(), 1e-6);
+    for (const Vec3& point : sweep) {
+      const double range = std::max(point.norm(), kMinRange);
       const double degrees =
-          RadToDeg(std::asin(std::clamp(p.z() / r, -1.0, 1.0)));
-      elevations.push_back(std::nearbyint(degrees * 10.0) / 10.0);
+          RadToDeg(std::asin(std::clamp(point.z() / range, -1.0, 1.0)));
+      elevations.push_back(std::nearbyint(degrees * kElevationStepsPerDegree) /
+                           kElevationStepsPerDegree);
     }
   }
   std::sort(elevations.begin(), elevations.end());
   elevations.erase(std::unique(elevations.begin(), elevations.end()),
                    elevations.end());
-  // Beams are clusters of elevations separated by gaps wider than 0.35 deg.
+  // Beams are clusters of elevations separated by wider gaps.
   std::vector<double> centers;
   size_t start = 0;
-  for (size_t i = 1; i <= elevations.size(); ++i) {
-    if (i < elevations.size() && elevations[i] - elevations[i - 1] <= 0.35) {
+  for (size_t end = 1; end <= elevations.size(); ++end) {
+    if (end < elevations.size() &&
+        elevations[end] - elevations[end - 1] <= kBeamGap) {
       continue;
     }
     double sum = 0.0;
-    for (size_t a = start; a < i; ++a) sum += elevations[a];
-    centers.push_back(sum / static_cast<double>(i - start));
-    start = i;
+    for (size_t member = start; member < end; ++member) {
+      sum += elevations[member];
+    }
+    centers.push_back(sum / static_cast<double>(end - start));
+    start = end;
   }
-  double spacing = 1.0;
-  if (centers.size() > 2) {
+  double spacing = kDefaultBeamSpacing;
+  if (centers.size() >= kMinBeamsForSpacing) {
     std::vector<double> gaps;
-    for (size_t a = 1; a < centers.size(); ++a) {
-      gaps.push_back(centers[a] - centers[a - 1]);
+    for (size_t beam = 1; beam < centers.size(); ++beam) {
+      gaps.push_back(centers[beam] - centers[beam - 1]);
     }
     spacing = Median(gaps);
   }
-  return std::clamp(spacing, 0.3, 4.0);
+  return std::clamp(spacing, kMinBeamSpacing, kMaxBeamSpacing);
 }
 
 DynamicDetector::DynamicDetector(const Points& map, const Points& normals,
@@ -218,7 +263,7 @@ DynamicDetector::DynamicDetector(const Points& map, const Points& normals,
       map_(map),
       trip_(trip),
       voter_(map, normals, config.bucket),
-      el_res_(config.el_res) {
+      elevation_resolution_(config.el_res) {
   GR_CHECK(normals.size() == map.size() && trip.size() == map.size());
 }
 
@@ -229,10 +274,12 @@ void DynamicDetector::SetHeights(const std::vector<double>& height) {
 
 void DynamicDetector::AddSweep(int trip, const Pose& world_from_lidar,
                                const Points& sweep) {
-  if (el_res_ <= 0.0) el_res_ = EstimateBeamSpacing({sweep});
+  if (elevation_resolution_ <= 0.0) {
+    elevation_resolution_ = EstimateBeamSpacing({sweep});
+  }
   VisibilityVoteOptions options;
   options.image.az_res_deg = config_.az_res;
-  options.image.el_res_deg = el_res_;
+  options.image.el_res_deg = elevation_resolution_;
   options.image.el_min_deg = config_.el_min;
   options.image.el_max_deg = config_.el_max;
   options.max_range = config_.max_range;
@@ -250,47 +297,52 @@ void DynamicDetector::AddEgoPath(int trip, const Points& vehicle_positions) {
 
 std::vector<bool> DynamicDetector::EgoSwept(int trip) const {
   std::vector<bool> swept(map_.size(), false);
-  const auto it = ego_paths_.find(trip);
-  if (it == ego_paths_.end() || it->second.empty() ||
+  const auto trip_path = ego_paths_.find(trip);
+  if (trip_path == ego_paths_.end() || trip_path->second.empty() ||
       config_.ego_radius <= 0.0) {
     return swept;
   }
-  const Points& path = it->second;
+  const Points& path = trip_path->second;
   const double radius = config_.ego_radius;
-  std::unordered_map<CellKey, std::vector<int>, CellKeyHash> grid;
-  for (size_t j = 0; j < path.size(); ++j) {
-    grid[CellOf(path[j], radius)].push_back(static_cast<int>(j));
+  // Path samples per cell of the ego radius.
+  std::unordered_map<CellKey, std::vector<int>, CellKeyHash> samples_by_cell;
+  for (size_t sample = 0; sample < path.size(); ++sample) {
+    samples_by_cell[CellOf(path[sample], radius)].push_back(
+        static_cast<int>(sample));
   }
   // vector<bool> is not safe for parallel writes; collect into bytes first.
   std::vector<uint8_t> hit(map_.size(), 0);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-  for (int64_t ii = 0; ii < static_cast<int64_t>(map_.size()); ++ii) {
-    const Vec3& q = map_[static_cast<size_t>(ii)];
-    const CellKey cell = CellOf(q, radius);
-    double best = radius * radius;
-    int nearest = -1;
-    for (int dx = -1; dx <= 1; ++dx) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        const auto g = grid.find({cell.x + dx, cell.y + dy});
-        if (g == grid.end()) continue;
-        for (int j : g->second) {
-          const double d2 =
-              (path[static_cast<size_t>(j)].head<2>() - q.head<2>())
+  for (int64_t index = 0; index < static_cast<int64_t>(map_.size());
+       ++index) {
+    const Vec3& map_point = map_[static_cast<size_t>(index)];
+    const CellKey cell = CellOf(map_point, radius);
+    double best_squared = radius * radius;
+    int nearest = kNoSample;
+    for (int dx = -kCellNeighbourhood; dx <= kCellNeighbourhood; ++dx) {
+      for (int dy = -kCellNeighbourhood; dy <= kCellNeighbourhood; ++dy) {
+        const auto neighbors = samples_by_cell.find({cell.x + dx, cell.y + dy});
+        if (neighbors == samples_by_cell.end()) continue;
+        for (int sample : neighbors->second) {
+          const double squared =
+              (path[static_cast<size_t>(sample)].head<2>() -
+               map_point.head<2>())
                   .squaredNorm();
-          if (d2 < best) {
-            best = d2;
-            nearest = j;
+          if (squared < best_squared) {
+            best_squared = squared;
+            nearest = sample;
           }
         }
       }
     }
-    if (nearest < 0) continue;
+    if (nearest == kNoSample) continue;
     // Height above the ego vehicle's floor.
-    const double dz = q.z() - path[static_cast<size_t>(nearest)].z();
-    if (dz > config_.min_height && dz < config_.ego_height) {
-      hit[static_cast<size_t>(ii)] = 1;
+    const double height =
+        map_point.z() - path[static_cast<size_t>(nearest)].z();
+    if (height > config_.min_height && height < config_.ego_height) {
+      hit[static_cast<size_t>(index)] = 1;
     }
   }
   for (size_t i = 0; i < hit.size(); ++i) swept[i] = hit[i] != 0;
@@ -298,16 +350,17 @@ std::vector<bool> DynamicDetector::EgoSwept(int trip) const {
 }
 
 std::vector<DynamicKind> DynamicDetector::Classify() const {
-  const size_t n = map_.size();
-  std::vector<uint8_t> moved(n, 0);
-  std::vector<uint8_t> changed(n, 0);
+  const size_t count = map_.size();
+  std::vector<uint8_t> moved(count, 0);
+  std::vector<uint8_t> changed(count, 0);
   for (int session : voter_.Sessions()) {
     const std::vector<int>& seen = voter_.SeenCounts(session);
     const std::vector<int>& through = voter_.ThroughCounts(session);
-    for (size_t i = 0; i < n; ++i) {
-      const int t = through[i];
-      if (t < config_.min_through) continue;
-      if (static_cast<double>(t) / std::max(seen[i] + t, 1) <
+    for (size_t i = 0; i < count; ++i) {
+      const int seen_through = through[i];
+      if (seen_through < config_.min_through) continue;
+      if (static_cast<double>(seen_through) /
+              std::max(seen[i] + seen_through, 1) <
           config_.min_ratio) {
         continue;
       }
@@ -316,12 +369,12 @@ std::vector<DynamicKind> DynamicDetector::Classify() const {
   }
   for (const auto& [trip, path] : ego_paths_) {
     const std::vector<bool> swept = EgoSwept(trip);
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < count; ++i) {
       if (swept[i]) (trip_[i] == trip ? moved : changed)[i] = 1;
     }
   }
-  std::vector<DynamicKind> kind(n, DynamicKind::kStatic);
-  for (size_t i = 0; i < n; ++i) {
+  std::vector<DynamicKind> kind(count, DynamicKind::kStatic);
+  for (size_t i = 0; i < count; ++i) {
     // The floor itself is grazed by many rays.
     if (!height_.empty() && !(height_[i] > config_.min_height)) continue;
     if (moved[i]) {

@@ -40,7 +40,7 @@ struct PaintRasters {
   int width = 0;
   int height = 0;
   std::vector<double> intensity;        // NaN where unobserved.
-  std::vector<uint8_t> rgb;             // 3 per cell.
+  std::vector<uint8_t> rgb;             // kRgbChannels per cell.
   std::vector<int> texture_nobs;        // Texture observations per cell.
   std::vector<double> height_max;       // NaN where unobserved.
 };
@@ -73,7 +73,6 @@ Mask Elongated(const Mask& mask, int width, int height, double res,
 // A line kernel of `length` cells at `angle` through the kernel centre (the
 // Python stage's _line_kernel: end points rounded half to even).
 Mask LineKernel(int length, double angle);
-
 
 }  // namespace gr
 

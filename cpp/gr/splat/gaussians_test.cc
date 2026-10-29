@@ -8,81 +8,109 @@
 namespace gr {
 namespace {
 
+constexpr double kWallStep = 0.05;     // m between wall points.
+constexpr double kNormalSigma = 0.002;  // m
+constexpr double kDepthTolerance = 0.005;  // m
+
 // Points of the plane x = `x` facing the origin, `half` metres around the x
-// axis, 5 cm apart.
+// axis, kWallStep apart.
 Points Wall(double x, double half) {
   Points points;
-  const int n = static_cast<int>(std::lround(half / 0.05));
-  for (int i = -n; i <= n; ++i) {
-    for (int j = -n; j <= n; ++j) points.emplace_back(x, 0.05 * i, 0.05 * j);
+  const int steps = static_cast<int>(std::lround(half / kWallStep));
+  for (int i = -steps; i <= steps; ++i) {
+    for (int j = -steps; j <= steps; ++j) {
+      points.emplace_back(x, kWallStep * i, kWallStep * j);
+    }
   }
   return points;
 }
 
 GR_TEST(InitGaussiansTest, FlatDiscsAlongTheNormal) {
+  constexpr double kTolerance = 1e-9;
+  constexpr double kScaleTolerance = 1e-6;
+  const GaussianInitConfig config;
   Points points = Wall(2.0, 0.5);
   Points normals(points.size(), Vec3(-1, 0, 0));
-  const std::vector<double> sigma(points.size(), 0.002);
+  const std::vector<double> sigma(points.size(), kNormalSigma);
   points.emplace_back(5.0, 5.0, 5.0);  // Alone and without a normal.
   normals.push_back(Vec3::Zero());
   std::vector<double> sigma_all = sigma;
-  sigma_all.push_back(0.002);
-  const GaussianSet set =
-      InitGaussians(points, normals, sigma_all, GaussianInitConfig());
+  sigma_all.push_back(kNormalSigma);
+  const GaussianSet set = InitGaussians(points, normals, sigma_all, config);
   GR_ASSERT_TRUE(set.size() == points.size());
-  // An interior point: 4 neighbours at 5 cm and 2 at 7.07 cm.
+  // An interior point: its 6 nearest neighbours are 4 at kWallStep and 2 on
+  // the diagonal.
   const size_t center = (points.size() - 1) / 2;
-  const double spacing = (4 * 0.05 + 2 * 0.05 * std::sqrt(2.0)) / 6.0;
-  GR_EXPECT_NEAR(set.scales[center].x(), 0.8 * spacing, 1e-6);
-  GR_EXPECT_NEAR(set.scales[center].y(), 0.8 * spacing, 1e-6);
-  GR_EXPECT_NEAR(set.scales[center].z(), 0.002, 1e-9);
+  const double spacing =
+      (4 * kWallStep + 2 * kWallStep * std::sqrt(2.0)) / config.neighbors;
+  GR_EXPECT_NEAR(set.scales[center].x(), config.tangent_factor * spacing,
+                 kScaleTolerance);
+  GR_EXPECT_NEAR(set.scales[center].y(), config.tangent_factor * spacing,
+                 kScaleTolerance);
+  GR_EXPECT_NEAR(set.scales[center].z(), kNormalSigma, kTolerance);
   const Vec3 axis = set.rotations[center].toRotationMatrix().col(2);
-  GR_EXPECT_NEAR(axis.x(), -1.0, 1e-9);
+  GR_EXPECT_NEAR(axis.x(), -1.0, kTolerance);
+  // The lonely point: isotropic, from the default spacing.
   const size_t alone = points.size() - 1;
-  GR_EXPECT_NEAR(set.scales[alone].x(), 0.8 * 0.05, 1e-9);
-  GR_EXPECT_NEAR(set.scales[alone].z(), 0.8 * 0.05, 1e-9);
-  GR_EXPECT_NEAR(set.opacity[center], 0.9, 1e-6);
+  const double default_sigma = config.tangent_factor * config.default_spacing;
+  GR_EXPECT_NEAR(set.scales[alone].x(), default_sigma, kTolerance);
+  GR_EXPECT_NEAR(set.scales[alone].z(), default_sigma, kTolerance);
+  GR_EXPECT_NEAR(set.opacity[center], config.opacity, kScaleTolerance);
 }
+
+// The left (y < 0) and right halves of the walls have these intensities.
+constexpr float kLeftIntensity = 0.3f;
+constexpr float kRightIntensity = 0.8f;
 
 GaussianSet WallGaussians(double x, double half, int trip) {
   const Points points = Wall(x, half);
   const Points normals(points.size(), Vec3(-1, 0, 0));
-  GaussianSet set = InitGaussians(points, normals,
-                                  std::vector<double>(points.size(), 0.002),
-                                  GaussianInitConfig());
+  GaussianSet set = InitGaussians(
+      points, normals, std::vector<double>(points.size(), kNormalSigma),
+      GaussianInitConfig());
   for (size_t i = 0; i < set.size(); ++i) {
-    set.intensity[i] = points[i].y() < 0.0 ? 0.3f : 0.8f;
+    set.intensity[i] = points[i].y() < 0.0 ? kLeftIntensity : kRightIntensity;
     set.trip[i] = trip;
   }
   return set;
 }
 
 GR_TEST(GaussianRayRendererTest, DepthAndIntensityOfAWall) {
-  const GaussianRayRenderer renderer(WallGaussians(5.0, 1.5, -1));
-  Points origins, directions;
+  constexpr double kWallX = 5.0;   // m
+  constexpr double kRise = 0.07;   // z component of the ray directions.
+  constexpr float kMinOpacity = 0.99f;
+  constexpr double kIntensityTolerance = 0.01;
+  const GaussianRayRenderer renderer(
+      WallGaussians(kWallX, 1.5, GaussianSet::kSharedTrip));
+  Points origins;
+  Points directions;
   std::vector<double> expected;
-  for (double angle : {-12.0, -6.0, 3.0, 9.0}) {
-    const double a = DegToRad(angle);
+  for (double angle_deg : {-12.0, -6.0, 3.0, 9.0}) {
+    const double angle = DegToRad(angle_deg);
     origins.push_back(Vec3::Zero());
-    directions.emplace_back(std::cos(a), std::sin(a), 0.07);
-    expected.push_back(5.0 / std::cos(a) *
-                       directions.back().norm() / std::hypot(
-                           std::cos(a), std::sin(a)));
+    directions.emplace_back(std::cos(angle), std::sin(angle), kRise);
+    expected.push_back(kWallX / std::cos(angle) * directions.back().norm() /
+                       std::hypot(std::cos(angle), std::sin(angle)));
   }
-  const RayRender render = renderer.Render(origins, directions, -1);
-  for (size_t r = 0; r < origins.size(); ++r) {
-    GR_EXPECT_NEAR(render.depth[r], expected[r], 0.005);
-    GR_EXPECT_NEAR(render.mean_depth[r], expected[r], 0.005);
-    GR_EXPECT_GT(render.opacity[r], 0.99f);
-    GR_EXPECT_TRUE(render.dominant[r] >= 0);
+  const RayRender render =
+      renderer.Render(origins, directions, GaussianSet::kSharedTrip);
+  for (size_t ray = 0; ray < origins.size(); ++ray) {
+    GR_EXPECT_NEAR(render.depth[ray], expected[ray], kDepthTolerance);
+    GR_EXPECT_NEAR(render.mean_depth[ray], expected[ray], kDepthTolerance);
+    GR_EXPECT_GT(render.opacity[ray], kMinOpacity);
+    GR_EXPECT_TRUE(render.dominant[ray] != RayRender::kNoGaussian);
   }
-  GR_EXPECT_NEAR(render.intensity[0], 0.3, 0.01);
-  GR_EXPECT_NEAR(render.intensity[3], 0.8, 0.01);
+  GR_EXPECT_NEAR(render.intensity[0], kLeftIntensity, kIntensityTolerance);
+  GR_EXPECT_NEAR(render.intensity[3], kRightIntensity, kIntensityTolerance);
 }
 
 GR_TEST(GaussianRayRendererTest, TripSpecificGaussiansOnlyInTheirTrip) {
-  GaussianSet set = WallGaussians(5.0, 1.0, -1);
-  const GaussianSet near = WallGaussians(3.0, 1.0, 1);  // A changed object.
+  constexpr double kFarX = 5.0;   // m: the shared wall.
+  constexpr double kNearX = 3.0;  // m: a changed object of kChangedTrip.
+  constexpr int kChangedTrip = 1;
+  constexpr int kOtherTrip = 0;
+  GaussianSet set = WallGaussians(kFarX, 1.0, GaussianSet::kSharedTrip);
+  const GaussianSet near = WallGaussians(kNearX, 1.0, kChangedTrip);
   for (size_t i = 0; i < near.size(); ++i) {
     set.means.push_back(near.means[i]);
     set.rotations.push_back(near.rotations[i]);
@@ -94,25 +122,29 @@ GR_TEST(GaussianRayRendererTest, TripSpecificGaussiansOnlyInTheirTrip) {
   const GaussianRayRenderer renderer(std::move(set));
   const Points origins = {Vec3::Zero()};
   const Points directions = {Vec3(1, 0.01, 0.02).normalized()};
-  const double scale = 1.0 / directions[0].x();
-  GR_EXPECT_NEAR(renderer.Render(origins, directions, 1).depth[0], 3 * scale,
-                 0.005);
-  GR_EXPECT_NEAR(renderer.Render(origins, directions, 0).depth[0], 5 * scale,
-                 0.005);
-  GR_EXPECT_NEAR(renderer.Render(origins, directions, -1).depth[0], 5 * scale,
-                 0.005);
+  const double scale = 1.0 / directions[0].x();  // Range per metre of x.
+  GR_EXPECT_NEAR(renderer.Render(origins, directions, kChangedTrip).depth[0],
+                 kNearX * scale, kDepthTolerance);
+  GR_EXPECT_NEAR(renderer.Render(origins, directions, kOtherTrip).depth[0],
+                 kFarX * scale, kDepthTolerance);
+  GR_EXPECT_NEAR(
+      renderer.Render(origins, directions, GaussianSet::kSharedTrip).depth[0],
+      kFarX * scale, kDepthTolerance);
 }
 
 GR_TEST(GaussianRayRendererTest, MissesGiveNaN) {
-  const GaussianRayRenderer renderer(WallGaussians(5.0, 1.0, -1));
-  const RayRender render =
-      renderer.Render({Vec3::Zero()}, {Vec3(-1, 0, 0)}, -1);
+  constexpr double kTolerance = 1e-9;
+  const GaussianRayRenderer renderer(
+      WallGaussians(5.0, 1.0, GaussianSet::kSharedTrip));
+  const RayRender render = renderer.Render({Vec3::Zero()}, {Vec3(-1, 0, 0)},
+                                           GaussianSet::kSharedTrip);
   GR_EXPECT_TRUE(std::isnan(render.depth[0]));
-  GR_EXPECT_EQ(render.dominant[0], -1);
-  GR_EXPECT_NEAR(render.opacity[0], 0.0, 1e-9);
+  GR_EXPECT_EQ(render.dominant[0], RayRender::kNoGaussian);
+  GR_EXPECT_NEAR(render.opacity[0], 0.0, kTolerance);
   const GaussianRayRenderer empty(GaussianSet{});
-  GR_EXPECT_TRUE(
-      std::isnan(empty.Render({Vec3::Zero()}, {Vec3::UnitX()}, -1).depth[0]));
+  GR_EXPECT_TRUE(std::isnan(
+      empty.Render({Vec3::Zero()}, {Vec3::UnitX()}, GaussianSet::kSharedTrip)
+          .depth[0]));
 }
 
 }  // namespace

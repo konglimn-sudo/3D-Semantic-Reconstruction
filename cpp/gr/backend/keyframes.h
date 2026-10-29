@@ -22,8 +22,11 @@ struct Keyframe {
 
 class KeyframeSet {
  public:
+  // The resolution (m) sweeps are kept at by default.
+  static constexpr double kDefaultVoxel = 0.2;
+
   // `voxels`: the resolutions (m, all positive) at which sweeps are kept.
-  explicit KeyframeSet(std::vector<double> voxels = {0.2});
+  explicit KeyframeSet(std::vector<double> voxels = {kDefaultVoxel});
   KeyframeSet(const KeyframeSet&) = default;
   KeyframeSet& operator=(const KeyframeSet&) = default;
   KeyframeSet(KeyframeSet&&) = default;
@@ -34,7 +37,7 @@ class KeyframeSet {
   int Add(const Keyframe& keyframe, const Points& sweep);
 
   size_t size() const { return keyframes_.size(); }
-  const Keyframe& operator[](size_t k) const { return keyframes_[k]; }
+  const Keyframe& operator[](size_t index) const { return keyframes_[index]; }
   const std::vector<Keyframe>& keyframes() const { return keyframes_; }
   const std::vector<double>& voxels() const { return voxels_; }
   int num_trips() const {
@@ -46,17 +49,21 @@ class KeyframeSet {
   std::vector<Pose> OdomPoses() const;
   bool HasVoxel(double voxel) const;
 
-  // The sweep of keyframe k at one of the kept resolutions.
-  const Points& Cloud(size_t k, double voxel) const;
+  // The sweep of keyframe `index` at one of the kept resolutions.
+  const Points& Cloud(size_t index, double voxel) const;
   // Cumulative travelled distance along each trip (restarts at 0 per trip).
   std::vector<double> PathDistance(const std::vector<Pose>& poses) const;
-  // Sweeps of the keyframes within `half_window` of k on its trip, in k's
-  // frame, merged and voxel-downsampled.
-  Points Submap(size_t k, int half_window, double voxel,
+  // Sweeps of the keyframes within `half_window` of keyframe `index` on its
+  // trip, in its frame, merged and voxel-downsampled.
+  Points Submap(size_t index, int half_window, double voxel,
                 const std::vector<Pose>& poses) const;
 
  private:
-  int Slot(double voxel) const;  // -1 if the resolution is not kept.
+  // Slot() of a resolution that is not kept.
+  static constexpr int kNoSlot = -1;
+
+  // Position of `voxel` in voxels_.
+  int Slot(double voxel) const;
 
   std::vector<double> voxels_;
   std::vector<Keyframe> keyframes_;

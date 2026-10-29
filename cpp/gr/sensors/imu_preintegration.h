@@ -22,10 +22,16 @@
 
 namespace gr {
 
-inline constexpr double kGravity = 9.81;  // m/s^2, along world -z.
+// Layout of a bias vector: the gyro bias, then the accelerometer bias.
+inline constexpr int kGyroBiasOffset = 0;
+inline constexpr int kAccelBiasOffset = kGyroBiasOffset + kSpaceDim;
+inline constexpr int kBiasDim = kAccelBiasOffset + kSpaceDim;
 
-using Vec9 = Eigen::Matrix<double, 9, 1>;
-using Mat9 = Eigen::Matrix<double, 9, 9>;
+// Rows of a preintegration residual [rotation, velocity, position].
+inline constexpr int kImuResidualDim = 3 * kSpaceDim;
+
+using Vec9 = Eigen::Matrix<double, kImuResidualDim, 1>;
+using Mat9 = Eigen::Matrix<double, kImuResidualDim, kImuResidualDim>;
 
 // Continuous-time noise densities of the IMU.
 struct ImuNoise {
@@ -37,8 +43,23 @@ struct ImuNoise {
 
 class ImuPreintegration {
  public:
-  // Columns: [phi_i, p_i, v_i, phi_j, p_j, v_j, gyro bias_i, accel bias_i].
-  using Jacobian = Eigen::Matrix<double, 9, 24>;
+  // Row blocks of the residual (and of its covariance).
+  static constexpr int kRotationRow = 0;
+  static constexpr int kVelocityRow = kRotationRow + kSpaceDim;
+  static constexpr int kPositionRow = kVelocityRow + kSpaceDim;
+  // Column blocks of the Jacobian: [phi_i, p_i, v_i, phi_j, p_j, v_j,
+  // gyro bias_i, accel bias_i].
+  static constexpr int kRotationICol = 0;
+  static constexpr int kPositionICol = kRotationICol + kSpaceDim;
+  static constexpr int kVelocityICol = kPositionICol + kSpaceDim;
+  static constexpr int kRotationJCol = kVelocityICol + kSpaceDim;
+  static constexpr int kPositionJCol = kRotationJCol + kSpaceDim;
+  static constexpr int kVelocityJCol = kPositionJCol + kSpaceDim;
+  static constexpr int kGyroBiasCol = kVelocityJCol + kSpaceDim;
+  static constexpr int kAccelBiasCol = kGyroBiasCol + kSpaceDim;
+  static constexpr int kJacobianCols = kAccelBiasCol + kSpaceDim;
+
+  using Jacobian = Eigen::Matrix<double, kImuResidualDim, kJacobianCols>;
 
   // `bias` is the linearisation point of the bias Jacobians.
   explicit ImuPreintegration(const Vec6& bias = Vec6::Zero(),
@@ -70,8 +91,8 @@ class ImuPreintegration {
 
   // The state at j predicted from the state at i.
   void Predict(const Pose& world_from_body_i, const Vec3& velocity_i,
-               const Vec6& bias_i, Pose& world_from_body_j,
-               Vec3& velocity_j) const;
+               const Vec6& bias_i, Pose* world_from_body_j,
+               Vec3* velocity_j) const;
 
  private:
   // Increments corrected to first order for `bias` - bias_.
@@ -93,12 +114,13 @@ class ImuPreintegration {
   Mat3 position_by_accel_bias_ = Mat3::Zero();
 };
 
-// Preintegrates the samples over [t0, t1]. The interval is split at every
-// sample stamp and each piece uses the (linearly interpolated) rates at its
-// midpoint, as MotionPrior does. nullopt unless t1 > t0 and the samples
-// cover [t0, t1].
+// Preintegrates the samples over [start_time, end_time]. The interval is
+// split at every sample stamp and each piece uses the (linearly
+// interpolated) rates at its midpoint, as MotionPrior does. nullopt unless
+// end_time > start_time and the samples cover the interval.
 std::optional<ImuPreintegration> PreintegrateImu(const ImuSamples& imu,
-                                                 double t0, double t1,
+                                                 double start_time,
+                                                 double end_time,
                                                  const Vec6& bias,
                                                  const ImuNoise& noise);
 

@@ -10,8 +10,9 @@ namespace {
 // A 40 x 20 m loop: corners 0 (0, 0), 1 (40, 0), 2 (40, 20), 3 (0, 20); the
 // bottom aisle split at x = 20 (node 4); a slot connector hangs off node 4.
 std::vector<TrafficEdge> Loop() {
-  auto edge = [](int a, int b, Vec2 p, Vec2 q, bool drivable = true) {
-    return TrafficEdge{a, b, 0, drivable, {p, q}};
+  const auto edge = [](int start_node, int end_node, Vec2 start, Vec2 end,
+                       bool drivable = true) {
+    return TrafficEdge{start_node, end_node, 0, drivable, {start, end}};
   };
   return {edge(0, 4, Vec2(0, 0), Vec2(20, 0)),
           edge(4, 1, Vec2(20, 0), Vec2(40, 0)),
@@ -21,14 +22,17 @@ std::vector<TrafficEdge> Loop() {
           edge(4, 5, Vec2(20, 0), Vec2(20, -3), false)};
 }
 
-TrafficArrow Arrow(double x, double y, double dx) {
-  return {0, Vec2(x, y), Vec2(dx, 0.0)};
+// An arrow on level 0 at (x, y) pointing along +x (`direction_x` = 1) or -x
+// (-1).
+TrafficArrow Arrow(double x, double y, double direction_x) {
+  return {0, Vec2(x, y), Vec2(direction_x, 0.0)};
 }
 
 GR_TEST(TrafficTest, CorridorsJoinEdgesBetweenJunctions) {
   // Only corners with a turn above the limit end a corridor: the bottom
   // aisle (two edges joined through the connector's node) is one corridor.
-  const auto corridors = Corridors(Loop(), 35.0);
+  constexpr double kMaxTurn = 35.0;  // deg
+  const auto corridors = Corridors(Loop(), kMaxTurn);
   GR_ASSERT_TRUE(corridors.size() == 4);
   GR_EXPECT_EQ(static_cast<int>(corridors[0].size()), 2);
 }
@@ -57,12 +61,15 @@ GR_TEST(TrafficTest, OtherPatternsStayTwoWay) {
                           Arrow(31, 1.6, -1)}) == TrafficVerdict::kTwoWay);
 }
 
-// A drive along the bottom aisle from x0 to x1 (y = 0.5, right lane).
+// A drive along the bottom aisle from x0 to x1 in its right lane (1 m off
+// the centre line).
 DrivenPath Drive(double x0, double x1) {
+  constexpr int kSamples = 60;
+  constexpr double kLaneOffset = 1.0;  // m
   DrivenPath path;
-  const int n = 60;
-  for (int k = 0; k <= n; ++k) {
-    path.points.emplace_back(x0 + (x1 - x0) * k / n, x1 > x0 ? -1.0 : 1.0);
+  for (int k = 0; k <= kSamples; ++k) {
+    path.points.emplace_back(x0 + (x1 - x0) * k / kSamples,
+                             x1 > x0 ? -kLaneOffset : kLaneOffset);
   }
   return path;
 }

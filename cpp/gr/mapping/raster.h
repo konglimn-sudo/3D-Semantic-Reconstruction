@@ -36,9 +36,12 @@ Eigen::MatrixXd Rasterize(const RowMatX2d& xy, const Eigen::VectorXd& values,
 // rejects specular highlights and transient occluders seen in few views.
 class FloorTextureFuser {
  public:
+  // Observations kept per cell.
+  static constexpr int kDefaultTopK = 5;
+
   // `floor_z` is height x width (NaN where there is no floor).
   FloorTextureFuser(const Grid2D& grid, const Eigen::MatrixXd& floor_z,
-                    int top_k = 5);
+                    int top_k = kDefaultTopK);
   FloorTextureFuser(const FloorTextureFuser&) = default;
   FloorTextureFuser& operator=(const FloorTextureFuser&) = default;
   FloorTextureFuser(FloorTextureFuser&&) = default;
@@ -73,11 +76,14 @@ class FloorTextureFuser {
   const Grid2D& grid() const { return grid_; }
 
  private:
+  // Score of an unused observation slot (scores are >= 0).
+  static constexpr float kEmptySlot = -1.0f;
+
   Grid2D grid_;
   Eigen::MatrixXd floor_z_;
   int top_k_;
-  std::vector<float> scores_;
-  std::vector<uint8_t> colors_;
+  std::vector<float> scores_;  // top_k_ slots per cell.
+  std::vector<uint8_t> colors_;  // RGB per slot.
   std::vector<uint16_t> observations_;
 };
 

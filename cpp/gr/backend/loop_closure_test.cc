@@ -7,42 +7,54 @@
 namespace gr {
 namespace {
 
+constexpr double kSweepVoxel = 0.2;  // m
+
 Pose PoseXyYaw(double x, double y, double yaw) {
   return Pose(Eigen::AngleAxisd(yaw, Vec3::UnitZ()).toRotationMatrix(),
               Vec3(x, y, 0));
 }
 
 GR_TEST(LoopClosureTest, PcmRejectsTheLoopThatContradictsOdometry) {
-  KeyframeSet keyframes({0.2});
+  // A straight drive of 40 keyframes 1 m apart. Keyframes 30.. revisit
+  // 2.. with the true relative pose; a fifth loop 36 -> 8 is off by 3 m, 1 m
+  // and 0.2 rad.
+  constexpr int kKeyframes = 40;
+  constexpr int kConsistentLoops = 4;
+  constexpr int kFirstSource = 30;
+  constexpr int kFirstTarget = 2;
+  constexpr int kBadSource = 36;
+  constexpr int kBadTarget = 8;
+  KeyframeSet keyframes({kSweepVoxel});
   std::vector<Pose> poses;
-  for (int k = 0; k < 40; ++k) {
+  for (int index = 0; index < kKeyframes; ++index) {
     Keyframe keyframe;
-    keyframe.odom = PoseXyYaw(k, 0, 0);
+    keyframe.odom = PoseXyYaw(index, 0, 0);
     keyframes.Add(keyframe, {});
     poses.push_back(keyframe.odom);
   }
   std::vector<LoopConstraint> loops;
-  // Consistent loops: keyframe i revisits j with the true relative pose.
-  for (int a = 0; a < 4; ++a) {
+  for (int offset = 0; offset < kConsistentLoops; ++offset) {
     LoopConstraint loop;
-    loop.i = 30 + a;
-    loop.j = 2 + a;
-    loop.j_from_i = poses[2 + a].Inverse() * poses[30 + a];
+    loop.i = kFirstSource + offset;
+    loop.j = kFirstTarget + offset;
+    loop.j_from_i = poses[static_cast<size_t>(loop.j)].Inverse() *
+                    poses[static_cast<size_t>(loop.i)];
     loops.push_back(loop);
   }
   LoopConstraint bad;
-  bad.i = 36;
-  bad.j = 8;
-  bad.j_from_i = poses[8].Inverse() * poses[36] * PoseXyYaw(3.0, 1.0, 0.2);
-  loops.insert(loops.begin() + 2, bad);
+  bad.i = kBadSource;
+  bad.j = kBadTarget;
+  bad.j_from_i = poses[kBadTarget].Inverse() * poses[kBadSource] *
+                 PoseXyYaw(3.0, 1.0, 0.2);
+  loops.insert(loops.begin() + kConsistentLoops / 2, bad);
   const std::vector<LoopConstraint> kept =
       SelectConsistentLoops(loops, keyframes, poses, LoopConfig());
-  GR_EXPECT_EQ(kept.size(), 4u);
-  for (const LoopConstraint& loop : kept) GR_EXPECT_TRUE(loop.i != 36);
+  GR_EXPECT_EQ(kept.size(), static_cast<size_t>(kConsistentLoops));
+  for (const LoopConstraint& loop : kept) GR_EXPECT_TRUE(loop.i != kBadSource);
 }
 
 GR_TEST(LoopClosureTest, DisabledOrTinySetsHaveNoLoops) {
-  KeyframeSet keyframes({0.2});
+  KeyframeSet keyframes({kSweepVoxel});
   LoopConfig config;
   LoopStats stats;
   GR_EXPECT_TRUE(DetectLoops(keyframes, {}, config, &stats).empty());

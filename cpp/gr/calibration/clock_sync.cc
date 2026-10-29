@@ -13,6 +13,20 @@
 namespace gr {
 namespace {
 
+// Rates are smoothed over at least this half width (s).
+constexpr double kMinSmoothing = 1e-4;
+// A window must turn: the 90th percentile of its rates reaches min_rate.
+constexpr double kRatePercentile = 90.0;
+// The robust line through the window lags: fit, drop the windows beyond
+// 3 sigma (from the median absolute deviation, at least 2 ms), fit again.
+constexpr int kRobustFitPasses = 2;
+constexpr double kInlierSigmas = 3.0;
+constexpr double kMadToSigma = 1.4826;     // For normally distributed lags.
+constexpr double kMinInlierLimit = 0.002;  // s
+// A drift needs two windows spread over more than this (s^2 of spread).
+constexpr double kMinWindowsForDrift = 2.0;
+constexpr double kMinTimeSpread = 1e-9;
+
 struct LagFit {
   double residual = 0.0;
   Mat3 rotation = Mat3::Identity();
@@ -29,11 +43,11 @@ std::vector<Vec3> Integral(const std::vector<double>& stamps,
   return out;
 }
 
-// Mean rate over [t - half, t + half] from the integral.
+// Mean rate over [time - half, time + half] from the integral.
 Vec3 MeanRate(const std::vector<double>& stamps,
-              const std::vector<Vec3>& integral, double t, double half) {
-  return (InterpolateSeries(stamps, integral, t + half) -
-          InterpolateSeries(stamps, integral, t - half)) /
+              const std::vector<Vec3>& integral, double time, double half) {
+  return (InterpolateSeries(stamps, integral, time + half) -
+          InterpolateSeries(stamps, integral, time - half)) /
          (2.0 * half);
 }
 
@@ -44,27 +58,30 @@ LagFit FitAtLag(const std::vector<double>& reference_stamps,
                 const std::vector<double>& other_stamps,
                 const std::vector<Vec3>& other_means, size_t first, size_t last,
                 double lag, double half) {
-  const size_t n = last - first;
-  std::vector<Vec3> reference(n);
+  const size_t count = last - first;
+  std::vector<Vec3> reference(count);
   Mat3 cross = Mat3::Zero();
-  for (size_t i = 0; i < n; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     reference[i] = MeanRate(reference_stamps, reference_integral,
                             other_stamps[first + i] + lag, half);
     cross += other_means[first + i] * reference[i].transpose();
   }
+  // Kabsch: the rotation of the SVD, its last axis flipped for a
+  // reflection.
   const Eigen::JacobiSVD<Mat3> svd(cross,
                                    Eigen::ComputeFullU | Eigen::ComputeFullV);
+  constexpr int kLastAxis = kSpaceDim - 1;
   Mat3 sign = Mat3::Identity();
-  sign(2, 2) = (svd.matrixV() * svd.matrixU().transpose()).determinant() < 0.0
-                   ? -1.0
-                   : 1.0;
+  sign(kLastAxis, kLastAxis) =
+      (svd.matrixV() * svd.matrixU().transpose()).determinant() < 0.0 ? -1.0
+                                                                      : 1.0;
   LagFit fit;
   fit.rotation = svd.matrixV() * sign * svd.matrixU().transpose();
   double sum = 0.0;
-  for (size_t i = 0; i < n; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     sum += (fit.rotation * other_means[first + i] - reference[i]).squaredNorm();
   }
-  fit.residual = std::sqrt(sum / static_cast<double>(n));
+  fit.residual = std::sqrt(sum / static_cast<double>(count));
   return fit;
 }
 
@@ -82,7 +99,7 @@ ClockSyncResult EstimateClockOffset(const std::vector<double>& reference_stamps,
   if (reference_stamps.size() < 2 || other_stamps.size() < 2) return result;
   const int num_lags =
       2 * static_cast<int>(std::lround(config.max_lag / config.step)) + 1;
-  const double half = std::max(config.smoothing, 1e-4);
+  const double half = std::max(config.smoothing, kMinSmoothing);
   const std::vector<Vec3> reference_integral =
       Integral(reference_stamps, reference_rates);
   const std::vector<Vec3> other_integral = Integral(other_stamps, other_rates);
@@ -92,52 +109,57 @@ ClockSyncResult EstimateClockOffset(const std::vector<double>& reference_stamps,
         MeanRate(other_stamps, other_integral, other_stamps[i], half);
   }
   // Samples whose shifted window may leave either span are not used.
-  const double lo = std::max(reference_stamps.front() + config.max_lag,
-                             other_stamps.front()) +
-                    half;
-  const double hi =
+  const double first_usable =
+      std::max(reference_stamps.front() + config.max_lag,
+               other_stamps.front()) +
+      half;
+  const double last_usable =
       std::min(reference_stamps.back() - config.max_lag, other_stamps.back()) -
       half;
   ClockSyncWindow best_window;
-  double best_residual = -1.0;
+  double best_residual = -1.0;  // None yet.
   for (double start = other_stamps.front(); start < other_stamps.back();
        start += config.window) {
     const double end = start + config.window;
     const size_t first = static_cast<size_t>(
         std::lower_bound(other_stamps.begin(), other_stamps.end(),
-                         std::max(start, lo)) -
+                         std::max(start, first_usable)) -
         other_stamps.begin());
     const size_t last = static_cast<size_t>(
         std::lower_bound(other_stamps.begin(), other_stamps.end(),
-                         std::min(end, hi)) -
+                         std::min(end, last_usable)) -
         other_stamps.begin());
     if (last <= first || static_cast<int>(last - first) < config.min_samples) {
       continue;
     }
     std::vector<double> rates;
     rates.reserve(last - first);
-    for (size_t i = first; i < last; ++i)
+    for (size_t i = first; i < last; ++i) {
       rates.push_back(other_means[i].norm());
-    if (Percentile(rates, 90.0) < config.min_rate) continue;
+    }
+    if (Percentile(rates, kRatePercentile) < config.min_rate) continue;
 
     std::vector<double> residuals(static_cast<size_t>(num_lags));
-    for (int k = 0; k < num_lags; ++k) {
-      const double lag = -config.max_lag + k * config.step;
-      residuals[static_cast<size_t>(k)] =
+    for (int lag_index = 0; lag_index < num_lags; ++lag_index) {
+      const double lag = -config.max_lag + lag_index * config.step;
+      residuals[static_cast<size_t>(lag_index)] =
           FitAtLag(reference_stamps, reference_integral, other_stamps,
                    other_means, first, last, lag, half)
               .residual;
     }
-    const int k =
+    const int best =
         static_cast<int>(std::min_element(residuals.begin(), residuals.end()) -
                          residuals.begin());
-    double lag = -config.max_lag + k * config.step;
-    if (k > 0 && k + 1 < num_lags) {
-      const double y0 = residuals[static_cast<size_t>(k - 1)];
-      const double y1 = residuals[static_cast<size_t>(k)];
-      const double y2 = residuals[static_cast<size_t>(k + 1)];
-      const double curvature = y0 - 2.0 * y1 + y2;
-      if (curvature > 0.0) lag += 0.5 * (y0 - y2) / curvature * config.step;
+    double lag = -config.max_lag + best * config.step;
+    if (best > 0 && best + 1 < num_lags) {
+      // The vertex of the parabola through the best lag and its neighbours.
+      const double before = residuals[static_cast<size_t>(best - 1)];
+      const double at = residuals[static_cast<size_t>(best)];
+      const double after = residuals[static_cast<size_t>(best + 1)];
+      const double curvature = before - 2.0 * at + after;
+      if (curvature > 0.0) {
+        lag += 0.5 * (before - after) / curvature * config.step;
+      }
     }
     const LagFit fit =
         FitAtLag(reference_stamps, reference_integral, other_stamps,
@@ -159,36 +181,45 @@ ClockSyncResult EstimateClockOffset(const std::vector<double>& reference_stamps,
 
   // Robust straight line through the window lags.
   std::vector<bool> inlier(result.windows.size(), true);
-  double sum_t = 0.0;
-  for (const ClockSyncWindow& w : result.windows) sum_t += w.center;
-  result.reference_time = sum_t / static_cast<double>(result.windows.size());
-  for (int pass = 0; pass < 2; ++pass) {
-    double n = 0.0, st = 0.0, sl = 0.0, stt = 0.0, stl = 0.0;
+  double sum_centers = 0.0;
+  for (const ClockSyncWindow& window : result.windows) {
+    sum_centers += window.center;
+  }
+  result.reference_time =
+      sum_centers / static_cast<double>(result.windows.size());
+  for (int pass = 0; pass < kRobustFitPasses; ++pass) {
+    // Least squares lag = offset + drift * time over the inliers.
+    double count = 0.0;
+    double sum_time = 0.0;
+    double sum_lag = 0.0;
+    double sum_time_time = 0.0;
+    double sum_time_lag = 0.0;
     for (size_t i = 0; i < result.windows.size(); ++i) {
       if (!inlier[i]) continue;
-      const double t = result.windows[i].center - result.reference_time;
-      const double l = result.windows[i].lag;
-      n += 1.0;
-      st += t;
-      sl += l;
-      stt += t * t;
-      stl += t * l;
+      const double time = result.windows[i].center - result.reference_time;
+      const double lag = result.windows[i].lag;
+      count += 1.0;
+      sum_time += time;
+      sum_lag += lag;
+      sum_time_time += time * time;
+      sum_time_lag += time * lag;
     }
-    const double denominator = n * stt - st * st;
-    if (n >= 2.0 && denominator > 1e-9) {
-      result.drift = (n * stl - st * sl) / denominator;
-      result.offset = (sl - result.drift * st) / n;
+    const double denominator = count * sum_time_time - sum_time * sum_time;
+    if (count >= kMinWindowsForDrift && denominator > kMinTimeSpread) {
+      result.drift = (count * sum_time_lag - sum_time * sum_lag) / denominator;
+      result.offset = (sum_lag - result.drift * sum_time) / count;
     } else {
       result.drift = 0.0;
-      result.offset = n > 0.0 ? sl / n : best_window.lag;
+      result.offset = count > 0.0 ? sum_lag / count : best_window.lag;
     }
     std::vector<double> deviations;
-    for (const ClockSyncWindow& w : result.windows) {
+    for (const ClockSyncWindow& window : result.windows) {
       deviations.push_back(
-          std::abs(w.lag - result.offset -
-                   result.drift * (w.center - result.reference_time)));
+          std::abs(window.lag - result.offset -
+                   result.drift * (window.center - result.reference_time)));
     }
-    const double limit = std::max(3.0 * 1.4826 * Median(deviations), 0.002);
+    const double limit = std::max(
+        kInlierSigmas * kMadToSigma * Median(deviations), kMinInlierLimit);
     for (size_t i = 0; i < result.windows.size(); ++i) {
       inlier[i] = deviations[i] <= limit;
     }

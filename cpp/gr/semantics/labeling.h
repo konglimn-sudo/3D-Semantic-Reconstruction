@@ -14,6 +14,7 @@
 #include "gr/core/pose.h"
 #include "gr/semantics/objects.h"
 #include "gr/semantics/projector.h"
+#include "gr/semantics/slots.h"
 #include "gr/sensors/camera.h"
 #include "gr/sensors/exposure.h"
 
@@ -30,7 +31,8 @@ struct FrameLabelConfig {
 };
 
 struct SlotGeometry {
-  std::array<Vec2, 4> corners;  // corners[0], corners[1]: entrance edge.
+  // corners[0], corners[1]: entrance edge.
+  std::array<Vec2, kParkingSlotCorners> corners;
   double z = 0.0;               // Floor height.
 };
 
@@ -43,9 +45,13 @@ struct MarkingGeometry {
 using Polyline2 = std::vector<Vec2>;
 
 struct SlotProjection {
+  // Image coordinates of a corner that does not project.
+  static constexpr double kUnprojected = -1.0;
+
   int index = 0;
-  std::array<Vec2, 4> corners_uv;  // (-1, -1) where a corner does not project.
-  std::array<bool, 4> corner_visible{};
+  // (kUnprojected, kUnprojected) where a corner does not project.
+  std::array<Vec2, kParkingSlotCorners> corners_uv;
+  std::array<bool, kParkingSlotCorners> corner_visible{};
   double entrance_visible = 0.0;  // Visible fraction of the entrance edge.
   double visible_fraction = 0.0;
   std::vector<Polyline2> polylines;  // Visible runs of the outline.
@@ -124,20 +130,34 @@ std::vector<float> EdgeStrength(const ImageView& image);
 // are skipped and votes are accumulated; a point needs `min_views` views.
 class LabelLifter {
  public:
+  // Defaults: point spacing (m) of the splats, the range (m) of the views,
+  // the half side (pixels) of the uniform-label window and the views a point
+  // needs.
+  static constexpr double kDefaultSpacing = 0.05;
+  static constexpr double kDefaultMaxRange = 15.0;
+  static constexpr int kDefaultBoundary = 1;
+  static constexpr int kDefaultMinViews = 2;
+  // No label: in the label images and of points without enough views.
+  static constexpr int kNoLabel = -1;
+
   // `num_classes` must be positive.
-  LabelLifter(const Points& points, int num_classes, double spacing = 0.05,
-              double max_range = 15.0, int boundary = 1, int min_views = 2);
+  LabelLifter(const Points& points, int num_classes,
+              double spacing = kDefaultSpacing,
+              double max_range = kDefaultMaxRange,
+              int boundary = kDefaultBoundary,
+              int min_views = kDefaultMinViews);
   LabelLifter(const LabelLifter&) = default;
   LabelLifter& operator=(const LabelLifter&) = default;
   LabelLifter(LabelLifter&&) = default;
   LabelLifter& operator=(LabelLifter&&) = default;
 
-  // `labels`: camera-sized H x W image (-1 = none); `weights`: H x W or null.
+  // `labels`: camera-sized H x W image (negative: none); `weights`: H x W or
+  // null.
   void AddView(const CameraModel& camera, const CameraExposure& exposure,
                const int32_t* labels, const float* weights = nullptr);
 
   struct Lifted {
-    std::vector<int> labels;         // -1 = unlabelled.
+    std::vector<int> labels;         // kNoLabel: unlabelled.
     std::vector<double> confidence;  // Winning share of the votes.
   };
   Lifted Lift() const;

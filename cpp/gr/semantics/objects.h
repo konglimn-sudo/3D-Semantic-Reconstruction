@@ -13,7 +13,10 @@
 namespace gr {
 
 struct ObjectBox {
-  int track_id = -1;
+  // Track id of boxes outside any track.
+  static constexpr int kNoTrack = -1;
+
+  int track_id = kNoTrack;
   int label = 0;  // Semantic class id.
   Vec3 center = Vec3::Zero();
   Vec3 size = Vec3::Ones();  // Length (x), width (y), height (z), box frame.
@@ -30,6 +33,9 @@ struct ObjectBox {
 
 class BoxTimeline {
  public:
+  // Tracks cover their time span plus this slack (s) at both ends.
+  static constexpr double kDefaultSlack = 0.5;
+
   BoxTimeline() = default;
   BoxTimeline(const BoxTimeline&) = default;
   BoxTimeline& operator=(const BoxTimeline&) = default;
@@ -43,7 +49,8 @@ class BoxTimeline {
   // Boxes at `stamp`: the trip's parked objects, then every track of the trip
   // whose time span (+- slack) covers the stamp, interpolated (linear centre,
   // shortest-arc yaw).
-  std::vector<ObjectBox> At(int trip, double stamp, double slack = 0.5) const;
+  std::vector<ObjectBox> At(int trip, double stamp,
+                            double slack = kDefaultSlack) const;
 
  private:
   struct Observation {

@@ -13,66 +13,111 @@
 namespace gr {
 namespace {
 
-Vec2 Unit(const Vec2& v) { return v / std::max(v.norm(), 1e-9); }
+// Directions of vectors shorter than this have no meaning; weights below it
+// do not divide.
+constexpr double kMinNorm = 1e-9;
+// Confidences are at most this.
+constexpr double kMaxConfidence = 1.0;
+// Skeleton cells with at least this many skeleton neighbours (of the 8
+// within kNeighbourhoodRadius) are junctions.
+constexpr int kNeighbourhoodRadius = 1;
+constexpr int kMinJunctionNeighbours = 3;
+// A cell's centre, in cells from its corner.
+constexpr double kCellCentre = 0.5;
+// Branches shorter than this share of the minimum marking length are noise.
+constexpr double kMinBranchShare = 0.5;
+// Branches whose cells lie farther than this (cells) from their line on
+// average are curved (arrow heads, text).
+constexpr double kMaxMeanResidual = 2.0;
+// The eigenvector of the larger eigenvalue (Eigen sorts them ascending).
+constexpr int kMajorAxis = 1;
+// The distance to the background is half the width on the centre line.
+constexpr double kWidthPerDepth = 2.0;
+// Each side is sampled kSideSamples times over the middle kSampleSpan of the
+// line, starting kSampleStart in.
+constexpr int kSideSamples = 20;
+constexpr double kSampleStart = 0.1;
+constexpr double kSampleSpan = 0.8;
+// Lane markings run within this angle (deg) of the path, measured over
+// kTangentHalfWindow samples to both sides of the closest one (needing
+// kMinPathSamples), whose chord is at least kMinTangentLength (m) long.
+constexpr double kLaneMaxAngle = 10.0;
+constexpr size_t kMinPathSamples = 3;
+constexpr size_t kTangentHalfWindow = 5;
+constexpr double kMinTangentLength = 0.5;
+
+Vec2 Unit(const Vec2& vector) {
+  return vector / std::max(vector.norm(), kMinNorm);
+}
+
+// The centre of a row-major cell, in cells.
+Vec2 CellCentre(int cell, int width) {
+  return Vec2(cell % width + kCellCentre, cell / width + kCellCentre);
+}
 
 }  // namespace
 
-std::vector<MarkingSegment> MergeCollinear(std::vector<MarkingSegment> segs,
-                                           const MarkingConfig& config) {
-  const size_t n = segs.size();
-  if (n < 2) return segs;
-  std::vector<uint8_t> alive(n, 1);
+std::vector<MarkingSegment> MergeCollinear(
+    std::vector<MarkingSegment> segments, const MarkingConfig& config) {
+  const size_t count = segments.size();
+  if (count < 2) return segments;
+  std::vector<uint8_t> alive(count, 1);
   const double cos_max = std::cos(DegToRad(config.merge_angle));
-  for (size_t a = 0; a < n; ++a) {
-    while (alive[a]) {
-      const Vec2 da = Unit(segs[a].p1 - segs[a].p0);
-      const Vec2 nrm(-da.y(), da.x());
-      const double la = (segs[a].p1 - segs[a].p0).norm();
-      size_t partner = n;
-      double t0 = 0.0;
-      double t1 = 0.0;
-      for (size_t k = 0; k < n; ++k) {
-        if (k == a || !alive[k]) continue;
-        const MarkingSegment& b = segs[k];
-        const Vec2 db = Unit(b.p1 - b.p0);
-        if (std::abs(db.dot(da)) < cos_max) continue;
-        if (std::max(std::abs((b.p0 - segs[a].p0).dot(nrm)),
-                     std::abs((b.p1 - segs[a].p0).dot(nrm))) >
+  for (size_t base = 0; base < count; ++base) {
+    while (alive[base]) {
+      const Vec2 direction = Unit(segments[base].p1 - segments[base].p0);
+      const Vec2 normal(-direction.y(), direction.x());
+      const double base_length = (segments[base].p1 - segments[base].p0).norm();
+      size_t partner = count;
+      double partner_start = 0.0;  // Along the base, from its p0.
+      double partner_end = 0.0;
+      for (size_t other = 0; other < count; ++other) {
+        if (other == base || !alive[other]) continue;
+        const MarkingSegment& candidate = segments[other];
+        const Vec2 candidate_direction = Unit(candidate.p1 - candidate.p0);
+        if (std::abs(candidate_direction.dot(direction)) < cos_max) continue;
+        if (std::max(
+                std::abs((candidate.p0 - segments[base].p0).dot(normal)),
+                std::abs((candidate.p1 - segments[base].p0).dot(normal))) >
             config.merge_offset) {
           continue;
         }
-        const double s0 = (b.p0 - segs[a].p0).dot(da);
-        const double s1 = (b.p1 - segs[a].p0).dot(da);
-        const double gap =
-            std::max(std::min(s0, s1) - la, -std::max(s0, s1));
+        const double start = (candidate.p0 - segments[base].p0).dot(direction);
+        const double end = (candidate.p1 - segments[base].p0).dot(direction);
+        const double gap = std::max(std::min(start, end) - base_length,
+                                    -std::max(start, end));
         if (gap > config.merge_gap) continue;
-        partner = k;
-        t0 = s0;
-        t1 = s1;
+        partner = other;
+        partner_start = start;
+        partner_end = end;
         break;
       }
-      if (partner == n) break;
-      const MarkingSegment& A = segs[a];
-      const MarkingSegment& B = segs[partner];
-      const double lo = std::min({0.0, t0, t1});
-      const double hi = std::max({la, t0, t1});
-      const double lb = B.length();
-      const double total = std::max(la + lb, 1e-9);
+      if (partner == count) break;
+      const MarkingSegment& kept = segments[base];
+      const MarkingSegment& absorbed = segments[partner];
+      const double start = std::min({0.0, partner_start, partner_end});
+      const double end = std::max({base_length, partner_start, partner_end});
+      const double absorbed_length = absorbed.length();
+      const double total = std::max(base_length + absorbed_length, kMinNorm);
       MarkingSegment merged;
-      merged.level = A.level;
-      merged.p0 = A.p0 + lo * da;
-      merged.p1 = A.p0 + hi * da;
-      merged.width = (A.width * la + B.width * lb) / total;
-      merged.lane = A.lane;
-      merged.confidence =
-          std::min(1.0, (A.confidence * la + B.confidence * lb) / total);
-      segs[a] = merged;
+      merged.level = kept.level;
+      merged.p0 = kept.p0 + start * direction;
+      merged.p1 = kept.p0 + end * direction;
+      merged.width =
+          (kept.width * base_length + absorbed.width * absorbed_length) /
+          total;
+      merged.lane = kept.lane;
+      merged.confidence = std::min(
+          kMaxConfidence, (kept.confidence * base_length +
+                           absorbed.confidence * absorbed_length) /
+                              total);
+      segments[base] = merged;
       alive[partner] = 0;
     }
   }
   std::vector<MarkingSegment> out;
-  for (size_t i = 0; i < n; ++i) {
-    if (alive[i]) out.push_back(segs[i]);
+  for (size_t i = 0; i < count; ++i) {
+    if (alive[i]) out.push_back(segments[i]);
   }
   return out;
 }
@@ -92,101 +137,124 @@ std::vector<MarkingSegment> VectorizeMarkings(
   // Junctions: skeleton cells with three or more skeleton neighbours; the
   // branches are what is left away from them.
   Mask junction(skeleton.size(), 0);
-  for (int j = 0; j < height; ++j) {
-    for (int i = 0; i < width; ++i) {
-      if (!skeleton[static_cast<size_t>(j * width + i)]) continue;
+  for (int row = 0; row < height; ++row) {
+    for (int column = 0; column < width; ++column) {
+      if (!skeleton[static_cast<size_t>(row * width + column)]) continue;
       int neighbours = 0;
-      for (int dj = -1; dj <= 1; ++dj) {
-        for (int di = -1; di <= 1; ++di) {
-          if (di == 0 && dj == 0) continue;
-          const int ni = i + di;
-          const int nj = j + dj;
-          neighbours += ni >= 0 && nj >= 0 && ni < width && nj < height &&
-                        skeleton[static_cast<size_t>(nj * width + ni)];
+      for (int row_offset = -kNeighbourhoodRadius;
+           row_offset <= kNeighbourhoodRadius; ++row_offset) {
+        for (int column_offset = -kNeighbourhoodRadius;
+             column_offset <= kNeighbourhoodRadius; ++column_offset) {
+          if (column_offset == 0 && row_offset == 0) continue;
+          const int neighbour_column = column + column_offset;
+          const int neighbour_row = row + row_offset;
+          neighbours +=
+              neighbour_column >= 0 && neighbour_row >= 0 &&
+              neighbour_column < width && neighbour_row < height &&
+              skeleton[static_cast<size_t>(neighbour_row * width +
+                                           neighbour_column)];
         }
       }
-      junction[static_cast<size_t>(j * width + i)] = neighbours >= 3;
+      junction[static_cast<size_t>(row * width + column)] =
+          neighbours >= kMinJunctionNeighbours;
     }
   }
   const Mask near_junction = DilateCross(junction, width, height);
   Mask branches(skeleton.size(), 0);
-  for (size_t c = 0; c < branches.size(); ++c) {
-    branches[c] = skeleton[c] && !near_junction[c];
+  for (size_t cell = 0; cell < branches.size(); ++cell) {
+    branches[cell] = skeleton[cell] && !near_junction[cell];
   }
   Mask background(mask.size());
-  for (size_t c = 0; c < mask.size(); ++c) background[c] = mask[c] == 0;
-  const std::vector<float> dist = DistanceTransform(background, width, height);
-  std::vector<MarkingSegment> segs;
+  for (size_t cell = 0; cell < mask.size(); ++cell) {
+    background[cell] = mask[cell] == 0;
+  }
+  const std::vector<float> distance =
+      DistanceTransform(background, width, height);
+  std::vector<MarkingSegment> segments;
   for (const std::vector<int>& cells : Label8(branches, width, height).cells) {
-    if (static_cast<double>(cells.size()) * res < config.min_length * 0.5) {
+    if (static_cast<double>(cells.size()) * res <
+        config.min_length * kMinBranchShare) {
       continue;
     }
     Vec2 mean = Vec2::Zero();
-    for (int c : cells) mean += Vec2(c % width + 0.5, c / width + 0.5);
+    for (int cell : cells) mean += CellCentre(cell, width);
     mean /= static_cast<double>(cells.size());
     Eigen::Matrix2d scatter = Eigen::Matrix2d::Zero();
-    for (int c : cells) {
-      const Vec2 d = Vec2(c % width + 0.5, c / width + 0.5) - mean;
-      scatter += d * d.transpose();
+    for (int cell : cells) {
+      const Vec2 offset = CellCentre(cell, width) - mean;
+      scatter += offset * offset.transpose();
     }
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> solver(scatter);
-    Vec2 d = solver.eigenvectors().col(1);
+    Vec2 direction = solver.eigenvectors().col(kMajorAxis);
     // A deterministic orientation: the larger component positive.
-    if ((std::abs(d.x()) >= std::abs(d.y()) ? d.x() : d.y()) < 0.0) d = -d;
-    const Vec2 nrm(-d.y(), d.x());
-    double t_min = std::numeric_limits<double>::infinity();
-    double t_max = -t_min;
-    double resid = 0.0;
-    double depth = 0.0;
-    for (int c : cells) {
-      const Vec2 p = Vec2(c % width + 0.5, c / width + 0.5) - mean;
-      const double t = p.dot(d);
-      t_min = std::min(t_min, t);
-      t_max = std::max(t_max, t);
-      resid += std::abs(p.dot(nrm));
-      depth += dist[static_cast<size_t>(c)];
+    if ((std::abs(direction.x()) >= std::abs(direction.y()) ? direction.x()
+                                                            : direction.y()) <
+        0.0) {
+      direction = -direction;
     }
-    if (resid / static_cast<double>(cells.size()) > 2.0) {
+    const Vec2 normal(-direction.y(), direction.x());
+    double along_min = std::numeric_limits<double>::infinity();
+    double along_max = -along_min;
+    double residual = 0.0;
+    double depth = 0.0;
+    for (int cell : cells) {
+      const Vec2 offset = CellCentre(cell, width) - mean;
+      const double along = offset.dot(direction);
+      along_min = std::min(along_min, along);
+      along_max = std::max(along_max, along);
+      residual += std::abs(offset.dot(normal));
+      depth += distance[static_cast<size_t>(cell)];
+    }
+    if (residual / static_cast<double>(cells.size()) > kMaxMeanResidual) {
       continue;  // A curved branch (arrow head, text).
     }
-    MarkingSegment seg;
-    seg.level = level;
+    MarkingSegment segment;
+    segment.level = level;
     const Vec2 origin(frame.x0, frame.y0);
-    seg.p0 = origin + res * (mean + t_min * d);
-    seg.p1 = origin + res * (mean + t_max * d);
-    seg.width = 2.0 * depth / static_cast<double>(cells.size()) * res;
-    segs.push_back(seg);
+    segment.p0 = origin + res * (mean + along_min * direction);
+    segment.p1 = origin + res * (mean + along_max * direction);
+    segment.width =
+        kWidthPerDepth * depth / static_cast<double>(cells.size()) * res;
+    segments.push_back(segment);
   }
-  segs = MergeCollinear(std::move(segs), config);
+  segments = MergeCollinear(std::move(segments), config);
   std::vector<MarkingSegment> out;
-  for (const MarkingSegment& s : segs) {
-    if (s.length() >= config.min_length && s.width >= config.min_width &&
-        s.width <= config.max_width) {
-      out.push_back(s);
+  for (const MarkingSegment& segment : segments) {
+    if (segment.length() >= config.min_length &&
+        segment.width >= config.min_width &&
+        segment.width <= config.max_width) {
+      out.push_back(segment);
     }
   }
   return out;
 }
 
-bool BothSidesObserved(const MarkingSegment& seg,
+bool BothSidesObserved(const MarkingSegment& segment,
                        const std::vector<uint8_t>& floor,
                        const RasterFrame& frame, double offset,
                        double min_fraction) {
-  const Vec2 d = Unit(seg.p1 - seg.p0);
-  const Vec2 n = Vec2(-d.y(), d.x()) * (seg.width / 2.0 + offset);
+  const Vec2 direction = Unit(segment.p1 - segment.p0);
+  const Vec2 side_offset =
+      Vec2(-direction.y(), direction.x()) * (segment.width / 2.0 + offset);
   for (double side : {1.0, -1.0}) {
     int inside = 0;
     int observed = 0;
-    for (int k = 0; k < 20; ++k) {
-      const double t = 0.1 + 0.8 * k / 19.0;
-      const Vec2 p = seg.p0 + t * (seg.p1 - seg.p0) + side * n;
-      const int ci =
-          static_cast<int>(std::floor((p.x() - frame.x0) / frame.res));
-      const int cj =
-          static_cast<int>(std::floor((p.y() - frame.y0) / frame.res));
-      if (ci < 0 || cj < 0 || ci >= frame.width || cj >= frame.height) continue;
+    for (int sample = 0; sample < kSideSamples; ++sample) {
+      const double fraction_along =
+          kSampleStart + kSampleSpan * sample / (kSideSamples - 1);
+      const Vec2 point = segment.p0 +
+                         fraction_along * (segment.p1 - segment.p0) +
+                         side * side_offset;
+      const int column =
+          static_cast<int>(std::floor((point.x() - frame.x0) / frame.res));
+      const int row =
+          static_cast<int>(std::floor((point.y() - frame.y0) / frame.res));
+      if (column < 0 || row < 0 || column >= frame.width ||
+          row >= frame.height) {
+        continue;
+      }
       ++inside;
-      observed += floor[static_cast<size_t>(cj * frame.width + ci)] != 0;
+      observed += floor[static_cast<size_t>(row * frame.width + column)] != 0;
     }
     const double fraction =
         inside > 0 ? static_cast<double>(observed) / inside : 0.0;
@@ -195,59 +263,67 @@ bool BothSidesObserved(const MarkingSegment& seg,
   return true;
 }
 
-bool GridAligned(const MarkingSegment& seg, double yaw,
+bool GridAligned(const MarkingSegment& segment, double yaw,
                  double max_angle_deg) {
-  const Vec2 d = seg.p1 - seg.p0;
+  const Vec2 direction = segment.p1 - segment.p0;
   const double quarter = kPi / 2.0;
-  double a = std::atan2(d.y(), d.x()) - yaw;
-  a -= std::floor(a / quarter) * quarter;  // Python's modulo: [0, pi / 2).
-  return std::min(a, quarter - a) <= DegToRad(max_angle_deg);
+  double angle = std::atan2(direction.y(), direction.x()) - yaw;
+  // Python's modulo: [0, pi / 2).
+  angle -= std::floor(angle / quarter) * quarter;
+  return std::min(angle, quarter - angle) <= DegToRad(max_angle_deg);
 }
 
-int RefineSegments(std::vector<MarkingSegment>& segs,
+int RefineSegments(std::vector<MarkingSegment>& segments,
                    const std::vector<const FloorImage*>& images,
                    const LineFitConfig& config) {
   int refined = 0;
-  for (MarkingSegment& seg : segs) {
+  for (MarkingSegment& segment : segments) {
     std::optional<LineFit> fit;
     for (const FloorImage* image : images) {
-      fit = FitLine(seg.p0, seg.p1, *image, config);
+      fit = FitLine(segment.p0, segment.p1, *image, config);
       if (fit) break;
     }
     if (!fit) continue;
-    seg.p0 = fit->p0;
-    seg.p1 = fit->p1;
-    seg.width = fit->width;
-    seg.end_ok[0] = fit->end_ok[0];
-    seg.end_ok[1] = fit->end_ok[1];
+    segment.p0 = fit->p0;
+    segment.p1 = fit->p1;
+    segment.width = fit->width;
+    for (int end = 0; end < kSegmentEnds; ++end) {
+      segment.end_ok[end] = fit->end_ok[end];
+    }
     ++refined;
   }
   return refined;
 }
 
-void ClassifyMarkings(std::vector<MarkingSegment>& segs,
+void ClassifyMarkings(std::vector<MarkingSegment>& segments,
                       const std::map<int, std::vector<Vec2>>& paths,
                       const MarkingConfig& config) {
-  const double cos_max = std::cos(DegToRad(10.0));
-  for (MarkingSegment& s : segs) {
-    s.lane = false;
-    const auto found = paths.find(s.level);
-    if (found == paths.end() || found->second.size() < 3 ||
-        s.length() < config.lane_min_length) {
+  const double cos_max = std::cos(DegToRad(kLaneMaxAngle));
+  for (MarkingSegment& segment : segments) {
+    segment.lane = false;
+    const auto found = paths.find(segment.level);
+    if (found == paths.end() || found->second.size() < kMinPathSamples ||
+        segment.length() < config.lane_min_length) {
       continue;
     }
     const std::vector<Vec2>& path = found->second;
-    const Vec2 mid = 0.5 * (s.p0 + s.p1);
-    size_t k = 0;
+    const Vec2 middle = 0.5 * (segment.p0 + segment.p1);
+    size_t closest = 0;
     for (size_t i = 1; i < path.size(); ++i) {
-      if ((path[i] - mid).norm() < (path[k] - mid).norm()) k = i;
+      if ((path[i] - middle).norm() < (path[closest] - middle).norm()) {
+        closest = i;
+      }
     }
-    const Vec2 t = path[std::min(path.size() - 1, k + 5)] -
-                   path[k >= 5 ? k - 5 : 0];
-    const Vec2 d = s.p1 - s.p0;
-    if (t.norm() > 0.5 &&
-        std::abs(t.dot(d)) / (t.norm() * d.norm()) > cos_max) {
-      s.lane = true;
+    const Vec2 tangent =
+        path[std::min(path.size() - 1, closest + kTangentHalfWindow)] -
+        path[closest >= kTangentHalfWindow ? closest - kTangentHalfWindow
+                                           : 0];
+    const Vec2 direction = segment.p1 - segment.p0;
+    if (tangent.norm() > kMinTangentLength &&
+        std::abs(tangent.dot(direction)) /
+                (tangent.norm() * direction.norm()) >
+            cos_max) {
+      segment.lane = true;
     }
   }
 }

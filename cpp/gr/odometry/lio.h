@@ -26,25 +26,25 @@
 namespace gr {
 
 struct LioConfig {
-  double min_range = 1.0;  // Returns used (m).
+  double min_range = 1.0;  // Returns used (m): from min_range to max_range.
   double max_range = 60.0;
-  double map_voxel = 0.5;  // Local map (m); at most this many points each.
-  int max_points_per_voxel = 20;
-  double map_radius = 100.0;   // Voxels farther are dropped (m).
-  double scan_voxel = 0.5;     // Sweep points used in the update (m).
-  double insert_voxel = 0.25;  // Sweep points added to the map (m).
-  int max_iterations = 6;
-  double convergence = 1e-4;  // Update step (rad / m) that ends iterating.
+  double map_voxel = 0.5;         // Local map voxels (m), with at most
+  int max_points_per_voxel = 20;  // this many points each.
+  double map_radius = 100.0;      // Voxels farther are dropped (m).
+  double scan_voxel = 0.5;        // Sweep points used in the update (m).
+  double insert_voxel = 0.25;     // Sweep points added to the map (m).
+  int max_iterations = 6;         // Gauss-Newton iterations per sweep.
+  double convergence = 1e-4;      // Update step (rad / m) that ends iterating.
   // Planes of the map around a point: PCA within the radius, doubled up to
   // max_plane_radius until planar.
-  double plane_radius = 0.0;  // <= 0: map_voxel.
-  double max_plane_radius = 1.2;
+  double plane_radius = 0.0;      // <= 0: map_voxel.
+  double max_plane_radius = 1.2;  // m
   int min_plane_points = 6;
-  double min_planarity = 0.5;
-  double max_plane_thickness = 0.05;
-  double max_residual = 0.5;   // Point-to-plane gate (m).
-  double point_sigma = 0.05;   // Point-to-plane noise (m).
-  double robust_scale = 0.1;   // Cauchy scale of the residual (m).
+  double min_planarity = 0.5;         // (l2 - l3) / l1 of the PCA.
+  double max_plane_thickness = 0.05;  // m, sqrt of the smallest eigenvalue.
+  double max_residual = 0.5;          // Point-to-plane gate (m).
+  double point_sigma = 0.05;          // Point-to-plane noise (m).
+  double robust_scale = 0.1;          // Cauchy scale of the residual (m).
   // Where no plane is found (cars, parapets, vegetation): point-to-point
   // residuals to the nearest map point, with this weight relative to a
   // plane residual (0 disables). They constrain the directions a scene of
@@ -68,11 +68,11 @@ struct LioConfig {
   // errors included) and bias random walks. Too tight a prediction outweighs
   // the weak LiDAR constraints of a degenerate stretch: on Hilti Parking_1
   // accel 0.05 drifted by 30 m, 0.3 tracked to 1.4 m (FAST-LIO uses ~0.3).
-  double gyro_noise = 0.05;        // rad/s/sqrt(Hz)
-  double accel_noise = 0.3;        // m/s^2/sqrt(Hz)
-  double gyro_bias_walk = 1e-4;    // rad/s^2/sqrt(Hz)
-  double accel_bias_walk = 1e-3;   // m/s^3/sqrt(Hz)
-  double gravity = 9.80665;        // m/s^2
+  double gyro_noise = 0.05;           // rad/s/sqrt(Hz)
+  double accel_noise = 0.3;           // m/s^2/sqrt(Hz)
+  double gyro_bias_walk = 1e-4;       // rad/s^2/sqrt(Hz)
+  double accel_bias_walk = 1e-3;      // m/s^3/sqrt(Hz)
+  double gravity = kStandardGravity;  // m/s^2
   // Initial uncertainty: the first sweep may already be in motion.
   double init_velocity_sigma = 1.0;    // m/s
   double init_tilt_sigma_deg = 1.0;    // roll / pitch
@@ -87,13 +87,25 @@ struct LioStats {
   // Smallest eigenvalue of the translation block of the LiDAR information
   // (1/m^2): small in degenerate geometry.
   double min_translation_information = 0.0;
-  int point_residuals = 0;  // Point-to-point fallbacks among them.
-  bool stationary = false;  // A zero-velocity update was applied.
+  int point_residuals = 0;       // Point-to-point fallbacks among them.
+  bool stationary = false;       // A zero-velocity update was applied.
   Vec3 velocity = Vec3::Zero();  // World, of the IMU (m/s).
 };
 
 class LioOdometry {
  public:
+  // The error state: rotation (right perturbation), position, velocity,
+  // gyro bias, accelerometer bias.
+  static constexpr int kRotationState = 0;
+  static constexpr int kPositionState = kRotationState + kSpaceDim;
+  static constexpr int kVelocityState = kPositionState + kSpaceDim;
+  static constexpr int kGyroBiasState = kVelocityState + kSpaceDim;
+  static constexpr int kAccelBiasState = kGyroBiasState + kSpaceDim;
+  static constexpr int kStateDim = kAccelBiasState + kSpaceDim;
+
+  using Mat15 = Eigen::Matrix<double, kStateDim, kStateDim>;
+  using Vec15 = Eigen::Matrix<double, kStateDim, 1>;
+
   // `imu` in the vehicle frame (ImuSamples); starts at world <- vehicle
   // `world_from_vehicle0`.
   LioOdometry(const LioConfig& config, ImuSamples imu,
@@ -113,27 +125,27 @@ class LioOdometry {
   const Vec3& gyro_bias() const { return gyro_bias_; }
   const Vec3& accel_bias() const { return accel_bias_; }
 
-  using Mat15 = Eigen::Matrix<double, 15, 15>;
-  using Vec15 = Eigen::Matrix<double, 15, 1>;
   const Mat15& covariance() const { return covariance_; }
 
  private:
+  // A pose of the propagation: world <- body at `time`.
   struct Sample {
-    double t;
+    double time = 0.0;
     Mat3 rotation;
     Vec3 position;
   };
-  // Propagates the state and covariance to `t`, recording the poses.
-  void Propagate(double t);
-  // World <- body at `t` within the recorded propagation (clamped).
-  void PoseAt(double t, Mat3& rotation, Vec3& position) const;
-  // Gyro-only poses before the first stamp (static start assumed).
-  void BackfillFirstSweep(double t_first, double stamp);
+  // Propagates the state and covariance to `time`, recording the poses.
+  void Propagate(double time);
+  // World <- body at `time` within the recorded propagation (clamped).
+  void PoseAt(double time, Mat3* rotation, Vec3* position) const;
+  // Gyro-only poses back to `first_time` from the first stamp (static start
+  // assumed).
+  void BackfillFirstSweep(double first_time, double stamp);
   Points Deskew(const Points& points, const std::vector<double>& times,
                 double stamp) const;
   void Update(const Points& sweep_body, bool stationary);
-  // Whether the IMU says the rig stood still just before `t`.
-  bool Stationary(double t) const;
+  // Whether the IMU says the rig stood still just before `time`.
+  bool Stationary(double time) const;
 
   LioConfig config_;
   ImuSamples imu_;
@@ -143,7 +155,7 @@ class LioOdometry {
   VoxelHashMap map_;
   bool initialized_ = false;
   double time_ = 0.0;
-  size_t imu_index_ = 0;  // First IMU sample after `time_`.
+  size_t imu_index_ = 0;              // First IMU sample after `time_`.
   Mat3 rotation_ = Mat3::Identity();  // World <- body.
   Vec3 position_ = Vec3::Zero();
   Vec3 velocity_ = Vec3::Zero();

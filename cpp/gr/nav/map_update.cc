@@ -8,6 +8,15 @@
 #include "gr/nav/features.h"
 
 namespace gr {
+namespace {
+
+// A change belongs to a floor up to this far (m) above its bottom: the
+// floor under a new object's lowest returns.
+constexpr double kFloorAboveBottom = 0.5;
+// Slots are polygons of at least this many corners.
+constexpr size_t kMinPolygonCorners = 3;
+
+}  // namespace
 
 std::vector<MapChange> AssessChanges(
     const std::vector<ChangeCluster>& clusters,
@@ -22,7 +31,9 @@ std::vector<MapChange> AssessChanges(
     double best = std::numeric_limits<double>::infinity();
     for (const FloorHeights& floor : floors) {
       const double z = floor.At(cluster.center.head<2>());
-      if (!std::isfinite(z) || z > cluster.min.z() + 0.5) continue;
+      if (!std::isfinite(z) || z > cluster.min.z() + kFloorAboveBottom) {
+        continue;
+      }
       const double gap = cluster.min.z() - z;
       if (gap < best) {
         best = gap;
@@ -32,7 +43,7 @@ std::vector<MapChange> AssessChanges(
     bool in_slot = false;
     for (const NavSlot& slot : slots) {
       in_slot |= change.level && slot.level == *change.level &&
-                 slot.corners.size() >= 3 &&
+                 slot.corners.size() >= kMinPolygonCorners &&
                  PointInPolygon(slot.corners, cluster.center.head<2>());
     }
     if (in_slot) continue;
@@ -40,15 +51,15 @@ std::vector<MapChange> AssessChanges(
       Footprint footprint;
       footprint.min = cluster.min.head<2>();
       footprint.max = cluster.max.head<2>();
-      for (size_t e = 0; e < edges.size(); ++e) {
-        const NavEdge& edge = edges[e];
+      for (size_t index = 0; index < edges.size(); ++index) {
+        const NavEdge& edge = edges[index];
         if (edge.level != *change.level || edge.kind == "connector" ||
             edge.points.size() < 2) {
           continue;
         }
         if (!EdgesAtFootprints({footprint}, {edge.points}, half_width)
                  .empty()) {
-          change.edges.push_back(static_cast<int>(e));
+          change.edges.push_back(static_cast<int>(index));
         }
       }
     }

@@ -16,8 +16,13 @@
 
 namespace gr {
 
+// SHA-256 (FIPS 180-4).
 class Sha256 {
  public:
+  // Bytes per message block, and 32-bit words of the hash state.
+  static constexpr size_t kBlockBytes = 64;
+  static constexpr size_t kStateWords = 8;
+
   Sha256();
   void Update(const void* data, size_t size);
   void Update(const std::string& text) { Update(text.data(), text.size()); }
@@ -27,8 +32,8 @@ class Sha256 {
  private:
   void Block(const uint8_t* block);
 
-  std::array<uint32_t, 8> state_;
-  std::array<uint8_t, 64> buffer_{};
+  std::array<uint32_t, kStateWords> state_;
+  std::array<uint8_t, kBlockBytes> buffer_{};
   size_t buffered_ = 0;
   uint64_t length_ = 0;  // Bytes.
 };
@@ -36,12 +41,15 @@ class Sha256 {
 // json.dumps(value, sort_keys=True[, indent=indent]): by default one line
 // with ", " and ": " separators; map keys sorted at every depth (ASCII
 // text: non-ASCII stays UTF-8 where Python escapes it).
-std::string PythonJsonDumps(const Value& value, int indent = -1);
+std::string PythonJsonDumps(const Value& value, int indent = kJsonOneLine);
 
 // pose_set._digest: the parts in order, each either float64 values (an
 // array's C-order bytes) or a JSON value; the first 16 hex digits.
 class PythonDigest {
  public:
+  // Hex digits of the short digest.
+  static constexpr size_t kShortDigestLength = 16;
+
   void AddDoubles(const std::vector<double>& values);
   void AddJson(const Value& value);
   std::string Hex16();

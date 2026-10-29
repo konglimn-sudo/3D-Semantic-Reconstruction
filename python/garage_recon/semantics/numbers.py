@@ -440,7 +440,7 @@ def read_numbers(recon, slots: list[slots_lib.Slot], cfg, log=print,
         return {"frames": 0, "landmark_list": []}
     pose_set = recon.pose_set()
     levels = recon.levels()
-    point_map = recon.point_map()
+    point_map = recon.point_map(fields=("dynamic",))
     static = np.ascontiguousarray(
         point_map.xyz if point_map.dynamic is None
         else point_map.xyz[~point_map.dynamic], dtype=np.float64)

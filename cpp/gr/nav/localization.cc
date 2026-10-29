@@ -14,6 +14,19 @@
 namespace gr {
 namespace {
 
+// The localization map keeps up to this many points per voxel.
+constexpr int kMapPointsPerVoxel = 40;
+// Odometry deltas over intervals outside (kMinSweepInterval,
+// kMaxSweepInterval) (s) do not deskew a sweep.
+constexpr double kMinSweepInterval = 1e-6;
+constexpr double kMaxSweepInterval = 1.0;
+// The robust kernel of each tracking gate is this fraction of the gate.
+constexpr double kGatePerKernel = 3.0;
+// The covariance takes at least this residual sigma (m) and a ridge of this
+// share of the Hessian's trace (at least 1).
+constexpr double kMinResidualSigma = 0.01;
+constexpr double kRidgeShare = 1e-9;
+
 // Keeps the components of `delta` along the eigenvectors of `block` whose
 // eigenvalue reaches `ratio` of the largest; returns the number dropped and
 // the smallest eigenvalue ratio.
@@ -32,13 +45,13 @@ Projection ProjectWellConstrained(const Mat3& block, const Vec3& delta,
   Projection out;
   out.delta = Vec3::Zero();
   out.min_ratio = largest > 0.0 ? values.minCoeff() / largest : 0.0;
-  for (int i = 0; i < 3; ++i) {
-    const Vec3 v = solver.eigenvectors().col(i);
-    if (largest > 0.0 && values(i) >= ratio * largest) {
-      out.delta += v * v.dot(delta);
+  for (int index = 0; index < kSpaceDim; ++index) {
+    const Vec3 axis = solver.eigenvectors().col(index);
+    if (largest > 0.0 && values(index) >= ratio * largest) {
+      out.delta += axis * axis.dot(delta);
     } else {
       ++out.dropped;
-      out.degenerate += v * v.transpose();
+      out.degenerate += axis * axis.transpose();
     }
   }
   return out;
@@ -52,24 +65,25 @@ Projection ProjectWellConstrained(const Mat3& block, const Vec3& delta,
 // constrain are dropped.
 struct ConstrainedStep {
   Pose pose;
-  Projection t;
-  Projection r;
+  Projection translation;
+  Projection rotation;
   Mat6 hessian;  // About the sensor, order [dt, dphi].
 };
 
 ConstrainedStep ConstrainStep(const Pose& from, const IcpResult& icp,
                               double ratio) {
-  Mat6 a = Mat6::Identity();
-  a.topRightCorner<3, 3>() = Hat(from.translation);
+  Mat6 adjoint = Mat6::Identity();
+  adjoint.topRightCorner<kSpaceDim, kSpaceDim>() = Hat(from.translation);
   ConstrainedStep out;
-  out.hessian = a.transpose() * icp.hessian * a;
+  out.hessian = adjoint.transpose() * icp.hessian * adjoint;
   const Vec3 dt = icp.pose.translation - from.translation;
   const Vec3 dphi = So3Log(icp.pose.rotation * from.rotation.transpose());
-  out.t = ProjectWellConstrained(out.hessian.topLeftCorner<3, 3>(), dt, ratio);
-  out.r = ProjectWellConstrained(out.hessian.bottomRightCorner<3, 3>(), dphi,
-                                 ratio);
-  out.pose = Pose(So3Exp(out.r.delta) * from.rotation,
-                  from.translation + out.t.delta);
+  out.translation = ProjectWellConstrained(
+      out.hessian.topLeftCorner<kSpaceDim, kSpaceDim>(), dt, ratio);
+  out.rotation = ProjectWellConstrained(
+      out.hessian.bottomRightCorner<kSpaceDim, kSpaceDim>(), dphi, ratio);
+  out.pose = Pose(So3Exp(out.rotation.delta) * from.rotation,
+                  from.translation + out.translation.delta);
   return out;
 }
 
@@ -79,7 +93,7 @@ Localizer::Localizer(const Points& map_points, const LocalizerConfig& config)
     : config_(config),
       map_points_(VoxelDownsample(map_points, config.map_voxel)),
       coarse_map_(VoxelDownsample(map_points, config.placement.voxel)),
-      map_(config.hash_voxel, 1e9, 40) {
+      map_(config.hash_voxel, VoxelHashMap::kUnbounded, kMapPointsPerVoxel) {
   GR_CHECK(!config_.gates.empty());
   map_.AddPoints(map_points_);
 }
@@ -96,19 +110,21 @@ Points Localizer::PrepareSweep(const Points& points,
   Points sweep;
   if (config_.deskew && last_odom_ && times.size() == points.size()) {
     const Pose delta = last_odom_->Inverse() * odom_from_sensor;
-    const double dt = stamp - last_stamp_;
-    if (dt > 1e-6 && dt < 1.0) {
+    const double interval = stamp - last_stamp_;
+    if (interval > kMinSweepInterval && interval < kMaxSweepInterval) {
       sweep = DeskewConstantVelocity(points, times,
-                                     So3Log(delta.rotation) / dt,
-                                     delta.translation / dt);
+                                     So3Log(delta.rotation) / interval,
+                                     delta.translation / interval);
     }
   }
   if (sweep.empty()) sweep = points;
   Points kept;
   kept.reserve(sweep.size());
-  for (const Vec3& p : sweep) {
-    const double r = p.norm();
-    if (r >= config_.min_range && r <= config_.max_range) kept.push_back(p);
+  for (const Vec3& point : sweep) {
+    const double range = point.norm();
+    if (range >= config_.min_range && range <= config_.max_range) {
+      kept.push_back(point);
+    }
   }
   return VoxelDownsample(kept, config_.scan_voxel);
 }
@@ -155,8 +171,9 @@ bool Localizer::TryGlobal(const Points& sweep, const Pose& odom_from_sensor,
   }
   last_attempt_ = travelled_;
   Points merged;
-  for (const SubmapSweep& s : submap_) {
-    const Points odom = TransformPoints(s.points, s.odom_from_sensor);
+  for (const SubmapSweep& submap_sweep : submap_) {
+    const Points odom = TransformPoints(submap_sweep.points,
+                                        submap_sweep.odom_from_sensor);
     merged.insert(merged.end(), odom.begin(), odom.end());
   }
   ++placement_attempts_;
@@ -179,23 +196,23 @@ void Localizer::Track(const Points& sweep, const Pose& odom_from_sensor,
   icp.pose = predicted;
   for (double gate : config_.gates) {
     options.max_corr_dist = gate;
-    options.kernel = gate / 3.0;
+    options.kernel = gate / kGatePerKernel;
     icp = AlignToMap(sweep, map_, icp.pose, options);
   }
   const ConstrainedStep step =
       ConstrainStep(predicted, icp, config_.degenerate_ratio);
-  const Projection& t = step.t;
-  const Projection& r = step.r;
+  const Projection& translation = step.translation;
+  const Projection& rotation = step.rotation;
   const Pose& corrected = step.pose;
   result.fitness = icp.fitness;
   result.rmse = icp.rmse;
-  result.degenerate_t = t.dropped;
-  result.degenerate_r = r.dropped;
-  result.min_eigen_ratio_t = t.min_ratio;
+  result.degenerate_t = translation.dropped;
+  result.degenerate_r = rotation.dropped;
+  result.min_eigen_ratio_t = translation.min_ratio;
   const bool fits = icp.inliers > 0 && icp.fitness >= config_.min_fitness &&
                     icp.rmse <= config_.max_rmse;
-  result.step_t = t.delta.norm();
-  result.step_r = RadToDeg(r.delta.norm());
+  result.step_t = translation.delta.norm();
+  result.step_r = RadToDeg(rotation.delta.norm());
   const bool jumps =
       result.step_t > config_.max_jump_t || result.step_r > config_.max_jump_r;
   if (fits && !jumps) {
@@ -203,22 +220,24 @@ void Localizer::Track(const Points& sweep, const Pose& odom_from_sensor,
     failures_ = 0;
     result.registered = true;
     result.pose = corrected;
-    const double sigma = std::max(icp.rmse, 0.01);
-    const double regularizer = 1e-9 * std::max(step.hessian.trace(), 1.0);
+    const double sigma = std::max(icp.rmse, kMinResidualSigma);
+    const double ridge = kRidgeShare * std::max(step.hessian.trace(), 1.0);
     Mat6 covariance =
-        sigma * sigma *
-        (step.hessian + regularizer * Mat6::Identity()).inverse();
+        sigma * sigma * (step.hessian + ridge * Mat6::Identity()).inverse();
     // Degenerate directions keep the prediction: report the odometry's
     // uncertainty there instead of the (meaningless) ICP one.
-    for (int block = 0; block < 2; ++block) {
-      const Mat3& dropped = block == 0 ? t.degenerate : r.degenerate;
+    for (const int offset : {kTranslationOffset, kRotationOffset}) {
+      const bool is_translation = offset == kTranslationOffset;
+      const Mat3& dropped =
+          is_translation ? translation.degenerate : rotation.degenerate;
       if (dropped.isZero()) continue;
-      const double s = block == 0 ? config_.degenerate_sigma_t
-                                  : DegToRad(config_.degenerate_sigma_r);
+      const double prior_sigma = is_translation
+                                     ? config_.degenerate_sigma_t
+                                     : DegToRad(config_.degenerate_sigma_r);
       const Mat3 kept = Mat3::Identity() - dropped;
-      Mat3 b = covariance.block<3, 3>(3 * block, 3 * block);
-      b = kept * b * kept + s * s * dropped;
-      covariance.block<3, 3>(3 * block, 3 * block) = b;
+      Mat3 block = covariance.block<kSpaceDim, kSpaceDim>(offset, offset);
+      block = kept * block * kept + prior_sigma * prior_sigma * dropped;
+      covariance.block<kSpaceDim, kSpaceDim>(offset, offset) = block;
     }
     result.covariance = covariance;
   } else {

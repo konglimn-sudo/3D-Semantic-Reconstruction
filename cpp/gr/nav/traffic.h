@@ -60,11 +60,11 @@ struct TrafficConfig {
 // A graph edge as the traffic rules see it (all edges of the graph, so that
 // junction degrees are right; only drivable ones carry arrows).
 struct TrafficEdge {
-  int a = -1;
-  int b = -1;
+  int start_node = -1;
+  int end_node = -1;
   int level = 0;
   bool drivable = false;     // Aisle or lane.
-  std::vector<Vec2> points;  // From node a to node b.
+  std::vector<Vec2> points;  // From start_node to end_node.
 };
 
 struct TrafficArrow {
@@ -88,7 +88,7 @@ struct TrafficSign {
 };
 
 struct EdgePasses {
-  int forward = 0;   // a -> b
+  int forward = 0;   // start_node -> end_node
   int backward = 0;
 };
 
@@ -98,9 +98,10 @@ std::vector<EdgePasses> CountPasses(const std::vector<TrafficEdge>& edges,
                                     const TrafficConfig& config);
 
 struct ArrowAssignment {
-  int edge = -1;         // -1: no edge.
-  int sign = 0;          // +1 along a -> b.
-  double lateral = 0.0;  // Left of a -> b (m).
+  static constexpr int kNoEdge = -1;
+  int edge = kNoEdge;
+  int sign = 0;          // +1 along start_node -> end_node, else -1.
+  double lateral = 0.0;  // Left of start_node -> end_node (m).
 };
 
 std::vector<ArrowAssignment> AssignArrows(
@@ -108,8 +109,8 @@ std::vector<ArrowAssignment> AssignArrows(
     const std::vector<TrafficArrow>& arrows, const TrafficConfig& config);
 
 struct CorridorStep {
-  int edge = -1;
-  bool forward = true;  // Travelled a -> b along the corridor.
+  int edge = ArrowAssignment::kNoEdge;
+  bool forward = true;  // Travelled start_node -> end_node.
 };
 
 // Chains of drivable edges between junctions.

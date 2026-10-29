@@ -111,7 +111,7 @@ PYTHONPATH=python .venv/bin/python -m pytest -q   # Python 测试（含一次 ti
 - `cd build && cpack`：程序的 tar.gz，Linux 上另出 deb（依赖 libgomp1、zlib1g）；
 - Docker：`docker build -f docker/Dockerfile -t garage-recon .`，构建阶段跑一遍 `gr_tests`，运行镜像只有两个程序（Ubuntu 24.04 + libgomp）。例：`docker run --rm -v $PWD/work:/work -v $PWD/data:/data garage-recon gr_localize --nav /work/semantics/nav --trip /data/trip_03 --out /work/loc`；
 - Python 包：`pip install .`（scikit-build-core，只编扩展，不编程序和测试）；
-- CI（`.github/workflows/ci.yml`）：Linux GCC 编译 + C++ / Python 测试 + 配置表是否过期 + cpack；macOS Apple clang 编译 + C++ 测试；wheel 构建与安装后导入；Docker 镜像构建与冒烟测试。本机验证过 Apple clang 和 GCC 15（Homebrew）两种编译器，Docker 与 Linux 上的 Eigen 3.4 只在 CI 里跑。
+- CI（`.github/workflows/ci.yml`）：Linux GCC 编译 + C++ / Python 测试 + 配置表是否过期 + cpack；macOS Apple clang 编译 + C++ 测试；wheel 构建与安装后导入；Docker 镜像构建与冒烟测试。本机验证过 Apple clang 和 GCC 15（Homebrew）两种编译器，Docker 与 Linux 上的 Eigen 3.4 只在 CI 里跑。CI 的 Python 包版本锁在 `.github/constraints.txt`（`PIP_CONSTRAINT`，pip 隔离构建 wheel 时也生效），取本机测试通过的版本；不锁时 CI 曾装上 OpenCV 5.0，一个测试因此失败。升级某个包时，先在本机跑通测试再改这个文件。
 - C++ 配置表（`cpp/gr/io/config_tables.inc`）由 `tools/gen_config_tables.py` 从 pybind11 绑定的字段列表生成，C++ 程序读 YAML 的方式因此与 Python 的 `core_config.fill` 完全相同；改了绑定的字段后重新生成，`--check` 检查是否过期。
 
 开发模式下，扩展模块直接生成到 `python/garage_recon/`。也可以用 `pip install .`（scikit-build-core）安装成包，安装前先删掉源码目录里的 `_core*.so`。
@@ -1663,6 +1663,28 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - **默认不分块**（`tile_size: 0`）。车库大到整图放不下时，再设成 20–40 m。
 - 块按点的体素坐标分（水平方向），不分楼层；多层车库的一块包含该范围内的所有楼层。
 
+**语义阶段按需读图**（`load_point_map(fields=, level=, bounds=)`）：各阶段只读自己用到的点属性。
+- BEV 一次只读一层：它的栅格只用本层的点。
+- 分块的图逐块读：先排好地图顺序，再把每块的值直接写到位，同一时刻只多占一块。
+
+合成 large（632 万点），各阶段的峰值内存：
+
+| 阶段 | 原来 | 整图，按需读 | 20 m 块，按需读 | 耗时（整图） |
+|---|---|---|---|---|
+| bev | 0.95 GB | 0.44 GB | 0.42 GB | 2.6 s |
+| structure | 1.33 GB | 1.17 GB | 1.08 GB | 3.4 s |
+| objects | 0.88 GB | 0.96 GB | 0.89 GB | 127 → 56 s（C++） |
+| occupancy | 1.14 GB | 0.86 GB | 0.85 GB | 88 s |
+| nav | 0.97 GB | 0.96 GB | 0.91 GB | 3.3 s |
+| export | 1.16 GB | 0.97 GB | 0.89 GB | 1.7 s |
+
+- **产物不变**：bev 和 semantics 下的 619 个产物（栅格、标签、结构、车位、目标、占据、导航、导出）：
+  - 分块与整图逐字节 / 逐值相同；
+  - 与改动前相比，只有移动目标框差不到 1e-4 m（C++ 目标跟踪，见 10.1）。
+- **为什么只降了 10–50%**：这些阶段的内存主要是整座车库的点坐标（每点 24 字节）和逐点标签。
+  - 结构识别要全库统一的柱网方向，导航要跨楼层的连通，目标识别要整趟的扫描，都还是全图处理；
+  - 要再降，得把这些算法改成按楼层 / 块处理，并重新验证结果。
+
 ## 10. 代码结构
 
 ### 10.1 C++ / Python 分工
@@ -1713,6 +1735,12 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - 线段方向取决于 SVD 的符号（numpy 的符号是任意的），真实数据上车位数会差 1–3 个；
 - 加速：楼层 10–17 倍，结构约 10 倍，标线约 2 倍。
 - 2026-10-27：导航分层（含 `cv2.fillPoly` 的移植、孔洞填充、椭圆核闭运算与膨胀）和 BEV 栅格迁入 C++，结果逐值一致（9.9）。
+- 2026-10-28：目标检测与跟踪（`objects4d`：地图上的停放目标、逐帧聚类检测、匈牙利关联与轨迹拼接、移动目标的框）迁入 C++（`semantics/objects4d`）。新增与 scipy 同算法、同平局规则的线性指派（`LinearSumAssignment`），以及孔洞填充、最小面积外接矩形。合成 large（5 趟、632 万点）上与旧 Python 比较：
+  - 329 个停放目标框相差不超过 1e-14 m；
+  - 276 个移动目标框不超过 2e-5 m（OpenCV 的 `minAreaRect` 用 float32），编号、类别、点数相同；
+  - 359 条轨迹的编号、类别、关键帧相同；
+  - 逐点标签完全相同；
+  - 阶段耗时 127 → 58 s。
 
 第 8 章新增的 C++ 部分：
 - **DA3 深度对齐**（`depth_prior`）：在 LiDAR 点上做稳健尺度 / 偏移拟合，按网格剔除，只填空洞；
@@ -1725,7 +1753,7 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 
 Python 部分：
 - 数据与标定读写、位姿集合（`recon/pose_set.py`）与产物版本记录（`provenance.py`）、阶段编排；
-- 语义：地面箭头的栅格准备、目标检测跟踪（`objects4d`）、车位号、规则、导出；
+- 语义：地面箭头的栅格准备、车位号、规则、导出（目标检测跟踪在 C++ 里，`objects4d.py` 只准备输入、转换框）；
 - 导航地图的路网编辑（合并、接入、碎片剪枝，shapely）、目标点、地址、路网更新与 QA；
 - 语言路线的特征提取与身份级语言特征（`semantics/language_field.py`）；
 - 模型接口与合成真值实现（`models/`）；
@@ -1931,13 +1959,12 @@ Python 部分：
   - 减小回环检测密度（`loops.stride`）；
   - 减少标定轨迹数（`calibration.tracks_per_anchor`）。
 - **不带 Python 部署**：车端定位 `gr_localize`（6.2）和重建的几何阶段 `gr_recon`（4.1）都是纯 C++，有 Docker 镜像和 CPack 包（3.1）。之后的阶段（标定、纹理、语义、导航）仍由 Python 编排，其中要调模型的部分本来就在 GPU 服务器上跑。
-- **CI**：工作流已写好（3.1），还没在 GitHub 上跑过（仓库未推送这次改动）；Linux 上的 Eigen 3.4、Docker 镜像只会在 CI 里第一次验证。
-- **大车库的分块处理**：分层 BA 解决了位姿块的大小；测量点云和动态点判断可以分块（`map.tile_size`，与整图逐位相同，12 m 块的峰值内存是整图的 1/4，9.11）。语义阶段（结构、标线、车位、目标、逐帧标签等）仍把整张图读进内存（`load_point_map` 合并各块），内存随车库面积线性增长，还要改成按楼层 / 块流式处理；BEV 的强度均值按点序求和，分块累加后末位会不同，要先定下合并顺序。
+- **CI**：工作流见 3.1，Python 包版本锁在 `.github/constraints.txt`。
+- **大车库的分块处理**：分层 BA 解决了位姿块的大小；测量点云和动态点判断可以分块（`map.tile_size`，与整图逐位相同，12 m 块的峰值内存是整图的 1/4，9.11）。语义阶段按需读点属性，BEV 一次只读一层，分块的图逐块读（9.11，峰值内存降 10–50%）。结构、目标、导航等算法本身仍要全图（统一柱网方向、跨楼层连通），内存仍随车库面积线性增长；要改成按楼层 / 块处理，得改算法并重新验证。
 - **仍在 Python 里的几何**：
   - 地面箭头的栅格准备；
-  - 路网编辑（合并、接入、碎片剪枝）、车位内缩与目标点、车道投影（shapely）；
-  - 目标跟踪（`objects4d`：scipy / shapely / OpenCV），约 570 行，是剩下最大的一块。
-- 部分旧 Python 模块（objects4d、bev、数据读写等）仍按约 120 列写，尚未改成 Google 风格。
+  - 路网编辑（合并、接入、碎片剪枝）、车位内缩与目标点、车道投影（shapely），是剩下最大的一块。
+- 部分旧 Python 模块（bev、static_map、数据读写等）仍按约 120 列写，尚未改成 Google 风格。
 - 合成路线的转弯很急（每帧最多 45°），转角处的单帧旋转误差可达 1–3°；真实 10 Hz 数据的转角误差会小得多。
 
 ## 参考

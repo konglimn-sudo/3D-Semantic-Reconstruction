@@ -63,6 +63,9 @@ class PointMap:
             return cls(**{f.name: (z[f.name] if f.name in z else None) for f in fields(cls)})
 
 
+_FIELDS = [f.name for f in fields(PointMap)]
+
+
 def accumulate(kfs: KeyframeSet, poses: np.ndarray, voxel: float, max_range: float = 20.0,
                fusion: _core.MapFusionConfig | None = None) -> PointMap:
     """Merges all keyframes into one voxel-downsampled cloud of the returns
@@ -193,36 +196,92 @@ def build_map(kfs: KeyframeSet, poses: np.ndarray, paths: list[np.ndarray],
     return result.pop("levels"), result
 
 
-def load_point_map(map_dir: Path, bounds=None) -> PointMap:
-    """The point map of a map directory, built in one piece or in tiles.
+def load_point_map(map_dir: Path, bounds=None, fields=None, level=None,
+                   with_index: bool = False):
+    """The point map of a map directory, built in one piece or in tiles,
+    read tile by tile so that only the requested part is ever held.
 
     Args:
         map_dir: work/map.
         bounds: (x0, y0, x1, y1): only the tiles that touch this box (a
-            tiled map; the points of those tiles, not cut to the box). None:
-            the whole map, in the order of a map built in one piece.
+            tiled map; the points of those tiles, not cut to the box).
+        fields: PointMap fields to read (None: all); the others stay None.
+        level: Only the points of this level.
+        with_index: Also return each point's index in the whole map.
+
+    Returns:
+        The PointMap in the order of a map built in one piece (and the
+        indices with `with_index`).
     """
     map_dir = Path(map_dir)
+    names = _FIELDS if fields is None else list(dict.fromkeys(["xyz",
+                                                                *fields]))
     index = map_dir / "tiles.json"
     if not index.exists():
-        return PointMap.load(map_dir / "point_map.npz")
+        with np.load(map_dir / "point_map.npz") as z:
+            keep = None if level is None else z["level"] == level
+            arrays = {n: (z[n] if keep is None else z[n][keep])
+                      for n in names if n in z.files}
+            order = (np.arange(len(arrays["xyz"])) if keep is None
+                     else np.nonzero(keep)[0])
+        out = PointMap(**{n: arrays.get(n) for n in _FIELDS})
+        return (out, order) if with_index else out
     meta = json.loads(index.read_text())
     size = float(meta["tile_size"])
-    parts = []
+    # First pass: the order keys of the points wanted (and of all points for
+    # their index in the whole map); second pass: every field written straight
+    # into its place, so that a field is held once, plus one tile.
+    wanted, keys, all_keys = [], [], []
     for tile in meta["tiles"]:
-        if bounds is not None:
-            x0, y0 = tile["ix"] * size, tile["iy"] * size
-            if (x0 > bounds[2] or x0 + size < bounds[0]
-                    or y0 > bounds[3] or y0 + size < bounds[1]):
-                continue
+        x0, y0 = tile["ix"] * size, tile["iy"] * size
+        touches = bounds is None or not (
+            x0 > bounds[2] or x0 + size < bounds[0]
+            or y0 > bounds[3] or y0 + size < bounds[1])
         with np.load(map_dir / tile["file"]) as z:
-            parts.append({name: z[name] for name in z.files})
-    names = [f.name for f in fields(PointMap)]
-    if not parts:
-        return PointMap(np.zeros((0, 3)), np.zeros(0, np.float32),
-                        np.zeros(0, np.int32), np.zeros(0, np.int16))
-    arrays = {key: np.concatenate([p[key] for p in parts])
-              for key in parts[0]}
-    order = np.lexsort((arrays["sequence"], arrays["range"]))
-    return PointMap(**{name: arrays[name][order] if name in arrays else None
-                       for name in names})
+            key = (z["range"], z["sequence"])
+            keep = None
+            if touches:
+                keep = (np.ones(len(key[0]), bool) if level is None
+                        else z["level"] == level)
+                keys.append((key[0][keep], key[1][keep]))
+        wanted.append(keep)
+        if with_index:
+            all_keys.append(key)
+    if not keys:
+        empty = PointMap(np.zeros((0, 3)), *(None,) * (len(_FIELDS) - 1))
+        return (empty, np.zeros(0, np.int64)) if with_index else empty
+    order = np.lexsort((np.concatenate([k[1] for k in keys]),
+                        np.concatenate([k[0] for k in keys])))
+    place = np.empty(len(order), np.int64)  # Concatenated -> map order.
+    place[order] = np.arange(len(order))
+    del keys
+    arrays = {}
+    start = 0
+    for tile, keep in zip(meta["tiles"], wanted):
+        if keep is None:
+            continue
+        count = int(keep.sum())
+        target = place[start:start + count]
+        with np.load(map_dir / tile["file"]) as z:
+            for name in names:
+                if name not in z.files:
+                    continue
+                values = z[name][keep]
+                if name not in arrays:
+                    arrays[name] = np.empty((len(order), *values.shape[1:]),
+                                            values.dtype)
+                arrays[name][target] = values
+        start += count
+    out = PointMap(**{n: arrays.get(n) for n in _FIELDS})
+    if not with_index:
+        return out
+    # The index of each point in the whole map: its rank among all keys.
+    rank = np.lexsort((np.concatenate([k[1] for k in all_keys]),
+                       np.concatenate([k[0] for k in all_keys])))
+    whole = np.empty(len(rank), np.int64)
+    whole[rank] = np.arange(len(rank))
+    offsets = np.cumsum([0] + [len(k[0]) for k in all_keys])
+    positions = np.concatenate([offsets[t] + np.nonzero(keep)[0]
+                                for t, keep in enumerate(wanted)
+                                if keep is not None])
+    return out, whole[positions[order]]

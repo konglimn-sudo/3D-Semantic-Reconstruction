@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "gr/mapping/tiled_map.h"
 #include "gr/odometry/odometry.h"
 #include "gr/odometry/trajectory.h"
+#include "gr/sensors/imu_preintegration.h"
 
 namespace gr {
 namespace {
@@ -29,46 +31,64 @@ namespace fs = std::filesystem;
 
 constexpr char kOdometrySweeps[] = "kf";
 constexpr char kFinalSweeps[] = "kf_final";
+// odometry.external_trajectory names the trip directory with this.
+constexpr char kTripPlaceholder[] = "{trip}";
+// graph/summary.json is written with this indentation (json.dump indent).
+constexpr int kSummaryJsonIndent = 2;
+// The summary rounds IMU biases to this many decimals (numpy round(4)).
+constexpr double kBiasRounding = 1e4;
+// The point shift against the odometry deskew is measured on every
+// kShiftCheckInterval-th sweep, from the first.
+constexpr int kShiftCheckInterval = 10;
+// Median shift: every kShiftQueryStride-th query point, against reference
+// points in the voxels this many steps around, closer than kMaxShift (m).
+constexpr size_t kShiftQueryStride = 10;
+constexpr int kNeighbourhoodRadius = 1;
+constexpr double kMaxShift = 0.5;
+constexpr double kPercent = 100.0;
 
 // Python's repr of a number (log lines print config values with it).
-std::string Repr(double value) { return ToJson(Value::Number(value), -1); }
+std::string Repr(double value) {
+  return ToJson(Value::Number(value), kJsonOneLine);
+}
 
 double ConfigDouble(const Value& value, const std::string& name) {
   if (!value.is_number()) throw std::runtime_error(name + ": number expected");
   return value.AsDouble();
 }
 
-// Median distance from `query` (every 10th point) to its nearest point of
-// `reference`, ignoring distances of 0.5 m or more
+// Median distance from `query` (every kShiftQueryStride-th point) to its
+// nearest point of `reference`, ignoring distances of kMaxShift or more
 // (trajectory._median_shift); NaN without such pairs.
 double MedianShift(const Points& reference, const Points& query) {
-  constexpr double kCell = 0.5;
   if (reference.empty() || query.empty()) {
     return std::numeric_limits<double>::quiet_NaN();
   }
   std::unordered_map<VoxelKey, std::vector<int>, VoxelKeyHash> cells;
-  for (size_t k = 0; k < reference.size(); ++k) {
-    cells[VoxelOf(reference[k], 1.0 / kCell)].push_back(static_cast<int>(k));
+  for (size_t point = 0; point < reference.size(); ++point) {
+    cells[VoxelOf(reference[point], 1.0 / kMaxShift)].push_back(
+        static_cast<int>(point));
   }
   std::vector<double> distances;
-  for (size_t q = 0; q < query.size(); q += 10) {
-    const VoxelKey key = VoxelOf(query[q], 1.0 / kCell);
-    double best = kCell;
-    for (int dx = -1; dx <= 1; ++dx) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        for (int dz = -1; dz <= 1; ++dz) {
-          const auto it =
+  for (size_t point = 0; point < query.size(); point += kShiftQueryStride) {
+    const VoxelKey key = VoxelOf(query[point], 1.0 / kMaxShift);
+    double best = kMaxShift;
+    for (int dx = -kNeighbourhoodRadius; dx <= kNeighbourhoodRadius; ++dx) {
+      for (int dy = -kNeighbourhoodRadius; dy <= kNeighbourhoodRadius; ++dy) {
+        for (int dz = -kNeighbourhoodRadius; dz <= kNeighbourhoodRadius;
+             ++dz) {
+          const auto found =
               cells.find(VoxelKey{key.x + dx, key.y + dy, key.z + dz});
-          if (it == cells.end()) continue;
-          for (int k : it->second) {
-            best = std::min(best, (reference[static_cast<size_t>(k)] -
-                                   query[q])
+          if (found == cells.end()) continue;
+          for (int other : found->second) {
+            best = std::min(best, (reference[static_cast<size_t>(other)] -
+                                   query[point])
                                       .norm());
           }
         }
       }
     }
-    if (best < kCell) distances.push_back(best);
+    if (best < kMaxShift) distances.push_back(best);
   }
   return Median(distances);
 }
@@ -84,7 +104,9 @@ Pose RigLidar(const Value& rig) {
 ContinuousTrajectory TripTrajectory(const TripPoses& poses,
                                     const TripReader& trip) {
   std::vector<Vec3> gyro;
-  for (const Vec6& bias : poses.biases) gyro.push_back(bias.head<3>());
+  for (const Vec6& bias : poses.biases) {
+    gyro.push_back(bias.segment<kSpaceDim>(kGyroBiasOffset));
+  }
   return ContinuousTrajectory(poses.knot_stamps, poses.knot_poses,
                               trip.ImuSamplesInVehicle(), poses.bias_stamps,
                               gyro, trip.WheelSamplesScaled());
@@ -141,15 +163,15 @@ std::vector<ReconPipeline::KeyframeEntry> ReconPipeline::Keyframes(
       fs::is_directory(fs::path(TripDir(0)) / kFinalSweeps);
   const std::string sweeps = use_final ? kFinalSweeps : kOdometrySweeps;
   std::vector<KeyframeEntry> out;
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    const TripOdometryFile odometry = ReadTripOdometry(TripDir(t));
+  for (size_t trip = 0; trip < trips_.size(); ++trip) {
+    const TripOdometryFile odometry = ReadTripOdometry(TripDir(trip));
     for (int64_t frame : odometry.kf_frames) {
       KeyframeEntry entry;
-      entry.trip = static_cast<int>(t);
+      entry.trip = static_cast<int>(trip);
       entry.frame = frame;
       entry.stamp = odometry.stamps.at(static_cast<size_t>(frame));
       entry.odom = odometry.lidar_poses.at(static_cast<size_t>(frame));
-      entry.path = SweepPath(TripDir(t), sweeps, frame);
+      entry.path = SweepPath(TripDir(trip), sweeps, frame);
       out.push_back(std::move(entry));
     }
   }
@@ -160,22 +182,23 @@ void ReconPipeline::StageOdometry() {
   const OdometryConfig odometry_config = OdometryConfigFrom(config_);
   const KeyframeConfig keyframe_config = KeyframeConfigFrom(config_);
   const Value& external = config_["odometry"]["external_trajectory"];
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    const TripReader& trip = trips_[t];
+  const size_t placeholder_length = std::strlen(kTripPlaceholder);
+  for (size_t trip_index = 0; trip_index < trips_.size(); ++trip_index) {
+    const TripReader& trip = trips_[trip_index];
     const Pose vehicle_from_lidar =
         trip.rig().primary_lidar().vehicle_from_lidar;
     const MotionPrior prior = trip.BuildMotionPrior();
     const std::optional<Pose> entrance = trip.EntrancePose(prior);
-    const size_t n = trip.size();
-    std::vector<double> stamps(n);
-    for (size_t k = 0; k < n; ++k) stamps[k] = trip.lidar_stamp(k);
+    const size_t frame_count = trip.size();
+    std::vector<double> stamps(frame_count);
+    for (size_t k = 0; k < frame_count; ++k) stamps[k] = trip.lidar_stamp(k);
     std::vector<Pose> external_poses;
     if (external.is_string() && !external.AsString().empty()) {
       // str.format(trip=<trip directory>).
       std::string path = external.AsString();
-      for (size_t at = path.find("{trip}"); at != std::string::npos;
-           at = path.find("{trip}", at + trip.root().size())) {
-        path.replace(at, 6, trip.root());
+      for (size_t at = path.find(kTripPlaceholder); at != std::string::npos;
+           at = path.find(kTripPlaceholder, at + trip.root().size())) {
+        path.replace(at, placeholder_length, trip.root());
       }
       const Trajectory given = ReadTum(path);
       external_poses = InterpolatePoses(given.stamps, given.poses, stamps);
@@ -186,15 +209,15 @@ void ReconPipeline::StageOdometry() {
     OdometryPipeline pipeline(odometry_config, keyframe_config,
                               vehicle_from_lidar, entrance.value_or(Pose()),
                               prior);
-    const std::string dir = TripDir(t);
+    const std::string dir = TripDir(trip_index);
     fs::create_directories(fs::path(dir) / kOdometrySweeps);
-    for (size_t k = 0; k < n; ++k) {
+    for (size_t k = 0; k < frame_count; ++k) {
       const LidarSweep sweep = trip.LoadLidar(k);
       std::optional<Pose> given;
       if (!external_poses.empty()) given = external_poses[k];
       const OdometryFrame frame =
           pipeline.Process(sweep.points, sweep.intensity, sweep.time,
-                           sweep.stamp, k + 1 == n, given);
+                           sweep.stamp, k + 1 == frame_count, given);
       if (frame.is_keyframe) {
         WriteSweep(SweepPath(dir, kOdometrySweeps, static_cast<int64_t>(k)),
                    frame.points, frame.intensity);
@@ -216,7 +239,8 @@ void ReconPipeline::StageOdometry() {
     LogLine(log_,
             StringPrintf("[odometry] %s: %zu frames, %zu keyframes, path "
                          "%.1f m%s%s%s",
-                         trip.trip_id().c_str(), n, odometry.kf_frames.size(),
+                         trip.trip_id().c_str(), frame_count,
+                         odometry.kf_frames.size(),
                          path,
                          pipeline.uses_prior() ? " (wheel/IMU prior)" : "",
                          pipeline.uses_gyro_prior() ? " (gyro prior)" : "",
@@ -239,9 +263,9 @@ void ReconPipeline::StageGraph() {
   std::vector<TripInputs> inputs;
   std::vector<TripOdometryFile> odometries;
   std::vector<std::string> trip_ids;
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    const TripReader& trip = trips_[t];
-    odometries.push_back(ReadTripOdometry(TripDir(t)));
+  for (size_t trip_index = 0; trip_index < trips_.size(); ++trip_index) {
+    const TripReader& trip = trips_[trip_index];
+    odometries.push_back(ReadTripOdometry(TripDir(trip_index)));
     trip_ids.push_back(trip.trip_id());
     TripInputs input;
     input.vehicle_from_lidar = trip.rig().primary_lidar().vehicle_from_lidar;
@@ -254,9 +278,9 @@ void ReconPipeline::StageGraph() {
     input.wheel = trip.WheelSamplesScaled();
     inputs.push_back(std::move(input));
   }
-  for (const auto& [i, j] : loop_pairs_) {
+  for (const auto& [first, second] : loop_pairs_) {
     const int size = static_cast<int>(keyframes.size());
-    if (i < 0 || j < 0 || i >= size || j >= size) {
+    if (first < 0 || second < 0 || first >= size || second >= size) {
       throw std::runtime_error("loop pair keyframe index out of range");
     }
   }
@@ -275,51 +299,56 @@ void ReconPipeline::StageGraph() {
   const fs::path out = fs::path(work_) / "graph";
   WriteKeyframeTable((out / "kf_poses.npz").string(), table);
   WriteTextFile((out / "loops.json").string(),
-                ToJson(LoopsValue(result.loops), -1));
+                ToJson(LoopsValue(result.loops), kJsonOneLine));
   Value summary = GraphSummaryValue(result, keyframes.size(), trip_ids);
   const std::vector<uint8_t>& valid = result.inertial.valid;
   const bool any_valid =
-      std::any_of(valid.begin(), valid.end(), [](uint8_t v) { return v; });
-  for (size_t t = 0; t < trips_.size() && any_valid; ++t) {
+      std::any_of(valid.begin(), valid.end(),
+                  [](uint8_t flag) { return flag != 0; });
+  for (size_t trip = 0; trip < trips_.size() && any_valid; ++trip) {
     Vec6 sum = Vec6::Zero();
     int count = 0;
     for (size_t k = 0; k < valid.size(); ++k) {
-      if (!valid[k] || entries[k].trip != static_cast<int>(t)) continue;
+      if (!valid[k] || entries[k].trip != static_cast<int>(trip)) continue;
       sum += result.inertial.biases[k];
       ++count;
     }
     if (count == 0) continue;
     const Vec6 mean = sum / count;
     // numpy round(4): rint(x * 1e4) / 1e4.
-    const auto round4 = [](double x) { return std::nearbyint(x * 1e4) / 1e4; };
+    const auto round4 = [](double x) {
+      return std::nearbyint(x * kBiasRounding) / kBiasRounding;
+    };
     Value gyro = Value::List();
     Value accel = Value::List();
-    for (int k = 0; k < 3; ++k) {
-      gyro.Append(Value::Number(round4(mean[k] * 180.0 / kPi)));
-      accel.Append(Value::Number(round4(mean[3 + k])));
+    for (int axis = 0; axis < kSpaceDim; ++axis) {
+      gyro.Append(
+          Value::Number(round4(RadToDeg(mean[kGyroBiasOffset + axis]))));
+      accel.Append(Value::Number(round4(mean[kAccelBiasOffset + axis])));
     }
     Value bias = Value::Map();
     bias.Set("gyro_deg_s", std::move(gyro));
     bias.Set("accel_m_s2", std::move(accel));
-    summary.Set("imu_bias_" + trip_ids[t], std::move(bias));
+    summary.Set("imu_bias_" + trip_ids[trip], std::move(bias));
   }
-  WriteTextFile((out / "summary.json").string(), ToJson(summary, 2));
+  WriteTextFile((out / "summary.json").string(),
+                ToJson(summary, kSummaryJsonIndent));
 
-  for (size_t t = 0; t < trips_.size(); ++t) {
+  for (size_t trip = 0; trip < trips_.size(); ++trip) {
     std::vector<double> stamps;
     std::vector<Pose> odom;
     std::vector<Pose> poses;
     for (size_t k = 0; k < entries.size(); ++k) {
-      if (entries[k].trip != static_cast<int>(t)) continue;
+      if (entries[k].trip != static_cast<int>(trip)) continue;
       stamps.push_back(entries[k].stamp);
       odom.push_back(entries[k].odom);
       poses.push_back(result.poses[k]);
     }
-    const TripOdometryFile& odometry = odometries[t];
+    const TripOdometryFile& odometry = odometries[trip];
     const std::vector<Pose> lidar = CorrectFramePoses(
         stamps, odom, poses, odometry.stamps, odometry.lidar_poses);
-    WriteFramePoses(TripDir(t), odometry.stamps, lidar,
-                    trips_[t].rig().primary_lidar().vehicle_from_lidar);
+    WriteFramePoses(TripDir(trip), odometry.stamps, lidar,
+                    trips_[trip].rig().primary_lidar().vehicle_from_lidar);
   }
 }
 
@@ -330,15 +359,15 @@ void ReconPipeline::StageTrajectory() {
   std::vector<TripPoses> pose_set;
   std::vector<Eigen::MatrixXd> imu;
   std::vector<Eigen::MatrixXd> wheel;
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    const TripReader& trip = trips_[t];
+  for (size_t trip_index = 0; trip_index < trips_.size(); ++trip_index) {
+    const TripReader& trip = trips_[trip_index];
     TripPoses poses;
     poses.trip_id = trip.trip_id();
     poses.dataset = trip.root();
     poses.rig = RigDict(ReadYamlFile((fs::path(trip.root()) / "rig.yaml")
                                          .string()));
     std::vector<Pose> lidar;
-    ReadFramePoses(TripDir(t), &poses.knot_stamps, &lidar);
+    ReadFramePoses(TripDir(trip_index), &poses.knot_stamps, &lidar);
     const Pose lidar_from_vehicle =
         trip.rig().primary_lidar().vehicle_from_lidar.Inverse();
     for (const Pose& pose : lidar) {
@@ -346,12 +375,13 @@ void ReconPipeline::StageTrajectory() {
     }
     std::vector<size_t> mine;
     for (size_t k = 0; with_bias && k < table.trip.size(); ++k) {
-      if (table.trip[k] == static_cast<int64_t>(t) && table.inertial.valid[k]) {
+      if (table.trip[k] == static_cast<int64_t>(trip_index) &&
+          table.inertial.valid[k]) {
         mine.push_back(k);
       }
     }
-    std::stable_sort(mine.begin(), mine.end(), [&](size_t a, size_t b) {
-      return table.stamp[a] < table.stamp[b];
+    std::stable_sort(mine.begin(), mine.end(), [&](size_t left, size_t right) {
+      return table.stamp[left] < table.stamp[right];
     });
     for (size_t k : mine) {
       poses.bias_stamps.push_back(table.stamp[k]);
@@ -372,22 +402,25 @@ void ReconPipeline::StageTrajectory() {
       ConfigDouble(config_["keyframes"]["voxel"], "keyframes.voxel");
   int written = 0;
   std::vector<double> shifts;
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    const TripReader& trip = trips_[t];
-    const ContinuousTrajectory trajectory = TripTrajectory(pose_set[t], trip);
+  for (size_t trip_index = 0; trip_index < trips_.size(); ++trip_index) {
+    const TripReader& trip = trips_[trip_index];
+    const ContinuousTrajectory trajectory =
+        TripTrajectory(pose_set[trip_index], trip);
     const Pose vehicle_from_lidar =
         trip.rig().primary_lidar().vehicle_from_lidar;
-    const TripOdometryFile odometry = ReadTripOdometry(TripDir(t));
+    const std::string dir = TripDir(trip_index);
+    const TripOdometryFile odometry = ReadTripOdometry(dir);
     for (int64_t frame : odometry.kf_frames) {
       const LidarSweep sweep = trip.LoadLidar(static_cast<size_t>(frame));
       const SweepSamples samples = DeskewKeyframeSweep(
           sweep.points, sweep.intensity, sweep.time, sweep.stamp, trajectory,
           vehicle_from_lidar, min_range, max_range, voxel);
-      const std::string path = SweepPath(TripDir(t), kFinalSweeps, frame);
+      const std::string path = SweepPath(dir, kFinalSweeps, frame);
       WriteSweep(path, samples.points, samples.intensity);
-      if (++written % 10 == 1) {  // Shift against the odometry deskew.
+      // Shift against the odometry deskew.
+      if (++written % kShiftCheckInterval == 1) {
         const SweepFile old =
-            ReadSweep(SweepPath(TripDir(t), kOdometrySweeps, frame));
+            ReadSweep(SweepPath(dir, kOdometrySweeps, frame));
         shifts.push_back(MedianShift(old.points, samples.points));
       }
     }
@@ -395,16 +428,20 @@ void ReconPipeline::StageTrajectory() {
             StringPrintf("[trajectory] %s: %zu keyframe sweeps deskewed (gyro "
                          "%.0f%%, wheel %.0f%% of knot intervals)",
                          trip.trip_id().c_str(), odometry.kf_frames.size(),
-                         100.0 * trajectory.gyro_coverage(),
-                         100.0 * trajectory.wheel_coverage()));
+                         kPercent * trajectory.gyro_coverage(),
+                         kPercent * trajectory.wheel_coverage()));
   }
   shifts.erase(std::remove_if(shifts.begin(), shifts.end(),
-                              [](double s) { return !std::isfinite(s); }),
+                              [](double shift) {
+                                return !std::isfinite(shift);
+                              }),
                shifts.end());
   LogLine(log_, "[trajectory] pose set " + ids.pose_set_id + ": " +
                     std::to_string(written) +
                     " sweeps re-deskewed, median point shift " +
-                    (shifts.empty() ? "None" : Repr(Median(shifts) * 100.0)) +
+                    (shifts.empty()
+                         ? "None"
+                         : Repr(Median(shifts) * kCentimetresPerMetre)) +
                     " cm");
   RecordProvenance(work_, "recon.trajectory", ids, false);
 }
@@ -425,31 +462,31 @@ void ReconPipeline::StageMap() {
   std::vector<Eigen::MatrixXd> imu;
   std::vector<Eigen::MatrixXd> wheel;
   std::vector<ContinuousTrajectory> trajectories;
-  for (size_t t = 0; t < trips_.size(); ++t) {
-    if (pose_set[t].trip_id != trips_[t].trip_id()) {
+  for (size_t trip = 0; trip < trips_.size(); ++trip) {
+    if (pose_set[trip].trip_id != trips_[trip].trip_id()) {
       throw std::runtime_error("the pose set does not match the trips");
     }
-    trajectories.push_back(TripTrajectory(pose_set[t], trips_[t]));
-    imu.push_back(trips_[t].Imu());
-    wheel.push_back(trips_[t].Wheel());
+    trajectories.push_back(TripTrajectory(pose_set[trip], trips_[trip]));
+    imu.push_back(trips_[trip].Imu());
+    wheel.push_back(trips_[trip].Wheel());
   }
   const PoseSetIds ids = ComputePoseSetIds(pose_set, imu, wheel);
 
   // Keyframe poses from the pose set (calibration.keyframe_poses).
   const std::vector<KeyframeEntry> keyframes = Keyframes(true);
   std::vector<Pose> poses(keyframes.size());
-  for (size_t t = 0; t < trips_.size(); ++t) {
+  for (size_t trip = 0; trip < trips_.size(); ++trip) {
     std::vector<size_t> index;
     std::vector<double> stamps;
     for (size_t k = 0; k < keyframes.size(); ++k) {
-      if (keyframes[k].trip != static_cast<int>(t)) continue;
+      if (keyframes[k].trip != static_cast<int>(trip)) continue;
       index.push_back(k);
       stamps.push_back(keyframes[k].stamp);
     }
-    const std::vector<Pose> vehicle = trajectories[t].PosesAt(stamps);
-    const Pose lidar = RigLidar(pose_set[t].rig);
-    for (size_t m = 0; m < index.size(); ++m) {
-      poses[index[m]] = vehicle[m] * lidar;
+    const std::vector<Pose> vehicle = trajectories[trip].PosesAt(stamps);
+    const Pose lidar = RigLidar(pose_set[trip].rig);
+    for (size_t k = 0; k < index.size(); ++k) {
+      poses[index[k]] = vehicle[k] * lidar;
     }
   }
 
@@ -480,9 +517,10 @@ void ReconPipeline::StageMap() {
   for (const KeyframeEntry& keyframe : keyframes) {
     keyframe_trip.push_back(keyframe.trip);
   }
-  const SweepLoader load = [&](int k, Points* points,
+  const SweepLoader load = [&](int keyframe, Points* points,
                                std::vector<float>* intensity) {
-    SweepFile sweep = ReadSweep(keyframes[static_cast<size_t>(k)].path);
+    SweepFile sweep =
+        ReadSweep(keyframes[static_cast<size_t>(keyframe)].path);
     *points = std::move(sweep.points);
     *intensity = std::move(sweep.intensity);
   };
@@ -503,7 +541,9 @@ void ReconPipeline::StageMap() {
     map.planarity = std::move(chunk.planarity);
     map.sigma = std::move(chunk.sigma);
     map.observations = std::move(chunk.observations);
-    for (uint8_t kind : chunk.dynamic_kind) map.dynamic.push_back(kind > 0);
+    for (uint8_t kind : chunk.dynamic_kind) {
+      map.dynamic.push_back(kind != static_cast<uint8_t>(DynamicKind::kStatic));
+    }
     map.dynamic_kind = std::move(chunk.dynamic_kind);
     map.level = std::move(chunk.level);
     map.height = std::move(chunk.height);
@@ -527,28 +567,29 @@ void ReconPipeline::StageMap() {
   const TiledMapSummary summary = BuildTiledMap(poses, keyframe_trip, paths,
                                                 load, tiled, sink, log_);
   const LevelModel& levels = summary.levels;
-  const size_t n = summary.points;
+  const size_t point_count = summary.points;
   if (tiled.dynamic) {
     const size_t dynamic = summary.moved + summary.changed;
     LogLine(log_, StringPrintf("[map] dynamic points: %zu / %zu (%.1f%%), "
                                "moved %zu, changed between sessions %zu",
-                               dynamic, n,
-                               n ? 100.0 * static_cast<double>(dynamic) /
-                                       static_cast<double>(n)
-                                 : 0.0,
+                               dynamic, point_count,
+                               point_count
+                                   ? kPercent * static_cast<double>(dynamic) /
+                                         static_cast<double>(point_count)
+                                   : 0.0,
                                summary.moved, summary.changed));
   }
   if (tiled.tile_size > 0.0) {
     Value index = Value::Map();
     index.Set("tile_size", Value::Number(tiled.tile_size));
     index.Set("voxel", Value::Number(voxel));
-    index.Set("points", Value::Integer(static_cast<long long>(n)));
+    index.Set("points", Value::Integer(static_cast<long long>(point_count)));
     index.Set("tiles", std::move(tile_list));
     WriteTextFile((out / "tiles.json").string(), ToJson(index));
   }
   WriteLevels(out.string(), levels);
-  LogLine(log_, "[map] " + std::to_string(n) + " points at " + Repr(voxel) +
-                    " m");
+  LogLine(log_, "[map] " + std::to_string(point_count) + " points at " +
+                    Repr(voxel) + " m");
   RecordProvenance(work_, "recon.map", ids, false);
 }
 

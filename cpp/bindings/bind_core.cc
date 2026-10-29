@@ -31,6 +31,15 @@ namespace {
 namespace py = ::pybind11;
 using ::pybind11::literals::operator""_a;
 
+// Rows of build_occupancy's boxes: center (3), size (3), yaw, label.
+constexpr int kBoxCenterColumn = 0;
+constexpr int kBoxSizeColumn = kBoxCenterColumn + kSpaceDim;
+constexpr int kBoxYawColumn = kBoxSizeColumn + kSpaceDim;
+constexpr int kBoxLabelColumn = kBoxYawColumn + 1;
+constexpr int kBoxColumns = kBoxLabelColumn + 1;
+// Cameras are (CameraModel, T_ego_cam) pairs.
+constexpr size_t kCameraPairSize = 2;
+
 py::dict IcpDict(const IcpResult& result) {
   return py::dict("T"_a = result.pose.Matrix(), "rmse"_a = result.rmse,
                   "fitness"_a = result.fitness, "inliers"_a = result.inliers,
@@ -62,10 +71,10 @@ ImageView RgbView(
   holder =
       py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(
           image);
-  Require(holder && holder.ndim() == 3 && holder.shape(2) == 3,
+  Require(holder && holder.ndim() == 3 && holder.shape(2) == kRgbChannels,
           "image must be HxWx3 uint8");
   return ImageView{holder.data(), static_cast<int>(holder.shape(0)),
-                   static_cast<int>(holder.shape(1)), 3};
+                   static_cast<int>(holder.shape(1)), kRgbChannels};
 }
 
 void BindRegistration(py::module_& m) {
@@ -76,7 +85,8 @@ void BindRegistration(py::module_& m) {
             Require(voxel_size > 0.0, "voxel_size must be positive");
             return VoxelHashMap(voxel_size, max_distance, max_points_per_voxel);
           }),
-          "voxel_size"_a, "max_distance"_a = 1e9, "max_points_per_voxel"_a = 20)
+          "voxel_size"_a, "max_distance"_a = VoxelHashMap::kUnbounded,
+          "max_points_per_voxel"_a = VoxelHashMap::kDefaultMaxPointsPerVoxel)
       .def(
           "add_points",
           [](VoxelHashMap& map, const PointsIn& points, int frame_id) {
@@ -130,13 +140,14 @@ void BindRegistration(py::module_& m) {
          const std::vector<double>& schedule, double base_voxel,
          int max_iters) {
         Require(base_voxel > 0.0, "base_voxel must be positive");
-        const Points s = ToPoints(source);
-        const Points t = ToPoints(target);
+        const Points source_points = ToPoints(source);
+        const Points target_points = ToPoints(target);
         IcpResult result;
         {
           py::gil_scoped_release release;
-          result = AlignMultiScale(s, t, Pose::FromMatrix(init), schedule,
-                                   base_voxel, max_iters);
+          result = AlignMultiScale(source_points, target_points,
+                                   Pose::FromMatrix(init), schedule, base_voxel,
+                                   max_iters);
         }
         return IcpDict(result);
       },
@@ -209,8 +220,8 @@ void BindOdometry(py::module_& m) {
           "register_frame",
           [](Odometry& odometry, const PointsIn& points,
              const py::object& times, double stamp, const py::object& prior) {
-            const Points p = ToPoints(points);
-            const std::vector<double> t = ToDoubleVector(times);
+            const Points cloud = ToPoints(points);
+            const std::vector<double> point_times = ToDoubleVector(times);
             std::optional<Pose> predicted;
             if (!prior.is_none()) {
               predicted = Pose::FromMatrix(prior.cast<Mat4>());
@@ -218,7 +229,8 @@ void BindOdometry(py::module_& m) {
             Pose pose;
             {
               py::gil_scoped_release release;
-              pose = odometry.RegisterFrame(p, t, stamp, predicted);
+              pose =
+                  odometry.RegisterFrame(cloud, point_times, stamp, predicted);
             }
             return pose.Matrix();
           },
@@ -271,8 +283,8 @@ void BindOdometry(py::module_& m) {
   m.def("scan_context_ring_key", &ScanContextRingKey, "sc"_a);
   m.def(
       "scan_context_distance",
-      [](const Eigen::MatrixXd& a, const Eigen::MatrixXd& b) {
-        const ScanContextMatch match = MatchScanContexts(a, b);
+      [](const Eigen::MatrixXd& query, const Eigen::MatrixXd& candidate) {
+        const ScanContextMatch match = MatchScanContexts(query, candidate);
         return py::make_tuple(match.distance, match.shift, match.yaw);
       },
       "a"_a, "b"_a,
@@ -308,8 +320,8 @@ void BindPoseGraph(py::module_& m) {
           "add_between",
           [](PoseGraph& graph, int i, int j, const Mat4& measurement,
              const Mat6& information, double robust_scale) {
-            const int n = static_cast<int>(graph.num_nodes());
-            RequireIndex(i >= 0 && i < n && j >= 0 && j < n,
+            const int node_count = static_cast<int>(graph.num_nodes());
+            RequireIndex(i >= 0 && i < node_count && j >= 0 && j < node_count,
                          "add_between: invalid node index");
             graph.AddBetween(i, j, Pose::FromMatrix(measurement), information,
                              robust_scale);
@@ -393,14 +405,15 @@ void BindVisibility(py::module_& m) {
              return FreeSpaceCarver(min_bound, max_bound, voxel,
                                     endpoint_margin);
            }),
-           "min_bound"_a, "max_bound"_a, "voxel"_a, "endpoint_margin"_a = 0.2)
+           "min_bound"_a, "max_bound"_a, "voxel"_a,
+           "endpoint_margin"_a = FreeSpaceCarver::kDefaultEndpointMargin)
       .def(
           "integrate",
           [](FreeSpaceCarver& carver, const Vec3& origin,
              const PointsIn& endpoints) {
-            const Points p = ToPoints(endpoints);
+            const Points ray_ends = ToPoints(endpoints);
             py::gil_scoped_release release;
-            carver.Integrate(origin, p);
+            carver.Integrate(origin, ray_ends);
           },
           "origin"_a, "endpoints"_a)
       .def(
@@ -439,7 +452,8 @@ void BindVisibility(py::module_& m) {
              Require(bucket > 0.0, "bucket_size must be positive");
              return VisibilityVoter(ToPoints(map), ToPoints(normals), bucket);
            }),
-           "map"_a, "normals"_a, "bucket_size"_a = 4.0)
+           "map"_a, "normals"_a,
+           "bucket_size"_a = VisibilityVoter::kDefaultBucketSize)
       .def(
           "add_sweep",
           [](VisibilityVoter& voter, const Mat4& world_from_lidar,
@@ -457,10 +471,10 @@ void BindVisibility(py::module_& m) {
             options.margin_abs = margin_abs;
             options.margin_rel = margin_rel;
             options.min_cos = min_cos;
-            const Points p = ToPoints(sweep);
+            const Points sweep_points = ToPoints(sweep);
             py::gil_scoped_release release;
-            voter.AddSweep(Pose::FromMatrix(world_from_lidar), p, options,
-                           session);
+            voter.AddSweep(Pose::FromMatrix(world_from_lidar), sweep_points,
+                           options, session);
           },
           "T_world_lidar"_a, "sweep"_a, "az_res_deg"_a = 1.0,
           "el_res_deg"_a = 1.0, "el_min_deg"_a = -30.0, "el_max_deg"_a = 30.0,
@@ -488,18 +502,18 @@ void BindCameras(py::module_& m) {
       .def(
           "project",
           [](const CameraModel& camera, const PointsIn& points) {
-            const Eigen::Index n = points.rows();
+            const Eigen::Index count = points.rows();
             RowMatX2d uv = RowMatX2d::Constant(
-                n, 2, std::numeric_limits<double>::quiet_NaN());
-            std::vector<uint8_t> valid(static_cast<size_t>(n), 0);
-            std::vector<uint8_t> inside(static_cast<size_t>(n), 0);
-            for (Eigen::Index i = 0; i < n; ++i) {
-              const std::optional<Vec2> p =
+                count, kPlaneDim, std::numeric_limits<double>::quiet_NaN());
+            std::vector<uint8_t> valid(static_cast<size_t>(count), 0);
+            std::vector<uint8_t> inside(static_cast<size_t>(count), 0);
+            for (Eigen::Index i = 0; i < count; ++i) {
+              const std::optional<Vec2> pixel =
                   camera.Project(points.row(i).transpose());
-              if (!p) continue;
-              uv.row(i) = p->transpose();
+              if (!pixel) continue;
+              uv.row(i) = pixel->transpose();
               valid[static_cast<size_t>(i)] = 1;
-              inside[static_cast<size_t>(i)] = camera.InImage(*p) ? 1 : 0;
+              inside[static_cast<size_t>(i)] = camera.InImage(*pixel) ? 1 : 0;
             }
             return py::make_tuple(uv, ToBoolArray(valid), ToBoolArray(inside));
           },
@@ -507,10 +521,10 @@ void BindCameras(py::module_& m) {
       .def(
           "unproject",
           [](const CameraModel& camera, const UvIn& uv) {
-            const Eigen::Index n = uv.rows();
-            RowMatX3d rays = RowMatX3d::Zero(n, 3);
-            std::vector<uint8_t> valid(static_cast<size_t>(n), 0);
-            for (Eigen::Index i = 0; i < n; ++i) {
+            const Eigen::Index count = uv.rows();
+            RowMatX3d rays = RowMatX3d::Zero(count, kSpaceDim);
+            std::vector<uint8_t> valid(static_cast<size_t>(count), 0);
+            for (Eigen::Index i = 0; i < count; ++i) {
               const std::optional<Vec3> ray =
                   camera.Unproject(uv.row(i).transpose());
               if (!ray) continue;
@@ -544,11 +558,11 @@ void BindProjection(py::module_& m) {
          double rel_tol, int mean_radius) {
         const CameraExposure exposure =
             ExposureFrom(camera_from_world, camera.height(), true);
-        const Points p = ToPoints(points);
+        const Points cloud = ToPoints(points);
         std::vector<float> depth;
         {
           py::gil_scoped_release release;
-          depth = RenderSurfaceDepth(camera, exposure, p, point_spacing,
+          depth = RenderSurfaceDepth(camera, exposure, cloud, point_spacing,
                                      min_radius, max_radius, min_range,
                                      max_range, abs_tol, rel_tol,
                                      mean_radius);
@@ -570,13 +584,14 @@ void BindProjection(py::module_& m) {
          int min_radius, int max_radius, double min_range, double max_range) {
         const CameraExposure exposure =
             ExposureFrom(camera_from_world, camera.height(), true);
-        const Points p = ToPoints(points);
-        const std::vector<int> l = ToIntVector(labels);
+        const Points cloud = ToPoints(points);
+        const std::vector<int> point_labels = ToIntVector(labels);
         RenderResult render;
         {
           py::gil_scoped_release release;
-          render = RenderPoints(camera, exposure, p, l, point_spacing,
-                                min_radius, max_radius, min_range, max_range);
+          render =
+              RenderPoints(camera, exposure, cloud, point_labels, point_spacing,
+                           min_radius, max_radius, min_range, max_range);
         }
         return py::make_tuple(
             ToImage(render.depth, render.height, render.width),
@@ -597,14 +612,14 @@ void BindProjection(py::module_& m) {
          double rel_tol) {
         const CameraExposure exposure =
             ExposureFrom(camera_from_world, camera.height(), true);
-        const Points p = ToPoints(points);
-        const std::vector<float> d =
+        const Points cloud = ToPoints(points);
+        const std::vector<float> depth_image =
             ToDepth(depth, camera.height(), camera.width());
         VisibilityResult visibility;
         {
           py::gil_scoped_release release;
-          visibility =
-              ProjectVisibility(camera, exposure, p, d, abs_tol, rel_tol);
+          visibility = ProjectVisibility(camera, exposure, cloud, depth_image,
+                                         abs_tol, rel_tol);
         }
         return py::make_tuple(visibility.uv, ToBoolArray(visibility.in_image),
                               ToBoolArray(visibility.visible),
@@ -620,7 +635,7 @@ void BindProjection(py::module_& m) {
              Require(bucket > 0.0, "bucket must be positive");
              return PointCloudIndex(PointsFrom(points), bucket);
            }),
-           "points"_a, "bucket"_a = 4.0)
+           "points"_a, "bucket"_a = PointCloudIndex::kDefaultBucketSize)
       .def("__len__", &PointCloudIndex::size)
       .def(
           "radius_search",
@@ -651,9 +666,9 @@ void BindRasters(py::module_& m) {
         grid.width = width;
         grid.height = height;
         const RowMatX2d points = xy;
-        const Reducer r = ParseReducer(reducer);
+        const Reducer reduction = ParseReducer(reducer);
         py::gil_scoped_release release;
-        return Rasterize(points, values, grid, r, fill);
+        return Rasterize(points, values, grid, reduction, fill);
       },
       "xy"_a, "values"_a, "x0"_a, "y0"_a, "res"_a, "width"_a, "height"_a,
       "reducer"_a = "mean", "fill"_a = std::numeric_limits<double>::quiet_NaN(),
@@ -675,7 +690,7 @@ void BindRasters(py::module_& m) {
              return FloorTextureFuser(grid, floor_z, top_k);
            }),
            "x0"_a, "y0"_a, "res"_a, "width"_a, "height"_a, "floor_z"_a,
-           "top_k"_a = 5)
+           "top_k"_a = FloorTextureFuser::kDefaultTopK)
       .def(
           "add_frame",
           [](FloorTextureFuser& fuser, const CameraModel& camera,
@@ -686,12 +701,12 @@ void BindRasters(py::module_& m) {
                 ExposureFrom(camera_from_world, camera.height(), true);
             RgbArray holder;
             const ImageView view = RgbView(image, holder);
-            const std::vector<float> d =
+            const std::vector<float> depth_image =
                 ToDepth(depth, view.height, view.width);
             py::gil_scoped_release release;
             fuser.AddFrame(camera, exposure, view,
-                           d.empty() ? nullptr : d.data(), depth_tol, max_range,
-                           min_cos);
+                           depth_image.empty() ? nullptr : depth_image.data(),
+                           depth_tol, max_range, min_cos);
           },
           "camera"_a, "T_cam_world"_a, "image"_a, "depth"_a = py::none(),
           "depth_tol"_a = 0.15, "max_range"_a = 8.0, "min_cos"_a = 0.2)
@@ -741,7 +756,7 @@ void BindRasters(py::module_& m) {
         const FloorTextureFuser::Texture texture = fuser.ComputeTexture();
         const int height = fuser.grid().height;
         const int width = fuser.grid().width;
-        return py::make_tuple(ToImage(texture.rgb, height, width, 3),
+        return py::make_tuple(ToImage(texture.rgb, height, width, kRgbChannels),
                               ToImage(texture.score, height, width),
                               ToImage(texture.observations, height, width));
       });
@@ -754,8 +769,9 @@ void BindOccupancy(py::module_& m) {
          int free_label, int camera_pixel_stride, double camera_max_range,
          const Mat4& world_from_ego, const PointsIn& static_world,
          const py::object& static_labels,
-         const Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic, 8,
-                                              Eigen::RowMajor>>& boxes,
+         const Eigen::Ref<const Eigen::Matrix<double, Eigen::Dynamic,
+                                              kBoxColumns, Eigen::RowMajor>>&
+             boxes,
          const Vec3& lidar_origin_ego, const PointsIn& scan_ego,
          const std::vector<py::tuple>& cameras) {
         Require(voxel > 0.0, "voxel must be positive");
@@ -769,15 +785,17 @@ void BindOccupancy(py::module_& m) {
         std::vector<OrientedBox> oriented;
         for (Eigen::Index i = 0; i < boxes.rows(); ++i) {
           OrientedBox box;
-          box.center = boxes.row(i).segment<3>(0).transpose();
-          box.size = boxes.row(i).segment<3>(3).transpose();
-          box.yaw = boxes(i, 6);
-          box.label = static_cast<int>(boxes(i, 7));
+          box.center =
+              boxes.row(i).segment<kSpaceDim>(kBoxCenterColumn).transpose();
+          box.size =
+              boxes.row(i).segment<kSpaceDim>(kBoxSizeColumn).transpose();
+          box.yaw = boxes(i, kBoxYawColumn);
+          box.label = static_cast<int>(boxes(i, kBoxLabelColumn));
           oriented.push_back(box);
         }
         std::vector<CameraView> views;
         for (const py::tuple& camera : cameras) {
-          Require(camera.size() == 2,
+          Require(camera.size() == kCameraPairSize,
                   "cameras: (CameraModel, T_ego_cam) pairs");
           CameraView view;
           view.camera = camera[0].cast<std::shared_ptr<CameraModel>>();
@@ -827,10 +845,10 @@ void BindGeometry(py::module_& m) {
       "interpolate_poses",
       [](const std::vector<double>& times, const py::object& poses,
          const std::vector<double>& query) {
-        const std::vector<Pose> p = PosesFrom(poses);
-        Require(!times.empty() && times.size() == p.size(),
+        const std::vector<Pose> pose_list = PosesFrom(poses);
+        Require(!times.empty() && times.size() == pose_list.size(),
                 "times and poses must be non-empty and of equal length");
-        return PosesToArray(InterpolatePoses(times, p, query));
+        return PosesToArray(InterpolatePoses(times, pose_list, query));
       },
       "times"_a, "poses"_a, "query"_a,
       "Slerp / lerp of an (N, 4, 4) pose sequence at query times (clamped).");
@@ -839,36 +857,39 @@ void BindGeometry(py::module_& m) {
       [](const PointsIn& points, double radius, int min_neighbors,
          int max_neighbors) {
         Require(radius > 0.0, "radius must be positive");
-        const Points p = ToPoints(points);
+        const Points cloud = ToPoints(points);
         NormalsResult normals;
         {
           py::gil_scoped_release release;
-          normals = EstimateNormals(p, radius, min_neighbors, max_neighbors);
+          normals =
+              EstimateNormals(cloud, radius, min_neighbors, max_neighbors);
         }
         return py::make_tuple(
             ToMatrix(normals.normals), ToArray(normals.planarity),
             ToArray(normals.thickness), ToArray(normals.neighbors));
       },
-      "points"_a, "radius"_a, "min_neighbors"_a = 5, "max_neighbors"_a = 64,
+      "points"_a, "radius"_a, "min_neighbors"_a = 5,
+      "max_neighbors"_a = kDefaultMaxNormalNeighbors,
       "Returns (normals, planarity, thickness, neighbor_count).");
   m.def(
       "project_to_local_planes",
       [](const PointsIn& points, double radius, int min_neighbors,
          int max_neighbors, double min_planarity, double max_shift) {
         Require(radius > 0.0, "radius must be positive");
-        const Points p = ToPoints(points);
+        const Points cloud = ToPoints(points);
         Points projected;
         std::vector<double> shift;
         {
           py::gil_scoped_release release;
-          projected = ProjectToLocalPlanes(p, radius, min_neighbors,
+          projected = ProjectToLocalPlanes(cloud, radius, min_neighbors,
                                            max_neighbors, min_planarity,
                                            max_shift, &shift);
         }
         return py::make_tuple(PointsToArray(projected), ToArray(shift));
       },
-      "points"_a, "radius"_a, "min_neighbors"_a = 8, "max_neighbors"_a = 64,
-      "min_planarity"_a = 0.3, "max_shift"_a = 0.1,
+      "points"_a, "radius"_a, "min_neighbors"_a = 8,
+      "max_neighbors"_a = kDefaultMaxNormalNeighbors, "min_planarity"_a = 0.3,
+      "max_shift"_a = 0.1,
       "Returns (points moved onto their local planes (N, 3), signed moves "
       "(N,)): one moving-least-squares step where the neighbourhood is "
       "planar and the move is at most max_shift.");
@@ -877,7 +898,7 @@ void BindGeometry(py::module_& m) {
       [](const PointsIn& points, double threshold, int iterations, int seed) {
         const PlaneFit fit =
             FitPlaneRansac(ToPoints(points), threshold, iterations, seed);
-        return py::make_tuple(fit.normal, fit.d, ToArray(fit.inliers));
+        return py::make_tuple(fit.normal, fit.offset, ToArray(fit.inliers));
       },
       "points"_a, "threshold"_a, "iterations"_a = 200, "seed"_a = 1);
   m.def(
@@ -908,12 +929,12 @@ void BindSim(py::module_& m) {
              const PointsIn& directions, double max_t) {
             Require(origins.rows() == directions.rows() || origins.rows() == 1,
                     "raycast: origins must be N x 3 or 1 x 3");
-            const RowMatX3d o = origins;
-            const RowMatX3d d = directions;
+            const RowMatX3d origin_rows = origins;
+            const RowMatX3d direction_rows = directions;
             RaycastHits hits;
             {
               py::gil_scoped_release release;
-              hits = scene.Raycast(o, d, max_t);
+              hits = scene.Raycast(origin_rows, direction_rows, max_t);
             }
             return py::make_tuple(hits.distance, hits.box_ids, hits.normals);
           },

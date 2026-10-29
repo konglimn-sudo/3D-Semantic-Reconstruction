@@ -19,6 +19,13 @@ using ::gr::testing::ParkedCars;
 using ::gr::testing::ScanFromPose;
 using ::gr::testing::SimBox;
 
+// The test maps: voxel, returns used and normal radius (m).
+constexpr double kVoxel = 0.1;
+constexpr double kMaxRange = 20.0;
+constexpr double kNormalRadius = 0.3;
+// Tiles of this side (m) cut the test garage into a dozen or more.
+constexpr double kTileSize = 8.0;
+
 // Static scans along the test garage's loop: trip 0 without, trip 1 with an
 // extra parked car (points that change between sessions).
 struct Scans {
@@ -30,26 +37,36 @@ struct Scans {
 };
 
 Scans MakeScans() {
+  constexpr int kTrips = 2;
+  constexpr int kScansPerTrip = 24;      // Around the loop.
+  constexpr double kTripOffset = 0.3;    // Scans of trip 1 lie in between.
+  constexpr double kLidarHeight = 1.8;   // m
+  constexpr double kScanRange = 30.0;    // m
+  constexpr int kIntensityLevels = 17;   // A made-up intensity pattern.
   Scans scans;
-  const Pose vehicle_from_lidar(Mat3::Identity(), Vec3(0.0, 0.0, 1.8));
+  const Pose vehicle_from_lidar(Mat3::Identity(),
+                                Vec3(0.0, 0.0, kLidarHeight));
   const LoopRoute route;
-  for (int trip = 0; trip < 2; ++trip) {
+  for (int trip = 0; trip < kTrips; ++trip) {
     std::vector<SimBox> boxes = GarageStructure();
     const std::vector<SimBox> cars = ParkedCars(trip == 1);
     boxes.insert(boxes.end(), cars.begin(), cars.end());
     const BoxScene scene = MakeScene(boxes);
     Points path;
-    for (int k = 0; k < 24; ++k) {
-      const double t = (k + 0.3 * trip) * route.length() / 24.0 / route.speed();
-      const Pose vehicle = route.PoseAt(t);
+    for (int scan = 0; scan < kScansPerTrip; ++scan) {
+      const double time = (scan + kTripOffset * trip) * route.length() /
+                          kScansPerTrip / route.speed();
+      const Pose vehicle = route.PoseAt(time);
       path.push_back(vehicle.translation);
       const Pose pose = vehicle * vehicle_from_lidar;
       scans.poses.push_back(pose);
       scans.trip.push_back(trip);
-      scans.sweeps.push_back(ScanFromPose(scene, pose, 30.0).points_sensor);
+      scans.sweeps.push_back(
+          ScanFromPose(scene, pose, kScanRange).points_sensor);
       std::vector<float> intensity(scans.sweeps.back().size());
       for (size_t i = 0; i < intensity.size(); ++i) {
-        intensity[i] = static_cast<float>(i % 17) / 17.0f;
+        intensity[i] = static_cast<float>(i % kIntensityLevels) /
+                       static_cast<float>(kIntensityLevels);
       }
       scans.intensity.push_back(std::move(intensity));
     }
@@ -61,14 +78,14 @@ Scans MakeScans() {
 // The chunks of a build merged into map order (range, then sequence).
 MapChunk Build(const Scans& scans, double tile_size, int* tiles) {
   TiledMapConfig config;
-  config.voxel = 0.1;
-  config.max_range = 20.0;
-  config.normal_radius = 0.3;
+  config.voxel = kVoxel;
+  config.max_range = kMaxRange;
+  config.normal_radius = kNormalRadius;
   config.tile_size = tile_size;
-  const SweepLoader load = [&](int k, Points* points,
+  const SweepLoader load = [&](int keyframe, Points* points,
                                std::vector<float>* intensity) {
-    *points = scans.sweeps[static_cast<size_t>(k)];
-    *intensity = scans.intensity[static_cast<size_t>(k)];
+    *points = scans.sweeps[static_cast<size_t>(keyframe)];
+    *intensity = scans.intensity[static_cast<size_t>(keyframe)];
   };
   std::vector<MapChunk> chunks;
   const TiledMapSummary summary = BuildTiledMap(
@@ -77,19 +94,25 @@ MapChunk Build(const Scans& scans, double tile_size, int* tiles) {
         chunks.push_back(std::move(chunk));
       });
   *tiles = summary.tiles;
+  // (chunk, point) pairs in map order.
   std::vector<std::pair<size_t, size_t>> index;
-  for (size_t c = 0; c < chunks.size(); ++c) {
-    for (size_t i = 0; i < chunks[c].size(); ++i) index.emplace_back(c, i);
+  for (size_t chunk = 0; chunk < chunks.size(); ++chunk) {
+    for (size_t i = 0; i < chunks[chunk].size(); ++i) {
+      index.emplace_back(chunk, i);
+    }
   }
-  std::sort(index.begin(), index.end(), [&](const auto& a, const auto& b) {
-    const MapChunk& x = chunks[a.first];
-    const MapChunk& y = chunks[b.first];
-    return std::make_pair(x.range[a.second], x.sequence[a.second]) <
-           std::make_pair(y.range[b.second], y.sequence[b.second]);
-  });
+  std::sort(index.begin(), index.end(),
+            [&](const auto& left, const auto& right) {
+              const MapChunk& a = chunks[left.first];
+              const MapChunk& b = chunks[right.first];
+              return std::make_pair(a.range[left.second],
+                                    a.sequence[left.second]) <
+                     std::make_pair(b.range[right.second],
+                                    b.sequence[right.second]);
+            });
   MapChunk out;
-  for (const auto& [c, i] : index) {
-    const MapChunk& x = chunks[c];
+  for (const auto& [chunk, i] : index) {
+    const MapChunk& x = chunks[chunk];
     out.xyz.push_back(x.xyz[i]);
     out.intensity.push_back(x.intensity[i]);
     out.keyframe.push_back(x.keyframe[i]);
@@ -109,14 +132,17 @@ MapChunk Build(const Scans& scans, double tile_size, int* tiles) {
 }
 
 GR_TEST(TiledMapTest, TilesGiveTheMapBuiltInOnePiece) {
+  constexpr int kMinTiles = 12;
+  constexpr size_t kMinPoints = 50000;
+  constexpr size_t kMinChanged = 20;  // Points of the extra car.
   const Scans scans = MakeScans();
   int whole_tiles = 0;
   int tiled_tiles = 0;
   const MapChunk whole = Build(scans, 0.0, &whole_tiles);
-  const MapChunk tiled = Build(scans, 8.0, &tiled_tiles);
+  const MapChunk tiled = Build(scans, kTileSize, &tiled_tiles);
   GR_EXPECT_EQ(whole_tiles, 1);
-  GR_EXPECT_GE(tiled_tiles, 12);
-  GR_ASSERT_TRUE(whole.size() > 50000);
+  GR_EXPECT_GE(tiled_tiles, kMinTiles);
+  GR_ASSERT_TRUE(whole.size() > kMinPoints);
   GR_ASSERT_TRUE(tiled.size() == whole.size());
   // Bit for bit: every point, normal, sigma, level and dynamic flag.
   GR_EXPECT_TRUE(tiled.xyz == whole.xyz);
@@ -141,27 +167,27 @@ GR_TEST(TiledMapTest, TilesGiveTheMapBuiltInOnePiece) {
   const size_t changed = static_cast<size_t>(
       std::count(whole.dynamic_kind.begin(), whole.dynamic_kind.end(),
                  static_cast<uint8_t>(DynamicKind::kChanged)));
-  GR_EXPECT_GT(changed, size_t{20});
+  GR_EXPECT_GT(changed, kMinChanged);
 }
 
 GR_TEST(TiledMapTest, TilesKeepEachVoxelOnce) {
   const Scans scans = MakeScans();
   TiledMapConfig config;
-  config.voxel = 0.1;
-  config.normal_radius = 0.3;
-  config.tile_size = 8.0;
+  config.voxel = kVoxel;
+  config.normal_radius = kNormalRadius;
+  config.tile_size = kTileSize;
   config.dynamic = false;
   size_t outside = 0;
   BuildTiledMap(
       scans.poses, scans.trip, scans.paths,
-      [&](int k, Points* points, std::vector<float>* intensity) {
-        *points = scans.sweeps[static_cast<size_t>(k)];
-        *intensity = scans.intensity[static_cast<size_t>(k)];
+      [&](int keyframe, Points* points, std::vector<float>* intensity) {
+        *points = scans.sweeps[static_cast<size_t>(keyframe)];
+        *intensity = scans.intensity[static_cast<size_t>(keyframe)];
       },
       config, [&](const MapTile& tile, MapChunk&& chunk) {
         GR_EXPECT_FALSE(tile.whole);
-        for (const Vec3& p : chunk.xyz) {
-          outside += !tile.region.Contains(VoxelOf(p, 1.0 / config.voxel));
+        for (const Vec3& point : chunk.xyz) {
+          outside += !tile.region.Contains(VoxelOf(point, 1.0 / config.voxel));
         }
       });
   GR_EXPECT_EQ(outside, size_t{0});

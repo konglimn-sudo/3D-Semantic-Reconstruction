@@ -129,3 +129,11 @@ def test_map_built_in_tiles_is_the_map_built_in_one_piece(tiny_run, tmp_path):
     x0, y0 = whole.xyz[:, :2].min(axis=0)
     part = tiled.point_map(bounds=(x0, y0, x0 + 1.0, y0 + 1.0))
     assert 0 < len(part) < len(whole)
+    # One level, some fields, and where its points are in the whole map.
+    for recon_run in (recon, tiled):
+        level, index = recon_run.point_map(fields=("dynamic",), level=0,
+                                           with_index=True)
+        np.testing.assert_array_equal(index, np.nonzero(whole.level == 0)[0])
+        np.testing.assert_array_equal(level.xyz, whole.xyz[index])
+        np.testing.assert_array_equal(level.dynamic, whole.dynamic[index])
+        assert level.normals is None and level.height is None

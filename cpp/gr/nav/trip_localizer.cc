@@ -10,6 +10,14 @@
 namespace gr {
 namespace {
 
+// Vectors shorter than this have no direction.
+constexpr double kMinNorm = 1e-9;
+constexpr double kMillisecondsPerSecond = 1000.0;
+// The yaw (rotation about z) in a [dt, dphi] covariance.
+constexpr int kYawIndex = kRotationOffset + 2;
+// The summary reports this percentile of the localizer times.
+constexpr double kTimePercentile = 95.0;
+
 double Seconds(std::chrono::steady_clock::time_point since) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                        since)
@@ -35,11 +43,11 @@ Pose LevelledStart(const ImuSamples& imu, double stamp, double window) {
   }
   if (count == 0) return Pose();
   Vec3 up = sum / count;
-  up /= std::max(up.norm(), 1e-9);
+  up /= std::max(up.norm(), kMinNorm);
   // Smallest rotation taking `up` (vehicle frame) to +z (world).
   const Vec3 axis = up.cross(Vec3::UnitZ());
   const double angle = std::atan2(axis.norm(), up.z());
-  if (axis.norm() <= 1e-9) return Pose();
+  if (axis.norm() <= kMinNorm) return Pose();
   return Pose(So3Exp(axis / axis.norm() * angle), Vec3::Zero());
 }
 
@@ -83,12 +91,14 @@ std::optional<SweepLocalization> TripLocalizer::Process(
   const auto started = std::chrono::steady_clock::now();
   out.result = localizer_.Process(frame.points, {}, stamp, frame.pose);
   last_sweep_ = frame.points;
-  out.ms = 1000.0 * Seconds(started);
+  out.ms = kMillisecondsPerSecond * Seconds(started);
   out.map_from_vehicle = out.result.pose * lidar_from_vehicle;
   out.odom_from_vehicle = frame.pose * lidar_from_vehicle;
-  const Mat6& cov = out.result.covariance;
-  out.sigma_t = std::sqrt(std::max(cov.topLeftCorner<3, 3>().trace(), 0.0));
-  out.sigma_yaw_deg = RadToDeg(std::sqrt(std::max(cov(5, 5), 0.0)));
+  const Mat6& covariance = out.result.covariance;
+  out.sigma_t = std::sqrt(std::max(
+      covariance.topLeftCorner<kSpaceDim, kSpaceDim>().trace(), 0.0));
+  out.sigma_yaw_deg = RadToDeg(
+      std::sqrt(std::max(covariance(kYawIndex, kYawIndex), 0.0)));
   if (localizer_.placement_attempts() > attempts_) {
     attempts_ = localizer_.placement_attempts();
     const Placement& placement = localizer_.last_placement();
@@ -112,10 +122,10 @@ std::optional<SweepLocalization> TripLocalizer::Process(
 }
 
 TripLocalizationSummary TripLocalizer::Summary() const {
-  TripLocalizationSummary s;
-  s.sweeps = static_cast<int>(sweeps_.size());
-  s.placement_attempts = localizer_.placement_attempts();
-  if (sweeps_.empty()) return s;
+  TripLocalizationSummary summary;
+  summary.sweeps = static_cast<int>(sweeps_.size());
+  summary.placement_attempts = localizer_.placement_attempts();
+  if (sweeps_.empty()) return summary;
   double travelled = 0.0;
   int registered_tracked = 0;
   int degenerate = 0;
@@ -129,26 +139,28 @@ TripLocalizationSummary TripLocalizer::Summary() const {
     }
     const bool tracking =
         sweep.result.status == LocalizationStatus::kTracking;
-    if (tracking && s.first_tracked < 0) {
-      s.first_tracked = static_cast<int>(k);
-      s.init_time_s = sweep.stamp - sweeps_[0].stamp;
-      s.init_distance_m = travelled;
+    if (tracking &&
+        summary.first_tracked == TripLocalizationSummary::kNeverTracked) {
+      summary.first_tracked = static_cast<int>(k);
+      summary.init_time_s = sweep.stamp - sweeps_[0].stamp;
+      summary.init_distance_m = travelled;
     }
-    s.tracked += tracking;
-    s.registered += sweep.result.registered;
+    summary.tracked += tracking;
+    summary.registered += sweep.result.registered;
     registered_tracked += tracking && sweep.result.registered;
     degenerate += tracking && sweep.result.degenerate_t > 0;
-    s.lost_sweeps += sweep.result.status == LocalizationStatus::kLost;
+    summary.lost_sweeps += sweep.result.status == LocalizationStatus::kLost;
     ms.push_back(sweep.ms);
   }
-  if (s.tracked > 0) {
-    s.registered_share_of_tracked =
-        static_cast<double>(registered_tracked) / s.tracked;
-    s.degenerate_share = static_cast<double>(degenerate) / s.tracked;
+  if (summary.tracked > 0) {
+    summary.registered_share_of_tracked =
+        static_cast<double>(registered_tracked) / summary.tracked;
+    summary.degenerate_share =
+        static_cast<double>(degenerate) / summary.tracked;
   }
-  s.ms_median = Median(ms);
-  s.ms_p95 = Percentile(ms, 95.0);
-  return s;
+  summary.ms_median = Median(ms);
+  summary.ms_p95 = Percentile(ms, kTimePercentile);
+  return summary;
 }
 
 }  // namespace gr

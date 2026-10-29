@@ -20,6 +20,17 @@
 
 namespace gr {
 
+// Normal z of the map points DetectLevels uses: ramp surfaces above
+// kRampMinNormalZ, level floors above kFloorMinNormalZ, ceilings below
+// kCeilingMaxNormalZ.
+inline constexpr double kRampMinNormalZ = 0.8;
+inline constexpr double kFloorMinNormalZ = 0.85;
+inline constexpr double kCeilingMaxNormalZ = -0.85;
+
+// A point belongs to the highest floor that is not above it by more than
+// this (m): floor points scatter around their floor.
+inline constexpr double kBelowFloorTolerance = 0.3;
+
 struct LevelConfig {
   double min_separation = 2.2;  // Between level heights (m).
   double flat_slope = 0.03;     // |dz / ds| below this: a level floor.
@@ -65,15 +76,18 @@ struct LevelModel {
   double FloorZ(const Vec2& xy, int level) const;
 };
 
+// The level of a point below every floor.
+inline constexpr int16_t kNoLevel = -1;
+
 struct LevelAssignment {
-  std::vector<int16_t> level;  // -1: below every floor.
+  std::vector<int16_t> level;  // kNoLevel: below every floor.
   std::vector<float> height;   // Above that floor (NaN without a level).
   std::vector<uint8_t> on_ramp;
 };
 
 // A point belongs to the highest floor that is not above it (by more than
-// 0.3 m); points over a ramp outline that sit closer to the ramp surface use
-// the ramp (and its upper level) instead.
+// kBelowFloorTolerance); points over a ramp outline that sit closer to the
+// ramp surface use the ramp (and its upper level) instead.
 LevelAssignment AssignLevels(const LevelModel& model, const Points& xyz);
 
 // Horizontal bounds of a map's points.
@@ -84,9 +98,10 @@ struct MapBounds {
 
 // Levels and ramps from the vehicle paths (one polyline of vehicle origins,
 // on the floor, per trip) and the map points with normals. Only points with
-// normal z above 0.8 or below -0.85 (floors, ramps, ceilings) count, so a
-// map built in tiles can pass just those, in map order, with the bounds of
-// all its points (`bounds`; otherwise the bounds of `xyz`).
+// normal z above kRampMinNormalZ or below kCeilingMaxNormalZ (floors, ramps,
+// ceilings) count, so a map built in tiles can pass just those, in map
+// order, with the bounds of all its points (`bounds`; otherwise the bounds
+// of `xyz`).
 LevelModel DetectLevels(const std::vector<Points>& vehicle_paths,
                         const Points& xyz, const Points& normals,
                         const LevelConfig& config = {},

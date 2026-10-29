@@ -29,9 +29,9 @@
 namespace gr {
 
 struct TiledMapConfig {
-  double voxel = 0.05;
-  double max_range = 20.0;
-  double normal_radius = 0.2;
+  double voxel = 0.05;          // m
+  double max_range = 20.0;      // m, returns used
+  double normal_radius = 0.2;   // m
   // Tile side (m), aligned to the voxel grid; <= 0: the map in one piece.
   double tile_size = 0.0;
   MapFusionConfig fusion;

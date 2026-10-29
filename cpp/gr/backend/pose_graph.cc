@@ -21,13 +21,57 @@ namespace gr {
 namespace {
 
 using Triplets = std::vector<Eigen::Triplet<double>>;
+using SpaceByPose = Eigen::Matrix<double, kSpaceDim, kPoseDim>;
+using ImuByPose = Eigen::Matrix<double, kImuResidualDim, kPoseDim>;
 
+// Normal-equation offset of a fixed variable.
+constexpr int kFixedVariable = -1;
+// An inertial state is [velocity, gyro bias, accel bias]; a pose is [t, phi]
+// (kTranslationOffset, kRotationOffset).
+constexpr int kVelocityOffset = 0;
+constexpr int kBiasOffset = kVelocityOffset + kSpaceDim;
+constexpr int kInertialDim = kBiasOffset + kBiasDim;
+// Local Jacobian columns of the factors on inertial states, by variable.
+// IMU: [pose_i, pose_j, inertial_i, inertial_j].
+constexpr int kImuPoseICol = 0;
+constexpr int kImuPoseJCol = kImuPoseICol + kPoseDim;
+constexpr int kImuInertialICol = kImuPoseJCol + kPoseDim;
+constexpr int kImuInertialJCol = kImuInertialICol + kInertialDim;
+constexpr int kImuFactorCols = kImuInertialJCol + kInertialDim;
+// Body velocity: [pose, inertial].
+constexpr int kBodyVelocityPoseCol = 0;
+constexpr int kBodyVelocityInertialCol = kBodyVelocityPoseCol + kPoseDim;
+constexpr int kBodyVelocityCols = kBodyVelocityInertialCol + kInertialDim;
+// Bias: [inertial_i, inertial_j]; a prior has inertial_i only.
+constexpr int kBiasInertialICol = 0;
+constexpr int kBiasInertialJCol = kBiasInertialICol + kInertialDim;
+constexpr int kBiasFactorCols = kBiasInertialJCol + kInertialDim;
+// A between factor's Jacobian columns: [pose_i, pose_j].
+constexpr int kBetweenCols = 2 * kPoseDim;
+// A plane factor relates two nodes at least.
+constexpr size_t kMinPlaneObservations = 2;
+// Plane factors are linearized in batches of this many.
+constexpr int64_t kPlanesPerBatch = 256;
+// Levenberg-Marquardt damping: lambda grows by kDampingFactor after a
+// rejected step and shrinks by it after an accepted one (never below
+// kMinLambda), at most kMaxDampingAttempts times per iteration. It scales the
+// Hessian diagonal, floored at kMinDampingDiagonal.
+constexpr int kMaxDampingAttempts = 12;
+constexpr double kDampingFactor = 10.0;
+constexpr double kMinLambda = 1e-12;
+constexpr double kMinDampingDiagonal = 1e-9;
+// Guards the relative cost decrease against a zero cost.
+constexpr double kMinCost = 1e-300;
+
+// Cauchy loss of `chi2` with `scale` on sqrt(chi2); chi2 itself if `scale`
+// <= 0.
 double RobustRho(double chi2, double scale) {
   if (scale <= 0.0) return chi2;
-  const double s2 = scale * scale;
-  return s2 * std::log1p(chi2 / s2);
+  const double squared_scale = scale * scale;
+  return squared_scale * std::log1p(chi2 / squared_scale);
 }
 
+// Derivative of RobustRho with respect to chi2 (the IRLS weight).
 double RobustWeight(double chi2, double scale) {
   if (scale <= 0.0) return 1.0;
   return 1.0 / (1.0 + chi2 / (scale * scale));
@@ -36,22 +80,27 @@ double RobustWeight(double chi2, double scale) {
 Vec6 PriorResidual(const Pose& pose, const Pose& measurement, Mat6* jacobian) {
   const Vec3 rotation_error =
       So3Log(measurement.rotation.transpose() * pose.rotation);
-  Vec6 e;
-  e.head<3>() = pose.translation - measurement.translation;
-  e.tail<3>() = rotation_error;
+  Vec6 residual;
+  residual.segment<kSpaceDim>(kTranslationOffset) =
+      pose.translation - measurement.translation;
+  residual.segment<kSpaceDim>(kRotationOffset) = rotation_error;
   if (jacobian != nullptr) {
     jacobian->setZero();
-    jacobian->block<3, 3>(0, 0) = Mat3::Identity();
-    jacobian->block<3, 3>(3, 3) = So3RightJacobianInverse(rotation_error);
+    jacobian->block<kSpaceDim, kSpaceDim>(
+        kTranslationOffset, kTranslationOffset) = Mat3::Identity();
+    jacobian->block<kSpaceDim, kSpaceDim>(kRotationOffset, kRotationOffset) =
+        So3RightJacobianInverse(rotation_error);
   }
-  return e;
+  return residual;
 }
 
 Vec3 PositionResidual(const Pose& pose, const PositionFactor& factor,
-                      Eigen::Matrix<double, 3, 6>* jacobian) {
+                      SpaceByPose* jacobian) {
   if (jacobian != nullptr) {
-    jacobian->block<3, 3>(0, 0) = Mat3::Identity();
-    jacobian->block<3, 3>(0, 3) = -pose.rotation * Hat(factor.lever);
+    jacobian->block<kSpaceDim, kSpaceDim>(0, kTranslationOffset) =
+        Mat3::Identity();
+    jacobian->block<kSpaceDim, kSpaceDim>(0, kRotationOffset) =
+        -pose.rotation * Hat(factor.lever);
   }
   return pose.translation + pose.rotation * factor.lever - factor.measurement;
 }
@@ -64,43 +113,50 @@ Vec3 GravityResidual(const Pose& pose, const GravityFactor& factor,
   return up - factor.up_body;
 }
 
-void AddBlock(Triplets& triplets, int row0, int col0, const Mat6& block) {
-  for (int r = 0; r < 6; ++r) {
-    for (int c = 0; c < 6; ++c) {
-      if (block(r, c) != 0.0) {
-        triplets.emplace_back(row0 + r, col0 + c, block(r, c));
+// Adds the nonzero entries of a pose-pose block at (first_row, first_col).
+void AddBlock(int first_row, int first_col, const Mat6& block,
+              Triplets* triplets) {
+  for (int row = 0; row < kPoseDim; ++row) {
+    for (int col = 0; col < kPoseDim; ++col) {
+      if (block(row, col) != 0.0) {
+        triplets->emplace_back(first_row + row, first_col + col,
+                               block(row, col));
       }
     }
   }
 }
 
 // Columns [first, first + size) of a factor Jacobian belong to the variable
-// at normal-equation offset `offset` (< 0: fixed variable).
+// at normal-equation offset `offset` (kFixedVariable: fixed variable).
 struct Segment {
   int first = 0;
   int size = 0;
-  int offset = -1;
+  int offset = kFixedVariable;
 };
 
-// Adds J^T W J and J^T W e of a factor with a dense local Jacobian.
+// Adds J^T W J to `triplets` and J^T W e to `gradient` for a factor with a
+// dense local Jacobian.
 void AddDenseFactor(const Eigen::MatrixXd& jacobian,
                     const Eigen::MatrixXd& information,
                     const Eigen::VectorXd& residual,
-                    const std::vector<Segment>& segments, Triplets& triplets,
-                    Eigen::VectorXd& b) {
-  const Eigen::MatrixXd jt_w = jacobian.transpose() * information;
-  const Eigen::MatrixXd h = jt_w * jacobian;
-  const Eigen::VectorXd g = jt_w * residual;
-  for (const Segment& row : segments) {
-    if (row.offset < 0) continue;
-    b.segment(row.offset, row.size) += g.segment(row.first, row.size);
-    for (const Segment& col : segments) {
-      if (col.offset < 0) continue;
-      for (int r = 0; r < row.size; ++r) {
-        for (int c = 0; c < col.size; ++c) {
-          const double value = h(row.first + r, col.first + c);
+                    const std::vector<Segment>& segments, Triplets* triplets,
+                    Eigen::VectorXd* gradient) {
+  const Eigen::MatrixXd weighted_transpose = jacobian.transpose() * information;
+  const Eigen::MatrixXd factor_hessian = weighted_transpose * jacobian;
+  const Eigen::VectorXd factor_gradient = weighted_transpose * residual;
+  for (const Segment& row_block : segments) {
+    if (row_block.offset < 0) continue;
+    gradient->segment(row_block.offset, row_block.size) +=
+        factor_gradient.segment(row_block.first, row_block.size);
+    for (const Segment& col_block : segments) {
+      if (col_block.offset < 0) continue;
+      for (int row = 0; row < row_block.size; ++row) {
+        for (int col = 0; col < col_block.size; ++col) {
+          const double value =
+              factor_hessian(row_block.first + row, col_block.first + col);
           if (value != 0.0) {
-            triplets.emplace_back(row.offset + r, col.offset + c, value);
+            triplets->emplace_back(row_block.offset + row,
+                                   col_block.offset + col, value);
           }
         }
       }
@@ -118,10 +174,13 @@ struct BodyPose {
 BodyPose ToBody(const Pose& world_from_node, const Pose& node_from_body) {
   BodyPose body;
   body.world_from_body = world_from_node * node_from_body;
-  body.body_by_node.block<3, 3>(0, 0) = Mat3::Identity();
-  body.body_by_node.block<3, 3>(0, 3) =
+  body.body_by_node.block<kSpaceDim, kSpaceDim>(
+      kTranslationOffset, kTranslationOffset) = Mat3::Identity();
+  body.body_by_node.block<kSpaceDim, kSpaceDim>(kTranslationOffset,
+                                                kRotationOffset) =
       -world_from_node.rotation * Hat(node_from_body.translation);
-  body.body_by_node.block<3, 3>(3, 3) = node_from_body.rotation.transpose();
+  body.body_by_node.block<kSpaceDim, kSpaceDim>(
+      kRotationOffset, kRotationOffset) = node_from_body.rotation.transpose();
   return body;
 }
 
@@ -158,19 +217,19 @@ int ThreadCount() {
 
 std::vector<Pose> ObservationPoses(const PlaneFactor& factor,
                                    const std::vector<Pose>& poses) {
-  std::vector<Pose> out;
-  out.reserve(factor.observations.size());
+  std::vector<Pose> observation_poses;
+  observation_poses.reserve(factor.observations.size());
   for (const PlaneObservation& observation : factor.observations) {
-    out.push_back(poses[static_cast<size_t>(observation.node)]);
+    observation_poses.push_back(poses[static_cast<size_t>(observation.node)]);
   }
-  return out;
+  return observation_poses;
 }
 
-// Weighted Gauss-Newton terms of one plane factor; `vars` holds the pose
-// variable index of every observation (-1: fixed node).
+// Weighted Gauss-Newton terms of one plane factor; `pose_variables` holds the
+// pose variable index of every observation (kFixedVariable: fixed node).
 struct PlaneTerm {
   bool valid = false;
-  std::vector<int> vars;
+  std::vector<int> pose_variables;
   Eigen::MatrixXd hessian;
   Eigen::VectorXd gradient;
 };
@@ -180,41 +239,41 @@ struct PlaneTerm {
 int PoseGraph::AddNode(const Pose& initial, bool fixed) {
   poses_.push_back(initial);
   fixed_.push_back(fixed);
-  inertial_index_.push_back(-1);
+  inertial_index_.push_back(kNoInertialState);
   return static_cast<int>(poses_.size()) - 1;
 }
 
-void PoseGraph::SetFixed(int i, bool fixed) {
-  GR_CHECK(HasNode(i));
-  fixed_[static_cast<size_t>(i)] = fixed;
+void PoseGraph::SetFixed(int node, bool fixed) {
+  GR_CHECK(HasNode(node));
+  fixed_[static_cast<size_t>(node)] = fixed;
 }
 
-void PoseGraph::SetPose(int i, const Pose& pose) {
-  GR_CHECK(HasNode(i));
-  poses_[static_cast<size_t>(i)] = pose;
+void PoseGraph::SetPose(int node, const Pose& pose) {
+  GR_CHECK(HasNode(node));
+  poses_[static_cast<size_t>(node)] = pose;
 }
 
-void PoseGraph::AddInertialState(int i, const Vec3& velocity,
+void PoseGraph::AddInertialState(int node, const Vec3& velocity,
                                  const Vec6& bias) {
-  GR_CHECK(HasNode(i) && !HasInertialState(i));
-  inertial_index_[static_cast<size_t>(i)] =
+  GR_CHECK(HasNode(node) && !HasInertialState(node));
+  inertial_index_[static_cast<size_t>(node)] =
       static_cast<int>(velocities_.size());
   velocities_.push_back(velocity);
   biases_.push_back(bias);
 }
 
-bool PoseGraph::HasInertialState(int i) const {
-  return HasNode(i) && InertialIndex(i) >= 0;
+bool PoseGraph::HasInertialState(int node) const {
+  return HasNode(node) && InertialIndex(node) != kNoInertialState;
 }
 
-const Vec3& PoseGraph::Velocity(int i) const {
-  GR_CHECK(HasInertialState(i));
-  return velocities_[static_cast<size_t>(InertialIndex(i))];
+const Vec3& PoseGraph::Velocity(int node) const {
+  GR_CHECK(HasInertialState(node));
+  return velocities_[static_cast<size_t>(InertialIndex(node))];
 }
 
-const Vec6& PoseGraph::Bias(int i) const {
-  GR_CHECK(HasInertialState(i));
-  return biases_[static_cast<size_t>(InertialIndex(i))];
+const Vec6& PoseGraph::Bias(int node) const {
+  GR_CHECK(HasInertialState(node));
+  return biases_[static_cast<size_t>(InertialIndex(node))];
 }
 
 void PoseGraph::AddImu(int i, int j, const ImuPreintegration& preintegration,
@@ -229,12 +288,12 @@ void PoseGraph::AddImu(int i, int j, const ImuPreintegration& preintegration,
   imu_.push_back(factor);
 }
 
-void PoseGraph::AddBodyVelocity(int i, const Vec3& velocity_body,
+void PoseGraph::AddBodyVelocity(int node, const Vec3& velocity_body,
                                 const Vec3& sigma, const Pose& node_from_body) {
-  GR_CHECK(HasInertialState(i));
+  GR_CHECK(HasInertialState(node));
   GR_CHECK((sigma.array() > 0.0).all());
   BodyVelocityFactor factor;
-  factor.i = i;
+  factor.i = node;
   factor.velocity_body = velocity_body;
   factor.node_from_body = node_from_body;
   factor.information = sigma.cwiseProduct(sigma).cwiseInverse().asDiagonal();
@@ -251,11 +310,11 @@ void PoseGraph::AddBiasBetween(int i, int j, const Vec6& sigma) {
   bias_factors_.push_back(factor);
 }
 
-void PoseGraph::AddBiasPrior(int i, const Vec6& bias, const Vec6& sigma) {
-  GR_CHECK(HasInertialState(i));
+void PoseGraph::AddBiasPrior(int node, const Vec6& bias, const Vec6& sigma) {
+  GR_CHECK(HasInertialState(node));
   GR_CHECK((sigma.array() > 0.0).all());
   BiasFactor factor;
-  factor.i = i;
+  factor.i = node;
   factor.bias = bias;
   factor.information = sigma.cwiseProduct(sigma).cwiseInverse().asDiagonal();
   bias_factors_.push_back(factor);
@@ -267,27 +326,27 @@ void PoseGraph::AddBetween(int i, int j, const Pose& measurement,
   between_.push_back({i, j, measurement, information, robust_scale});
 }
 
-void PoseGraph::AddPrior(int i, const Pose& measurement,
+void PoseGraph::AddPrior(int node, const Pose& measurement,
                          const Mat6& information) {
-  GR_CHECK(HasNode(i));
-  priors_.push_back({i, measurement, information});
+  GR_CHECK(HasNode(node));
+  priors_.push_back({node, measurement, information});
 }
 
-void PoseGraph::AddPosition(int i, const Vec3& measurement,
+void PoseGraph::AddPosition(int node, const Vec3& measurement,
                             const Mat3& information, const Vec3& lever) {
-  GR_CHECK(HasNode(i));
+  GR_CHECK(HasNode(node));
   PositionFactor factor;
-  factor.i = i;
+  factor.i = node;
   factor.measurement = measurement;
   factor.lever = lever;
   factor.information = information;
   positions_.push_back(factor);
 }
 
-void PoseGraph::AddGravity(int i, const Vec3& up_body, double sigma_rad) {
-  GR_CHECK(HasNode(i));
+void PoseGraph::AddGravity(int node, const Vec3& up_body, double sigma_rad) {
+  GR_CHECK(HasNode(node));
   GravityFactor factor;
-  factor.i = i;
+  factor.i = node;
   factor.up_body = up_body.normalized();
   factor.information = 1.0 / (sigma_rad * sigma_rad);
   gravity_.push_back(factor);
@@ -295,15 +354,15 @@ void PoseGraph::AddGravity(int i, const Vec3& up_body, double sigma_rad) {
 
 void PoseGraph::AddPlane(std::vector<PlaneObservation> observations,
                          double sigma, double robust_scale) {
-  GR_CHECK(sigma > 0.0 && observations.size() >= 2);
+  GR_CHECK(sigma > 0.0 && observations.size() >= kMinPlaneObservations);
   PlaneFactor factor;
-  for (size_t a = 0; a < observations.size(); ++a) {
-    GR_CHECK(HasNode(observations[a].node));
-    GR_CHECK(observations[a].points.weight() > 0.0);
-    for (size_t b = 0; b < a; ++b) {
-      GR_CHECK(observations[a].node != observations[b].node);
+  for (size_t index = 0; index < observations.size(); ++index) {
+    GR_CHECK(HasNode(observations[index].node));
+    GR_CHECK(observations[index].points.weight() > 0.0);
+    for (size_t earlier = 0; earlier < index; ++earlier) {
+      GR_CHECK(observations[index].node != observations[earlier].node);
     }
-    factor.weight += observations[a].points.weight();
+    factor.weight += observations[index].points.weight();
   }
   factor.observations = std::move(observations);
   factor.information = 1.0 / (sigma * sigma);
@@ -314,28 +373,34 @@ void PoseGraph::AddPlane(std::vector<PlaneObservation> observations,
 Vec6 PoseGraph::BetweenResidual(const Pose& pose_i, const Pose& pose_j,
                                 const Pose& measurement, Mat6* jacobian_i,
                                 Mat6* jacobian_j) {
-  const Mat3 ri_t = pose_i.rotation.transpose();
-  const Vec3 d = pose_j.translation - pose_i.translation;
-  const Vec3 rotation_error =
-      So3Log(measurement.rotation.transpose() * ri_t * pose_j.rotation);
-  Vec6 e;
-  e.head<3>() = ri_t * d - measurement.translation;
-  e.tail<3>() = rotation_error;
-  if (jacobian_i == nullptr && jacobian_j == nullptr) return e;
-  const Mat3 jr_inv = So3RightJacobianInverse(rotation_error);
+  const Mat3 rotation_i_inverse = pose_i.rotation.transpose();
+  const Vec3 displacement = pose_j.translation - pose_i.translation;
+  const Vec3 rotation_error = So3Log(measurement.rotation.transpose() *
+                                     rotation_i_inverse * pose_j.rotation);
+  Vec6 residual;
+  residual.segment<kSpaceDim>(kTranslationOffset) =
+      rotation_i_inverse * displacement - measurement.translation;
+  residual.segment<kSpaceDim>(kRotationOffset) = rotation_error;
+  if (jacobian_i == nullptr && jacobian_j == nullptr) return residual;
+  const Mat3 right_jacobian_inverse = So3RightJacobianInverse(rotation_error);
   if (jacobian_i != nullptr) {
     jacobian_i->setZero();
-    jacobian_i->block<3, 3>(0, 0) = -ri_t;
-    jacobian_i->block<3, 3>(0, 3) = Hat(ri_t * d);
-    jacobian_i->block<3, 3>(3, 3) =
-        -jr_inv * pose_j.rotation.transpose() * pose_i.rotation;
+    jacobian_i->block<kSpaceDim, kSpaceDim>(
+        kTranslationOffset, kTranslationOffset) = -rotation_i_inverse;
+    jacobian_i->block<kSpaceDim, kSpaceDim>(kTranslationOffset,
+                                            kRotationOffset) =
+        Hat(rotation_i_inverse * displacement);
+    jacobian_i->block<kSpaceDim, kSpaceDim>(kRotationOffset, kRotationOffset) =
+        -right_jacobian_inverse * pose_j.rotation.transpose() * pose_i.rotation;
   }
   if (jacobian_j != nullptr) {
     jacobian_j->setZero();
-    jacobian_j->block<3, 3>(0, 0) = ri_t;
-    jacobian_j->block<3, 3>(3, 3) = jr_inv;
+    jacobian_j->block<kSpaceDim, kSpaceDim>(
+        kTranslationOffset, kTranslationOffset) = rotation_i_inverse;
+    jacobian_j->block<kSpaceDim, kSpaceDim>(kRotationOffset, kRotationOffset) =
+        right_jacobian_inverse;
   }
-  return e;
+  return residual;
 }
 
 PoseGraph::State PoseGraph::CurrentState() const {
@@ -351,72 +416,79 @@ double PoseGraph::PlaneChi2(const PlaneFactor& factor,
 }
 
 std::vector<double> PoseGraph::PlaneRms() const {
-  std::vector<double> out(planes_.size());
+  std::vector<double> rms(planes_.size());
   const int64_t num_planes = static_cast<int64_t>(planes_.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 64)
+  constexpr int kPlanesPerChunk = 64;
+#pragma omp parallel for schedule(dynamic, kPlanesPerChunk)
 #endif
-  for (int64_t p = 0; p < num_planes; ++p) {
-    const PlaneFactor& factor = planes_[static_cast<size_t>(p)];
+  for (int64_t plane = 0; plane < num_planes; ++plane) {
+    const PlaneFactor& factor = planes_[static_cast<size_t>(plane)];
     const double cost =
         PlaneCost(factor.observations, ObservationPoses(factor, poses_));
-    out[static_cast<size_t>(p)] = std::sqrt(cost / factor.weight);
+    rms[static_cast<size_t>(plane)] = std::sqrt(cost / factor.weight);
   }
-  return out;
+  return rms;
 }
 
 double PoseGraph::TotalCost(const State& state) const {
   const std::vector<Pose>& poses = state.poses;
-  const auto at = [&](int i) -> const Pose& {
-    return poses[static_cast<size_t>(i)];
+  const auto pose_at = [&](int node) -> const Pose& {
+    return poses[static_cast<size_t>(node)];
   };
-  const auto inertial = [&](int i) {
-    return static_cast<size_t>(InertialIndex(i));
+  const auto inertial = [&](int node) {
+    return static_cast<size_t>(InertialIndex(node));
   };
   double cost = 0.0;
-  for (const BetweenFactor& f : between_) {
-    const Vec6 e = BetweenResidual(at(f.i), at(f.j), f.measurement);
-    cost += RobustRho(e.dot(f.information * e), f.robust_scale);
+  for (const BetweenFactor& factor : between_) {
+    const Vec6 residual = BetweenResidual(pose_at(factor.i), pose_at(factor.j),
+                                          factor.measurement);
+    cost += RobustRho(residual.dot(factor.information * residual),
+                      factor.robust_scale);
   }
-  for (const PriorFactor& f : priors_) {
-    const Vec6 e = PriorResidual(at(f.i), f.measurement, nullptr);
-    cost += e.dot(f.information * e);
+  for (const PriorFactor& factor : priors_) {
+    const Vec6 residual =
+        PriorResidual(pose_at(factor.i), factor.measurement, nullptr);
+    cost += residual.dot(factor.information * residual);
   }
-  for (const PositionFactor& f : positions_) {
-    const Vec3 e = PositionResidual(at(f.i), f, nullptr);
-    cost += e.dot(f.information * e);
+  for (const PositionFactor& factor : positions_) {
+    const Vec3 residual = PositionResidual(pose_at(factor.i), factor, nullptr);
+    cost += residual.dot(factor.information * residual);
   }
-  for (const GravityFactor& f : gravity_) {
-    cost += f.information * GravityResidual(at(f.i), f, nullptr).squaredNorm();
+  for (const GravityFactor& factor : gravity_) {
+    cost += factor.information *
+            GravityResidual(pose_at(factor.i), factor, nullptr).squaredNorm();
   }
-  for (const ImuFactor& f : imu_) {
-    const Vec9 e = ImuResidual(
-        f, at(f.i), at(f.j), state.velocities[inertial(f.i)],
-        state.velocities[inertial(f.j)], state.biases[inertial(f.i)]);
-    cost += e.dot(f.information * e);
+  for (const ImuFactor& factor : imu_) {
+    const Vec9 residual = ImuResidual(
+        factor, pose_at(factor.i), pose_at(factor.j),
+        state.velocities[inertial(factor.i)],
+        state.velocities[inertial(factor.j)], state.biases[inertial(factor.i)]);
+    cost += residual.dot(factor.information * residual);
   }
-  for (const BodyVelocityFactor& f : body_velocities_) {
-    const Vec3 e =
-        BodyVelocityResidual(f, at(f.i), state.velocities[inertial(f.i)]);
-    cost += e.dot(f.information * e);
+  for (const BodyVelocityFactor& factor : body_velocities_) {
+    const Vec3 residual = BodyVelocityResidual(
+        factor, pose_at(factor.i), state.velocities[inertial(factor.i)]);
+    cost += residual.dot(factor.information * residual);
   }
-  for (const BiasFactor& f : bias_factors_) {
-    const Vec6 e =
-        f.j < 0
-            ? Vec6(state.biases[inertial(f.i)] - f.bias)
-            : Vec6(state.biases[inertial(f.j)] - state.biases[inertial(f.i)]);
-    cost += e.dot(f.information * e);
+  for (const BiasFactor& factor : bias_factors_) {
+    const Vec6 residual =
+        factor.j < 0 ? Vec6(state.biases[inertial(factor.i)] - factor.bias)
+                     : Vec6(state.biases[inertial(factor.j)] -
+                            state.biases[inertial(factor.i)]);
+    cost += residual.dot(factor.information * residual);
   }
   // Summed in plane order, so that the cost does not depend on the number of
   // threads.
   std::vector<double> plane_chi2(planes_.size());
   const int64_t num_planes = static_cast<int64_t>(planes_.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 64)
+  constexpr int kPlanesPerChunk = 64;
+#pragma omp parallel for schedule(dynamic, kPlanesPerChunk)
 #endif
-  for (int64_t p = 0; p < num_planes; ++p) {
-    plane_chi2[static_cast<size_t>(p)] =
-        PlaneChi2(planes_[static_cast<size_t>(p)], poses);
+  for (int64_t plane = 0; plane < num_planes; ++plane) {
+    plane_chi2[static_cast<size_t>(plane)] =
+        PlaneChi2(planes_[static_cast<size_t>(plane)], poses);
   }
   double plane_cost = 0.0;
   for (const double chi2 : plane_chi2) plane_cost += chi2;
@@ -424,84 +496,90 @@ double PoseGraph::TotalCost(const State& state) const {
 }
 
 std::vector<double> PoseGraph::BetweenChi2() const {
-  std::vector<double> out;
-  out.reserve(between_.size());
-  for (const BetweenFactor& f : between_) {
-    const Vec6 e =
-        BetweenResidual(poses_[static_cast<size_t>(f.i)],
-                        poses_[static_cast<size_t>(f.j)], f.measurement);
-    out.push_back(e.dot(f.information * e));
+  std::vector<double> chi2;
+  chi2.reserve(between_.size());
+  for (const BetweenFactor& factor : between_) {
+    const Vec6 residual = BetweenResidual(poses_[static_cast<size_t>(factor.i)],
+                                          poses_[static_cast<size_t>(factor.j)],
+                                          factor.measurement);
+    chi2.push_back(residual.dot(factor.information * residual));
   }
-  return out;
+  return chi2;
 }
 
 std::vector<double> PoseGraph::ImuChi2() const {
-  std::vector<double> out;
-  out.reserve(imu_.size());
-  for (const ImuFactor& f : imu_) {
-    const size_t si = static_cast<size_t>(InertialIndex(f.i));
-    const size_t sj = static_cast<size_t>(InertialIndex(f.j));
-    const Vec9 e = ImuResidual(f, poses_[static_cast<size_t>(f.i)],
-                               poses_[static_cast<size_t>(f.j)],
-                               velocities_[si], velocities_[sj], biases_[si]);
-    out.push_back(e.dot(f.information * e));
+  std::vector<double> chi2;
+  chi2.reserve(imu_.size());
+  for (const ImuFactor& factor : imu_) {
+    const size_t state_i = static_cast<size_t>(InertialIndex(factor.i));
+    const size_t state_j = static_cast<size_t>(InertialIndex(factor.j));
+    const Vec9 residual =
+        ImuResidual(factor, poses_[static_cast<size_t>(factor.i)],
+                    poses_[static_cast<size_t>(factor.j)], velocities_[state_i],
+                    velocities_[state_j], biases_[state_i]);
+    chi2.push_back(residual.dot(factor.information * residual));
   }
-  return out;
+  return chi2;
 }
 
 struct PoseGraph::LinearSystem {
   // All factors, except the pose-pose blocks of the plane factors when the
   // pose block is dense.
-  Eigen::SparseMatrix<double> h;
-  Eigen::VectorXd b;
+  Eigen::SparseMatrix<double> hessian;
+  Eigen::VectorXd gradient;
   Eigen::MatrixXd pose_hessian;  // Dense layout: plane pose-pose blocks.
 };
 
 void PoseGraph::LinearizePlanes(const State& state, const Layout& layout,
-                                LinearSystem& system,
-                                Triplets& triplets) const {
-  const int num_vars = layout.pose_dim / 6;
+                                LinearSystem* system,
+                                Triplets* triplets) const {
+  const int num_variables = layout.pose_dim / kPoseDim;
   if (layout.dense) {
-    system.pose_hessian =
+    system->pose_hessian =
         Eigen::MatrixXd::Zero(layout.pose_dim, layout.pose_dim);
   }
   // Sparse layout: blocks per row variable, keyed by the column variable.
   std::vector<std::unordered_map<int, Mat6>> rows;
-  if (!layout.dense) rows.resize(static_cast<size_t>(num_vars));
+  if (!layout.dense) rows.resize(static_cast<size_t>(num_variables));
   const int64_t num_planes = static_cast<int64_t>(planes_.size());
-  constexpr int64_t kChunk = 256;
-  std::vector<PlaneTerm> terms(static_cast<size_t>(kChunk));
-  for (int64_t start = 0; start < num_planes; start += kChunk) {
-    const int64_t count = std::min(kChunk, num_planes - start);
+  std::vector<PlaneTerm> terms(static_cast<size_t>(kPlanesPerBatch));
+  for (int64_t start = 0; start < num_planes; start += kPlanesPerBatch) {
+    const int64_t count = std::min(kPlanesPerBatch, num_planes - start);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 4)
+    constexpr int kPlanesPerChunk = 4;
+#pragma omp parallel for schedule(dynamic, kPlanesPerChunk)
 #endif
-    for (int64_t q = 0; q < count; ++q) {
-      const PlaneFactor& f = planes_[static_cast<size_t>(start + q)];
-      PlaneTerm& term = terms[static_cast<size_t>(q)];
+    for (int64_t slot = 0; slot < count; ++slot) {
+      const PlaneFactor& factor = planes_[static_cast<size_t>(start + slot)];
+      PlaneTerm& term = terms[static_cast<size_t>(slot)];
       term.valid = false;
-      const std::optional<PlaneLinearization> linearization =
-          LinearizePlane(f.observations, ObservationPoses(f, state.poses));
+      const std::optional<PlaneLinearization> linearization = LinearizePlane(
+          factor.observations, ObservationPoses(factor, state.poses));
       if (!linearization) continue;
-      const double mean_chi2 = linearization->cost / f.weight * f.information;
+      const double mean_chi2 =
+          linearization->cost / factor.weight * factor.information;
       const double scale =
-          f.information * RobustWeight(mean_chi2, f.robust_scale);
-      term.vars.clear();
-      for (const PlaneObservation& observation : f.observations) {
+          factor.information * RobustWeight(mean_chi2, factor.robust_scale);
+      term.pose_variables.clear();
+      for (const PlaneObservation& observation : factor.observations) {
         const int offset = layout.pose[static_cast<size_t>(observation.node)];
-        term.vars.push_back(offset < 0 ? -1 : offset / 6);
+        term.pose_variables.push_back(offset < 0 ? kFixedVariable
+                                                 : offset / kPoseDim);
       }
       term.hessian = scale * linearization->hessian;
       term.gradient = scale * linearization->gradient;
       term.valid = true;
     }
-    for (int64_t q = 0; q < count; ++q) {
-      const PlaneTerm& term = terms[static_cast<size_t>(q)];
+    for (int64_t slot = 0; slot < count; ++slot) {
+      const PlaneTerm& term = terms[static_cast<size_t>(slot)];
       if (!term.valid) continue;
-      for (size_t a = 0; a < term.vars.size(); ++a) {
-        if (term.vars[a] < 0) continue;
-        system.b.segment<6>(6 * term.vars[a]) +=
-            term.gradient.segment<6>(static_cast<Eigen::Index>(6 * a));
+      for (size_t observation = 0; observation < term.pose_variables.size();
+           ++observation) {
+        const int variable = term.pose_variables[observation];
+        if (variable < 0) continue;
+        system->gradient.segment<kPoseDim>(kPoseDim * variable) +=
+            term.gradient.segment<kPoseDim>(
+                static_cast<Eigen::Index>(kPoseDim * observation));
       }
     }
     // Each thread adds the blocks of the row variables it owns.
@@ -510,35 +588,40 @@ void PoseGraph::LinearizePlanes(const State& state, const Layout& layout,
 #endif
     {
       const int thread = ThreadIndex();
-      const int threads = ThreadCount();
-      for (int64_t q = 0; q < count; ++q) {
-        const PlaneTerm& term = terms[static_cast<size_t>(q)];
+      const int num_threads = ThreadCount();
+      for (int64_t slot = 0; slot < count; ++slot) {
+        const PlaneTerm& term = terms[static_cast<size_t>(slot)];
         if (!term.valid) continue;
-        const size_t m = term.vars.size();
-        for (size_t a = 0; a < m; ++a) {
-          const int va = term.vars[a];
-          if (va < 0 || va % threads != thread) continue;
-          for (size_t c = 0; c < m; ++c) {
-            const int vc = term.vars[c];
-            if (vc < 0) continue;
-            const Mat6 block =
-                term.hessian.block<6, 6>(static_cast<Eigen::Index>(6 * a),
-                                         static_cast<Eigen::Index>(6 * c));
+        const size_t num_observations = term.pose_variables.size();
+        for (size_t row = 0; row < num_observations; ++row) {
+          const int row_variable = term.pose_variables[row];
+          if (row_variable < 0 || row_variable % num_threads != thread) {
+            continue;
+          }
+          for (size_t col = 0; col < num_observations; ++col) {
+            const int col_variable = term.pose_variables[col];
+            if (col_variable < 0) continue;
+            const Mat6 block = term.hessian.block<kPoseDim, kPoseDim>(
+                static_cast<Eigen::Index>(kPoseDim * row),
+                static_cast<Eigen::Index>(kPoseDim * col));
             if (layout.dense) {
-              system.pose_hessian.block<6, 6>(6 * va, 6 * vc) += block;
+              system->pose_hessian.block<kPoseDim, kPoseDim>(
+                  kPoseDim * row_variable, kPoseDim * col_variable) += block;
             } else {
-              auto [it, inserted] =
-                  rows[static_cast<size_t>(va)].try_emplace(vc, block);
-              if (!inserted) it->second += block;
+              auto [entry, inserted] =
+                  rows[static_cast<size_t>(row_variable)].try_emplace(
+                      col_variable, block);
+              if (!inserted) entry->second += block;
             }
           }
         }
       }
     }
   }
-  for (size_t va = 0; va < rows.size(); ++va) {
-    for (const auto& [vc, block] : rows[va]) {
-      AddBlock(triplets, 6 * static_cast<int>(va), 6 * vc, block);
+  for (size_t row_variable = 0; row_variable < rows.size(); ++row_variable) {
+    for (const auto& [col_variable, block] : rows[row_variable]) {
+      AddBlock(kPoseDim * static_cast<int>(row_variable),
+               kPoseDim * col_variable, block, triplets);
     }
   }
 }
@@ -546,288 +629,362 @@ void PoseGraph::LinearizePlanes(const State& state, const Layout& layout,
 PoseGraph::LinearSystem PoseGraph::Linearize(const State& state,
                                              const Layout& layout) const {
   const int dim = layout.dim;
-  // Pose blocks come first, so 6 * var(i) is node i's offset.
-  const auto var = [&](int i) {
-    const int offset = layout.pose[static_cast<size_t>(i)];
-    return offset < 0 ? -1 : offset / 6;
+  // Pose blocks come first, so kPoseDim * pose_variable(node) is the node's
+  // offset.
+  const auto pose_variable = [&](int node) {
+    const int offset = layout.pose[static_cast<size_t>(node)];
+    return offset < 0 ? kFixedVariable : offset / kPoseDim;
   };
-  const auto pose_at = [&](int i) -> const Pose& {
-    return state.poses[static_cast<size_t>(i)];
+  const auto pose_at = [&](int node) -> const Pose& {
+    return state.poses[static_cast<size_t>(node)];
   };
-  const auto pose_offset = [&](int i) {
-    return layout.pose[static_cast<size_t>(i)];
+  const auto pose_offset = [&](int node) {
+    return layout.pose[static_cast<size_t>(node)];
   };
-  const auto inertial_offset = [&](int i) {
-    return layout.inertial[static_cast<size_t>(InertialIndex(i))];
+  const auto inertial_offset = [&](int node) {
+    return layout.inertial[static_cast<size_t>(InertialIndex(node))];
   };
+  // Hessian entries of each kind of factor (at most).
+  constexpr size_t kBetweenEntries = kBetweenCols * kBetweenCols;
+  constexpr size_t kPoseEntries = kPoseDim * kPoseDim;
+  constexpr size_t kImuEntries = kImuFactorCols * kImuFactorCols;
+  constexpr size_t kBodyVelocityEntries = kBodyVelocityCols * kBodyVelocityCols;
+  constexpr size_t kBiasEntries = kBiasFactorCols * kBiasFactorCols;
   Triplets triplets;
-  triplets.reserve(between_.size() * 144 +
-                   (priors_.size() + positions_.size() + gravity_.size()) * 36 +
-                   imu_.size() * 900 + body_velocities_.size() * 225 +
-                   bias_factors_.size() * 324);
+  triplets.reserve(between_.size() * kBetweenEntries +
+                   (priors_.size() + positions_.size() + gravity_.size()) *
+                       kPoseEntries +
+                   imu_.size() * kImuEntries +
+                   body_velocities_.size() * kBodyVelocityEntries +
+                   bias_factors_.size() * kBiasEntries);
   LinearSystem system;
-  system.b = Eigen::VectorXd::Zero(dim);
-  for (const BetweenFactor& f : between_) {
-    Mat6 ji, jj;
-    const Vec6 e =
-        BetweenResidual(pose_at(f.i), pose_at(f.j), f.measurement, &ji, &jj);
-    const Mat6 w =
-        RobustWeight(e.dot(f.information * e), f.robust_scale) * f.information;
-    const int vi = var(f.i);
-    const int vj = var(f.j);
-    if (vi >= 0) {
-      AddBlock(triplets, 6 * vi, 6 * vi, ji.transpose() * w * ji);
-      system.b.segment<6>(6 * vi) += ji.transpose() * w * e;
+  system.gradient = Eigen::VectorXd::Zero(dim);
+  for (const BetweenFactor& factor : between_) {
+    Mat6 jacobian_i;
+    Mat6 jacobian_j;
+    const Vec6 residual =
+        BetweenResidual(pose_at(factor.i), pose_at(factor.j),
+                        factor.measurement, &jacobian_i, &jacobian_j);
+    const Mat6 weight =
+        RobustWeight(residual.dot(factor.information * residual),
+                     factor.robust_scale) *
+        factor.information;
+    const int variable_i = pose_variable(factor.i);
+    const int variable_j = pose_variable(factor.j);
+    if (variable_i >= 0) {
+      AddBlock(kPoseDim * variable_i, kPoseDim * variable_i,
+               jacobian_i.transpose() * weight * jacobian_i, &triplets);
+      system.gradient.segment<kPoseDim>(kPoseDim * variable_i) +=
+          jacobian_i.transpose() * weight * residual;
     }
-    if (vj >= 0) {
-      AddBlock(triplets, 6 * vj, 6 * vj, jj.transpose() * w * jj);
-      system.b.segment<6>(6 * vj) += jj.transpose() * w * e;
+    if (variable_j >= 0) {
+      AddBlock(kPoseDim * variable_j, kPoseDim * variable_j,
+               jacobian_j.transpose() * weight * jacobian_j, &triplets);
+      system.gradient.segment<kPoseDim>(kPoseDim * variable_j) +=
+          jacobian_j.transpose() * weight * residual;
     }
-    if (vi >= 0 && vj >= 0) {
-      const Mat6 hij = ji.transpose() * w * jj;
-      AddBlock(triplets, 6 * vi, 6 * vj, hij);
-      AddBlock(triplets, 6 * vj, 6 * vi, hij.transpose());
+    if (variable_i >= 0 && variable_j >= 0) {
+      const Mat6 coupling = jacobian_i.transpose() * weight * jacobian_j;
+      AddBlock(kPoseDim * variable_i, kPoseDim * variable_j, coupling,
+               &triplets);
+      AddBlock(kPoseDim * variable_j, kPoseDim * variable_i,
+               coupling.transpose(), &triplets);
     }
   }
-  for (const PriorFactor& f : priors_) {
-    const int vi = var(f.i);
-    if (vi < 0) continue;
-    Mat6 j;
-    const Vec6 e = PriorResidual(pose_at(f.i), f.measurement, &j);
-    AddBlock(triplets, 6 * vi, 6 * vi, j.transpose() * f.information * j);
-    system.b.segment<6>(6 * vi) += j.transpose() * f.information * e;
+  for (const PriorFactor& factor : priors_) {
+    const int variable = pose_variable(factor.i);
+    if (variable < 0) continue;
+    Mat6 jacobian;
+    const Vec6 residual =
+        PriorResidual(pose_at(factor.i), factor.measurement, &jacobian);
+    AddBlock(kPoseDim * variable, kPoseDim * variable,
+             jacobian.transpose() * factor.information * jacobian, &triplets);
+    system.gradient.segment<kPoseDim>(kPoseDim * variable) +=
+        jacobian.transpose() * factor.information * residual;
   }
-  for (const PositionFactor& f : positions_) {
-    const int vi = var(f.i);
-    if (vi < 0) continue;
-    Eigen::Matrix<double, 3, 6> j;
-    const Vec3 e = PositionResidual(pose_at(f.i), f, &j);
-    AddBlock(triplets, 6 * vi, 6 * vi, j.transpose() * f.information * j);
-    system.b.segment<6>(6 * vi) += j.transpose() * f.information * e;
+  for (const PositionFactor& factor : positions_) {
+    const int variable = pose_variable(factor.i);
+    if (variable < 0) continue;
+    SpaceByPose jacobian;
+    const Vec3 residual =
+        PositionResidual(pose_at(factor.i), factor, &jacobian);
+    AddBlock(kPoseDim * variable, kPoseDim * variable,
+             jacobian.transpose() * factor.information * jacobian, &triplets);
+    system.gradient.segment<kPoseDim>(kPoseDim * variable) +=
+        jacobian.transpose() * factor.information * residual;
   }
-  for (const GravityFactor& f : gravity_) {
-    const int vi = var(f.i);
-    if (vi < 0) continue;
-    Mat3 j;
-    const Vec3 e = GravityResidual(pose_at(f.i), f, &j);
+  for (const GravityFactor& factor : gravity_) {
+    const int variable = pose_variable(factor.i);
+    if (variable < 0) continue;
+    Mat3 jacobian;
+    const Vec3 residual = GravityResidual(pose_at(factor.i), factor, &jacobian);
     Mat6 block = Mat6::Zero();
-    block.block<3, 3>(3, 3) = f.information * j.transpose() * j;
-    AddBlock(triplets, 6 * vi, 6 * vi, block);
-    system.b.segment<3>(6 * vi + 3) += f.information * j.transpose() * e;
+    block.block<kSpaceDim, kSpaceDim>(kRotationOffset, kRotationOffset) =
+        factor.information * jacobian.transpose() * jacobian;
+    AddBlock(kPoseDim * variable, kPoseDim * variable, block, &triplets);
+    system.gradient.segment<kSpaceDim>(kPoseDim * variable + kRotationOffset) +=
+        factor.information * jacobian.transpose() * residual;
   }
-  for (const ImuFactor& f : imu_) {
-    const size_t si = static_cast<size_t>(InertialIndex(f.i));
-    const size_t sj = static_cast<size_t>(InertialIndex(f.j));
-    const BodyPose body_i = ToBody(pose_at(f.i), f.node_from_body);
-    const BodyPose body_j = ToBody(pose_at(f.j), f.node_from_body);
-    ImuPreintegration::Jacobian j24;
-    const Vec9 e = f.preintegration.Residual(
-        body_i.world_from_body, state.velocities[si], body_j.world_from_body,
-        state.velocities[sj], state.biases[si], &j24);
-    // Local columns: [pose_i, pose_j, inertial_i, inertial_j] (6, 6, 9, 9).
-    Eigen::Matrix<double, 9, 6> by_body_i;
-    by_body_i << j24.block<9, 3>(0, 3), j24.block<9, 3>(0, 0);
-    Eigen::Matrix<double, 9, 6> by_body_j;
-    by_body_j << j24.block<9, 3>(0, 12), j24.block<9, 3>(0, 9);
-    Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(9, 30);
-    jacobian.block<9, 6>(0, 0) = by_body_i * body_i.body_by_node;
-    jacobian.block<9, 6>(0, 6) = by_body_j * body_j.body_by_node;
-    jacobian.block<9, 3>(0, 12) = j24.block<9, 3>(0, 6);
-    jacobian.block<9, 6>(0, 15) = j24.block<9, 6>(0, 18);
-    jacobian.block<9, 3>(0, 21) = j24.block<9, 3>(0, 15);
-    AddDenseFactor(jacobian, f.information, e,
-                   {{0, 6, pose_offset(f.i)},
-                    {6, 6, pose_offset(f.j)},
-                    {12, 9, inertial_offset(f.i)},
-                    {21, 9, inertial_offset(f.j)}},
-                   triplets, system.b);
+  for (const ImuFactor& factor : imu_) {
+    const size_t state_i = static_cast<size_t>(InertialIndex(factor.i));
+    const size_t state_j = static_cast<size_t>(InertialIndex(factor.j));
+    const BodyPose body_i = ToBody(pose_at(factor.i), factor.node_from_body);
+    const BodyPose body_j = ToBody(pose_at(factor.j), factor.node_from_body);
+    ImuPreintegration::Jacobian by_preintegration;
+    const Vec9 residual = factor.preintegration.Residual(
+        body_i.world_from_body, state.velocities[state_i],
+        body_j.world_from_body, state.velocities[state_j],
+        state.biases[state_i], &by_preintegration);
+    const auto columns = [&by_preintegration](int first) {
+      return by_preintegration.block<kImuResidualDim, kSpaceDim>(0, first);
+    };
+    // The body pose blocks in the [position, rotation] order of a pose.
+    ImuByPose by_body_i;
+    by_body_i << columns(ImuPreintegration::kPositionICol),
+        columns(ImuPreintegration::kRotationICol);
+    ImuByPose by_body_j;
+    by_body_j << columns(ImuPreintegration::kPositionJCol),
+        columns(ImuPreintegration::kRotationJCol);
+    Eigen::MatrixXd jacobian =
+        Eigen::MatrixXd::Zero(kImuResidualDim, kImuFactorCols);
+    jacobian.block<kImuResidualDim, kPoseDim>(0, kImuPoseICol) =
+        by_body_i * body_i.body_by_node;
+    jacobian.block<kImuResidualDim, kPoseDim>(0, kImuPoseJCol) =
+        by_body_j * body_j.body_by_node;
+    jacobian.block<kImuResidualDim, kSpaceDim>(
+        0, kImuInertialICol + kVelocityOffset) =
+        columns(ImuPreintegration::kVelocityICol);
+    jacobian.block<kImuResidualDim, kBiasDim>(0,
+                                              kImuInertialICol + kBiasOffset) =
+        by_preintegration.block<kImuResidualDim, kBiasDim>(
+            0, ImuPreintegration::kGyroBiasCol);
+    jacobian.block<kImuResidualDim, kSpaceDim>(
+        0, kImuInertialJCol + kVelocityOffset) =
+        columns(ImuPreintegration::kVelocityJCol);
+    AddDenseFactor(
+        jacobian, factor.information, residual,
+        {{kImuPoseICol, kPoseDim, pose_offset(factor.i)},
+         {kImuPoseJCol, kPoseDim, pose_offset(factor.j)},
+         {kImuInertialICol, kInertialDim, inertial_offset(factor.i)},
+         {kImuInertialJCol, kInertialDim, inertial_offset(factor.j)}},
+        &triplets, &system.gradient);
   }
-  for (const BodyVelocityFactor& f : body_velocities_) {
+  for (const BodyVelocityFactor& factor : body_velocities_) {
     const Vec3& velocity =
-        state.velocities[static_cast<size_t>(InertialIndex(f.i))];
-    const BodyPose body = ToBody(pose_at(f.i), f.node_from_body);
+        state.velocities[static_cast<size_t>(InertialIndex(factor.i))];
+    const BodyPose body = ToBody(pose_at(factor.i), factor.node_from_body);
     const Mat3 body_from_world = body.world_from_body.rotation.transpose();
-    const Vec3 e = BodyVelocityResidual(f, pose_at(f.i), velocity);
-    Eigen::Matrix<double, 3, 6> by_body;
+    const Vec3 residual =
+        BodyVelocityResidual(factor, pose_at(factor.i), velocity);
+    // By the body [position, rotation].
+    SpaceByPose by_body;
     by_body << Mat3::Zero(), Hat(body_from_world * velocity);
-    Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(3, 15);
-    jacobian.block<3, 6>(0, 0) = by_body * body.body_by_node;
-    jacobian.block<3, 3>(0, 6) = body_from_world;
-    AddDenseFactor(jacobian, f.information, e,
-                   {{0, 6, pose_offset(f.i)}, {6, 9, inertial_offset(f.i)}},
-                   triplets, system.b);
+    Eigen::MatrixXd jacobian =
+        Eigen::MatrixXd::Zero(kSpaceDim, kBodyVelocityCols);
+    jacobian.block<kSpaceDim, kPoseDim>(0, kBodyVelocityPoseCol) =
+        by_body * body.body_by_node;
+    jacobian.block<kSpaceDim, kSpaceDim>(
+        0, kBodyVelocityInertialCol + kVelocityOffset) = body_from_world;
+    AddDenseFactor(
+        jacobian, factor.information, residual,
+        {{kBodyVelocityPoseCol, kPoseDim, pose_offset(factor.i)},
+         {kBodyVelocityInertialCol, kInertialDim, inertial_offset(factor.i)}},
+        &triplets, &system.gradient);
   }
-  for (const BiasFactor& f : bias_factors_) {
-    const Vec6& bias_i = state.biases[static_cast<size_t>(InertialIndex(f.i))];
-    if (f.j < 0) {
-      Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(6, 9);
-      jacobian.block<6, 6>(0, 3) = Mat6::Identity();
-      AddDenseFactor(jacobian, f.information, bias_i - f.bias,
-                     {{0, 9, inertial_offset(f.i)}}, triplets, system.b);
+  for (const BiasFactor& factor : bias_factors_) {
+    const Vec6& bias_i =
+        state.biases[static_cast<size_t>(InertialIndex(factor.i))];
+    if (factor.j < 0) {
+      Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(kBiasDim, kInertialDim);
+      jacobian.block<kBiasDim, kBiasDim>(0, kBiasInertialICol + kBiasOffset) =
+          Mat6::Identity();
+      AddDenseFactor(
+          jacobian, factor.information, bias_i - factor.bias,
+          {{kBiasInertialICol, kInertialDim, inertial_offset(factor.i)}},
+          &triplets, &system.gradient);
       continue;
     }
-    const Vec6& bias_j = state.biases[static_cast<size_t>(InertialIndex(f.j))];
-    Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(6, 18);
-    jacobian.block<6, 6>(0, 3) = -Mat6::Identity();
-    jacobian.block<6, 6>(0, 12) = Mat6::Identity();
-    AddDenseFactor(jacobian, f.information, bias_j - bias_i,
-                   {{0, 9, inertial_offset(f.i)}, {9, 9, inertial_offset(f.j)}},
-                   triplets, system.b);
+    const Vec6& bias_j =
+        state.biases[static_cast<size_t>(InertialIndex(factor.j))];
+    Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(kBiasDim, kBiasFactorCols);
+    jacobian.block<kBiasDim, kBiasDim>(0, kBiasInertialICol + kBiasOffset) =
+        -Mat6::Identity();
+    jacobian.block<kBiasDim, kBiasDim>(0, kBiasInertialJCol + kBiasOffset) =
+        Mat6::Identity();
+    AddDenseFactor(
+        jacobian, factor.information, bias_j - bias_i,
+        {{kBiasInertialICol, kInertialDim, inertial_offset(factor.i)},
+         {kBiasInertialJCol, kInertialDim, inertial_offset(factor.j)}},
+        &triplets, &system.gradient);
   }
-  if (!planes_.empty()) LinearizePlanes(state, layout, system, triplets);
-  system.h.resize(dim, dim);
-  system.h.setFromTriplets(triplets.begin(), triplets.end());
+  if (!planes_.empty()) LinearizePlanes(state, layout, &system, &triplets);
+  system.hessian.resize(dim, dim);
+  system.hessian.setFromTriplets(triplets.begin(), triplets.end());
   return system;
 }
 
 bool PoseGraph::Solve(const LinearSystem& system, const Layout& layout,
-                      double lambda, Eigen::VectorXd& dx) const {
+                      double lambda, Eigen::VectorXd* step) const {
   const int dim = layout.dim;
-  Eigen::VectorXd diagonal = system.h.diagonal();
+  Eigen::VectorXd diagonal = system.hessian.diagonal();
   if (layout.dense) {
     diagonal.head(layout.pose_dim) += system.pose_hessian.diagonal();
   }
   const Eigen::VectorXd damping =
-      lambda * diagonal.cwiseMax(Eigen::VectorXd::Constant(dim, 1e-9));
+      lambda *
+      diagonal.cwiseMax(Eigen::VectorXd::Constant(dim, kMinDampingDiagonal));
   if (!layout.dense) {
-    Eigen::SparseMatrix<double> a = system.h;
-    for (int k = 0; k < dim; ++k) a.coeffRef(k, k) += damping[k];
+    Eigen::SparseMatrix<double> damped = system.hessian;
+    for (int index = 0; index < dim; ++index) {
+      damped.coeffRef(index, index) += damping[index];
+    }
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-    solver.compute(a);
+    solver.compute(damped);
     if (solver.info() != Eigen::Success) return false;
-    dx = solver.solve(-system.b);
-    return dx.allFinite();
+    *step = solver.solve(-system.gradient);
+    return step->allFinite();
   }
   // Dense pose block: eliminate the inertial states (sparse, chain
   // structured), then factor the reduced pose system.
-  const int p = layout.pose_dim;
-  const int q = dim - p;
+  const int pose_dim = layout.pose_dim;
+  const int inertial_dim = dim - pose_dim;
   Eigen::MatrixXd reduced =
-      system.pose_hessian + Eigen::MatrixXd(system.h.topLeftCorner(p, p));
-  reduced.diagonal() += damping.head(p);
-  Eigen::VectorXd rhs = -system.b.head(p);
+      system.pose_hessian +
+      Eigen::MatrixXd(system.hessian.topLeftCorner(pose_dim, pose_dim));
+  reduced.diagonal() += damping.head(pose_dim);
+  Eigen::VectorXd rhs = -system.gradient.head(pose_dim);
   Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> inertial_solver;
-  Eigen::SparseMatrix<double> coupling;  // p x q
-  if (q > 0) {
-    Eigen::SparseMatrix<double> a_ii = system.h.bottomRightCorner(q, q);
-    for (int k = 0; k < q; ++k) a_ii.coeffRef(k, k) += damping[p + k];
-    inertial_solver.compute(a_ii);
+  Eigen::SparseMatrix<double> coupling;  // pose_dim x inertial_dim
+  if (inertial_dim > 0) {
+    Eigen::SparseMatrix<double> damped_inertial =
+        system.hessian.bottomRightCorner(inertial_dim, inertial_dim);
+    for (int index = 0; index < inertial_dim; ++index) {
+      damped_inertial.coeffRef(index, index) += damping[pose_dim + index];
+    }
+    inertial_solver.compute(damped_inertial);
     if (inertial_solver.info() != Eigen::Success) return false;
-    coupling = system.h.topRightCorner(p, q);
-    const Eigen::MatrixXd coupling_t = Eigen::MatrixXd(coupling.transpose());
-    Eigen::MatrixXd solved(q, p);  // a_ii^-1 coupling^T
-    constexpr int kColumns = 64;
-    const int64_t num_chunks = (p + kColumns - 1) / kColumns;
+    coupling = system.hessian.topRightCorner(pose_dim, inertial_dim);
+    const Eigen::MatrixXd coupling_transpose =
+        Eigen::MatrixXd(coupling.transpose());
+    // damped_inertial^-1 coupling^T
+    Eigen::MatrixXd solved(inertial_dim, pose_dim);
+    constexpr int kColumnsPerChunk = 64;
+    const int64_t num_chunks =
+        (pose_dim + kColumnsPerChunk - 1) / kColumnsPerChunk;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
-      const int first = static_cast<int>(chunk) * kColumns;
-      const int width = std::min(kColumns, p - first);
+      const int first = static_cast<int>(chunk) * kColumnsPerChunk;
+      const int width = std::min(kColumnsPerChunk, pose_dim - first);
       solved.middleCols(first, width) =
-          inertial_solver.solve(coupling_t.middleCols(first, width));
+          inertial_solver.solve(coupling_transpose.middleCols(first, width));
     }
     reduced.noalias() -= coupling * solved;
-    rhs += coupling * inertial_solver.solve(system.b.tail(q));
+    rhs += coupling * inertial_solver.solve(system.gradient.tail(inertial_dim));
   }
   const Eigen::LLT<Eigen::MatrixXd> llt(reduced);
   if (llt.info() != Eigen::Success) return false;
-  dx.resize(dim);
-  dx.head(p) = llt.solve(rhs);
-  if (q > 0) {
-    dx.tail(q) = inertial_solver.solve(-system.b.tail(q) -
-                                       coupling.transpose() * dx.head(p));
+  step->resize(dim);
+  step->head(pose_dim) = llt.solve(rhs);
+  if (inertial_dim > 0) {
+    step->tail(inertial_dim) =
+        inertial_solver.solve(-system.gradient.tail(inertial_dim) -
+                              coupling.transpose() * step->head(pose_dim));
   }
-  return dx.allFinite();
+  return step->allFinite();
 }
 
 bool PoseGraph::DampedStep(const LinearSystem& system, const Layout& layout,
-                           double& lambda, State& state, double& cost) const {
-  for (int attempt = 0; attempt < 12; ++attempt) {
-    Eigen::VectorXd dx;
-    if (!Solve(system, layout, lambda, dx)) {
-      lambda *= 10.0;
+                           double* lambda, State* state, double* cost) const {
+  for (int attempt = 0; attempt < kMaxDampingAttempts; ++attempt) {
+    Eigen::VectorXd step;
+    if (!Solve(system, layout, *lambda, &step)) {
+      *lambda *= kDampingFactor;
       continue;
     }
-    State candidate = state;
-    for (size_t i = 0; i < candidate.poses.size(); ++i) {
-      const int offset = layout.pose[i];
+    State candidate = *state;
+    for (size_t node = 0; node < candidate.poses.size(); ++node) {
+      const int offset = layout.pose[node];
       if (offset < 0) continue;
-      Pose& p = candidate.poses[i];
-      p.translation += dx.segment<3>(offset);
-      p.rotation = p.rotation * So3Exp(dx.segment<3>(offset + 3));
-      p.Normalize();
+      Pose& pose = candidate.poses[node];
+      pose.translation += step.segment<kSpaceDim>(offset + kTranslationOffset);
+      pose.rotation = pose.rotation *
+                      So3Exp(step.segment<kSpaceDim>(offset + kRotationOffset));
+      pose.Normalize();
     }
-    for (size_t s = 0; s < candidate.velocities.size(); ++s) {
-      const int offset = layout.inertial[s];
-      candidate.velocities[s] += dx.segment<3>(offset);
-      candidate.biases[s] += dx.segment<6>(offset + 3);
+    for (size_t inertial = 0; inertial < candidate.velocities.size();
+         ++inertial) {
+      const int offset = layout.inertial[inertial];
+      candidate.velocities[inertial] +=
+          step.segment<kSpaceDim>(offset + kVelocityOffset);
+      candidate.biases[inertial] +=
+          step.segment<kBiasDim>(offset + kBiasOffset);
     }
     const double new_cost = TotalCost(candidate);
-    if (new_cost < cost) {
-      std::swap(state, candidate);
-      cost = new_cost;
-      lambda = std::max(lambda / 10.0, 1e-12);
+    if (new_cost < *cost) {
+      std::swap(*state, candidate);
+      *cost = new_cost;
+      *lambda = std::max(*lambda / kDampingFactor, kMinLambda);
       return true;
     }
-    lambda *= 10.0;
+    *lambda *= kDampingFactor;
   }
   return false;
 }
 
 PoseGraphSummary PoseGraph::Optimize(const PoseGraphOptions& options) {
   PoseGraphSummary summary;
-  const int n = static_cast<int>(poses_.size());
-  if (n == 0) return summary;
+  if (poses_.empty()) return summary;
 
   // Gauge: fix the first node if nothing anchors the graph. Gravity alone
   // leaves x, y, z and yaw free, so it does not anchor it.
   std::vector<bool> fixed = fixed_;
-  const bool anchored =
-      !priors_.empty() || !positions_.empty() ||
-      std::any_of(fixed.begin(), fixed.end(), [](bool b) { return b; });
+  const bool anchored = !priors_.empty() || !positions_.empty() ||
+                        std::any_of(fixed.begin(), fixed.end(),
+                                    [](bool node_fixed) { return node_fixed; });
   if (!anchored) fixed[0] = true;
   Layout layout;
-  layout.pose.assign(static_cast<size_t>(n), -1);
-  for (size_t i = 0; i < layout.pose.size(); ++i) {
-    if (!fixed[i]) {
-      layout.pose[i] = layout.dim;
-      layout.dim += 6;
+  layout.pose.assign(poses_.size(), kFixedVariable);
+  for (size_t node = 0; node < layout.pose.size(); ++node) {
+    if (!fixed[node]) {
+      layout.pose[node] = layout.dim;
+      layout.dim += kPoseDim;
     }
   }
   layout.pose_dim = layout.dim;
-  layout.dense =
-      !planes_.empty() && layout.pose_dim / 6 <= options.dense_max_pose_nodes;
+  layout.dense = !planes_.empty() &&
+                 layout.pose_dim / kPoseDim <= options.dense_max_pose_nodes;
   layout.inertial.resize(velocities_.size());
   for (int& offset : layout.inertial) {
     offset = layout.dim;
-    layout.dim += 9;
+    layout.dim += kInertialDim;
   }
   if (layout.dim == 0) return summary;
 
-  State x = CurrentState();
-  double cost = TotalCost(x);
+  State state = CurrentState();
+  double cost = TotalCost(state);
   summary.initial_cost = cost;
   double lambda = options.lambda_init;
   for (int iteration = 0; iteration < options.max_iterations; ++iteration) {
-    const LinearSystem system = Linearize(x, layout);
+    const LinearSystem system = Linearize(state, layout);
     const double previous_cost = cost;
-    const bool accepted = DampedStep(system, layout, lambda, x, cost);
+    const bool accepted = DampedStep(system, layout, &lambda, &state, &cost);
     summary.iterations = iteration + 1;
     if (!accepted) {
       summary.converged = true;  // No further decrease possible.
       break;
     }
     const double relative_decrease =
-        (previous_cost - cost) / std::max(previous_cost, 1e-300);
+        (previous_cost - cost) / std::max(previous_cost, kMinCost);
     if (relative_decrease < options.rel_tol) {
       summary.converged = true;
       break;
     }
   }
-  poses_ = std::move(x.poses);
-  velocities_ = std::move(x.velocities);
-  biases_ = std::move(x.biases);
+  poses_ = std::move(state.poses);
+  velocities_ = std::move(state.velocities);
+  biases_ = std::move(state.biases);
   summary.final_cost = cost;
   return summary;
 }

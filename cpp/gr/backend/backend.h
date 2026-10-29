@@ -102,6 +102,18 @@ struct Anchor {
   bool weak = false;
 };
 
+// Columns of TripInputs::gnss: [t, x, y, z(, std)]; a fix has at least
+// kGnssStdColumn columns.
+inline constexpr int kGnssTimeColumn = 0;
+inline constexpr int kGnssPositionColumn = 1;
+inline constexpr int kGnssStdColumn = kGnssPositionColumn + kSpaceDim;
+// Columns of TripInputs::control_points: [t, px, py, pz, x, y, z(, std)];
+// a control point has at least kControlStdColumn columns.
+inline constexpr int kControlTimeColumn = 0;
+inline constexpr int kControlLidarColumn = 1;
+inline constexpr int kControlWorldColumn = kControlLidarColumn + kSpaceDim;
+inline constexpr int kControlStdColumn = kControlWorldColumn + kSpaceDim;
+
 // Everything the back-end needs from one trip besides its keyframes.
 struct TripInputs {
   Pose vehicle_from_lidar;
@@ -245,9 +257,10 @@ struct TripAlignConfig {
   std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};
   int icp_iters = 40;
   double min_score = 0.3;  // Coarse: fraction of structure cells matched.
-  double z_peak_ratio = 0.5;  // Height hypotheses (AlignGravityAlignedCandidates).
-  int max_candidates = 8;     // Hypotheses refined by ICP, best score first.
-  double min_fitness = 0.5;   // ICP: inliers / points of the trip's map.
+  double z_peak_ratio =
+      0.5;                 // Height hypotheses (AlignGravityAlignedCandidates).
+  int max_candidates = 8;  // Hypotheses refined by ICP, best score first.
+  double min_fitness = 0.5;  // ICP: inliers / points of the trip's map.
   // ICP (m). Whole-trip maps carry each trip's own drift: 14 cm between the
   // two Oxford Spires Keble sessions (Hesai QT64).
   double max_rmse = 0.2;
@@ -269,9 +282,9 @@ struct TripAlignConfig {
 struct TripAlignment {
   int trip = 0;
   bool aligned = false;
-  Pose correction;  // Applied to the trip's poses (world <- trip map).
-  double score = 0.0;      // Coarse score of the accepted hypothesis.
-  double fitness = 0.0;    // Its ICP fitness and RMSE.
+  Pose correction;       // Applied to the trip's poses (world <- trip map).
+  double score = 0.0;    // Coarse score of the accepted hypothesis.
+  double fitness = 0.0;  // Its ICP fitness and RMSE.
   double rmse = 0.0;
   double runner_up = 0.0;  // Best ICP fitness of a distinct hypothesis.
   int hypotheses = 0;      // Refined by ICP.
@@ -283,8 +296,8 @@ struct TripAlignment {
 // Returns one entry per such trip except the reference.
 std::vector<TripAlignment> AlignTrips(const KeyframeSet& keyframes,
                                       const TripAlignConfig& config,
-                                      std::vector<Pose>& poses,
-                                      std::vector<Anchor>& anchors,
+                                      std::vector<Pose>* poses,
+                                      std::vector<Anchor>* anchors,
                                       const Logger& log = nullptr);
 
 struct GraphStageConfig {

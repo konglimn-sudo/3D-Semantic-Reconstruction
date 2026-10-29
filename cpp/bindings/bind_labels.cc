@@ -25,14 +25,21 @@ using ::pybind11::literals::operator""_a;
 
 using ImageArray =
     py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
+// Slot corners in image or world coordinates: one (u, v) / (x, y) row each.
+using CornerMatrix =
+    Eigen::Matrix<double, kParkingSlotCorners, kPlaneDim, Eigen::RowMajor>;
+// Images without a channel axis have one channel.
+constexpr int kSingleChannel = 1;
+// Cameras are (CameraModel, T_vehicle_cam) pairs.
+constexpr size_t kCameraPairSize = 2;
 
 py::array_t<double> PolylineArray(const Polyline2& polyline) {
-  py::array_t<double> array(
-      {static_cast<py::ssize_t>(polyline.size()), static_cast<py::ssize_t>(2)});
+  py::array_t<double> array({static_cast<py::ssize_t>(polyline.size()),
+                             static_cast<py::ssize_t>(kPlaneDim)});
   double* data = array.mutable_data();
   for (size_t i = 0; i < polyline.size(); ++i) {
-    data[2 * i] = polyline[i].x();
-    data[2 * i + 1] = polyline[i].y();
+    data[kPlaneDim * i] = polyline[i].x();
+    data[kPlaneDim * i + 1] = polyline[i].y();
   }
   return array;
 }
@@ -53,18 +60,18 @@ ImageView ImageViewOf(const py::object& image, ImageArray& holder) {
           "image must be HxW[xC] uint8");
   return ImageView{holder.data(), static_cast<int>(holder.shape(0)),
                    static_cast<int>(holder.shape(1)),
-                   holder.ndim() == 3 ? static_cast<int>(holder.shape(2)) : 1};
+                   holder.ndim() == 3 ? static_cast<int>(holder.shape(2))
+                                      : kSingleChannel};
 }
 
 py::dict FrameRecord(const FrameLabels& labels) {
   py::list slots;
   for (const SlotProjection& slot : labels.slots) {
-    Eigen::Matrix<double, 4, 2, Eigen::RowMajor> corners;
+    CornerMatrix corners;
     py::list corner_visible;
-    for (size_t a = 0; a < 4; ++a) {
-      corners.row(static_cast<Eigen::Index>(a)) =
-          slot.corners_uv[a].transpose();
-      corner_visible.append(slot.corner_visible[a]);
+    for (int corner = 0; corner < kParkingSlotCorners; ++corner) {
+      corners.row(corner) = slot.corners_uv[corner].transpose();
+      corner_visible.append(slot.corner_visible[corner]);
     }
     slots.append(py::dict("index"_a = slot.index, "corners_uv"_a = corners,
                           "corner_visible"_a = corner_visible,
@@ -173,7 +180,7 @@ void BindOccupancyGenerator(py::module_& m) {
              Require(config.voxel > 0.0, "voxel must be positive");
              std::vector<CameraView> views;
              for (const py::tuple& camera : cameras) {
-               Require(camera.size() == 2,
+               Require(camera.size() == kCameraPairSize,
                        "cameras: (CameraModel, T_vehicle_cam) pairs");
                CameraView view;
                view.camera = camera[0].cast<std::shared_ptr<CameraModel>>();
@@ -225,8 +232,7 @@ void BindFrameLabels(py::module_& m) {
       .def_readwrite("box_render_step", &FrameLabelConfig::box_render_step)
       .def_readwrite("box_sample_step", &FrameLabelConfig::box_sample_step);
 
-  using SlotTuple =
-      std::pair<Eigen::Matrix<double, 4, 2, Eigen::RowMajor>, double>;
+  using SlotTuple = std::pair<CornerMatrix, double>;
   using MarkingTuple = std::tuple<Vec2, Vec2, double>;
   py::class_<FrameLabeler>(m, "FrameLabeler")
       .def(py::init([](const PointsIn& static_world, const py::object& labels,
@@ -243,9 +249,8 @@ void BindFrameLabels(py::module_& m) {
              std::vector<SlotGeometry> slot_geometry;
              for (const auto& [corners, z] : slots) {
                SlotGeometry geometry;
-               for (size_t a = 0; a < 4; ++a) {
-                 geometry.corners[a] =
-                     corners.row(static_cast<Eigen::Index>(a)).transpose();
+               for (int corner = 0; corner < kParkingSlotCorners; ++corner) {
+                 geometry.corners[corner] = corners.row(corner).transpose();
                }
                geometry.z = z;
                slot_geometry.push_back(geometry);
@@ -310,8 +315,11 @@ void BindLifting(py::module_& m) {
              return LabelLifter(ToPoints(points), num_classes, spacing,
                                 max_range, boundary, min_views);
            }),
-           "points"_a, "num_classes"_a, "spacing"_a = 0.05,
-           "max_range"_a = 15.0, "boundary"_a = 1, "min_views"_a = 2)
+           "points"_a, "num_classes"_a,
+           "spacing"_a = LabelLifter::kDefaultSpacing,
+           "max_range"_a = LabelLifter::kDefaultMaxRange,
+           "boundary"_a = LabelLifter::kDefaultBoundary,
+           "min_views"_a = LabelLifter::kDefaultMinViews)
       .def(
           "add_view",
           [](LabelLifter& lifter, const CameraModel& camera,

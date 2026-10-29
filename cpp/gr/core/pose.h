@@ -14,17 +14,25 @@
 
 namespace gr {
 
-// Skew-symmetric matrix of v, so that Hat(v) * x == v.cross(x).
-inline Mat3 Hat(const Vec3& v) {
-  Mat3 m;
-  m << 0.0, -v.z(), v.y(), v.z(), 0.0, -v.x(), -v.y(), v.x(), 0.0;
-  return m;
+// Layout of a pose perturbation [t, phi] (and of the matrices over it): the
+// translation first, then the rotation vector.
+inline constexpr int kTranslationOffset = 0;
+inline constexpr int kRotationOffset = kSpaceDim;
+
+// Skew-symmetric matrix of `vec`, so that Hat(vec) * x == vec.cross(x).
+inline Mat3 Hat(const Vec3& vec) {
+  Mat3 skew;
+  skew << 0.0, -vec.z(), vec.y(), vec.z(), 0.0, -vec.x(), -vec.y(), vec.x(),
+      0.0;
+  return skew;
 }
 
 // Exponential map of SO(3).
 inline Mat3 So3Exp(const Vec3& omega) {
+  // Below this angle I + Hat(omega) is exact to double precision.
+  constexpr double kFirstOrderAngle = 1e-12;
   const double angle = omega.norm();
-  if (angle < 1e-12) return Mat3::Identity() + Hat(omega);
+  if (angle < kFirstOrderAngle) return Mat3::Identity() + Hat(omega);
   return Eigen::AngleAxisd(angle, omega / angle).toRotationMatrix();
 }
 
@@ -57,17 +65,22 @@ struct Pose {
   Pose(const Mat3& rotation, const Vec3& translation)
       : rotation(rotation), translation(translation) {}
 
+  // The pose of a homogeneous 4 x 4 matrix.
   static Pose FromMatrix(const Mat4& matrix) {
-    return Pose(matrix.block<3, 3>(0, 0), matrix.block<3, 1>(0, 3));
+    return Pose(matrix.topLeftCorner<kSpaceDim, kSpaceDim>(),
+                matrix.topRightCorner<kSpaceDim, 1>());
   }
+  // The homogeneous 4 x 4 matrix of the pose.
   Mat4 Matrix() const;
   Pose Inverse() const {
     return Pose(rotation.transpose(), -rotation.transpose() * translation);
   }
+  // Composition: (a * b) * x == a * (b * x).
   Pose operator*(const Pose& other) const {
     return Pose(rotation * other.rotation,
                 rotation * other.translation + translation);
   }
+  // The pose applied to a point.
   Vec3 operator*(const Vec3& point) const {
     return rotation * point + translation;
   }
@@ -75,21 +88,24 @@ struct Pose {
   void Normalize();
 };
 
-// Slerp on the rotation and linear interpolation of the translation.
-Pose Interpolate(const Pose& a, const Pose& b, double fraction);
+// Slerp on the rotation and linear interpolation of the translation, from
+// `start` (fraction 0) to `end` (fraction 1).
+Pose Interpolate(const Pose& start, const Pose& end, double fraction);
 
+// Every point moved by `pose`.
 Points TransformPoints(const Points& points, const Pose& pose);
 
 // Information matrix of a pose measurement, order [t, phi]: isotropic
 // translation sigma (m) and rotation sigma (deg).
 Mat6 PoseInformation(double sigma_translation, double sigma_rotation_deg);
 
-// Pose of a time-ordered sequence at time `t`, clamped to the ends.
+// Pose of a time-ordered sequence at `time`, clamped to the ends.
 Pose InterpolatePose(const std::vector<double>& times,
-                     const std::vector<Pose>& poses, double t);
+                     const std::vector<Pose>& poses, double time);
+// InterpolatePose at each of `query_times`.
 std::vector<Pose> InterpolatePoses(const std::vector<double>& times,
                                    const std::vector<Pose>& poses,
-                                   const std::vector<double>& query);
+                                   const std::vector<double>& query_times);
 
 }  // namespace gr
 

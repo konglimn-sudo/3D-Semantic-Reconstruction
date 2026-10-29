@@ -31,6 +31,7 @@
 #define GARAGE_RECON_GR_NAV_LOCALIZATION_H_
 
 #include <deque>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -71,9 +72,10 @@ struct LocalizerConfig {
   // A correct placement of the submap matches nearly all of its structure;
   // wrong ones on a regular garage still reach about 0.5 (floors, ceilings,
   // most columns), hence a stricter fitness than for whole trips.
+  static constexpr double kSubmapPlacementMinFitness = 0.7;
   PlacementConfig placement = [] {
     PlacementConfig config;
-    config.min_fitness = 0.7;
+    config.min_fitness = kSubmapPlacementMinFitness;
     return config;
   }();
 };
@@ -156,7 +158,8 @@ class Localizer {
   std::optional<Pose> last_odom_;
   double last_stamp_ = 0.0;
   double travelled_ = 0.0;
-  double last_attempt_ = -1e18;
+  // Travel at the last global placement attempt (m); none yet.
+  double last_attempt_ = -std::numeric_limits<double>::infinity();
   int failures_ = 0;
   int placement_attempts_ = 0;
   Placement last_placement_;

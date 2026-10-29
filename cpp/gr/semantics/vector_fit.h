@@ -67,11 +67,14 @@ struct LineFitConfig {
   double max_end_shift = 0.3;  // m from the skeleton end.
 };
 
+// A line segment has two ends.
+inline constexpr int kSegmentEnds = 2;
+
 struct LineFit {
   Vec2 p0 = Vec2::Zero();  // Centre line ends.
   Vec2 p1 = Vec2::Zero();
   double width = 0.0;
-  bool end_ok[2] = {false, false};
+  bool end_ok[kSegmentEnds] = {false, false};
   int stations = 0;
   double rms = 0.0;  // Of the stripe centres about the fitted line (m).
 };

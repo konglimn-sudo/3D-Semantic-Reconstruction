@@ -39,9 +39,9 @@ template <typename T>
 class FieldTable {
  public:
   template <typename M>
-  FieldTable& Add(const std::string& name, M T::*member) {
-    setters_.emplace_back(name, [member](const Value& v, T* out) {
-      Assign(v, &(out->*member));
+  FieldTable& Add(const std::string& name, M T::* member) {
+    setters_.emplace_back(name, [member](const Value& value, T* out) {
+      Assign(value, &(out->*member));
     });
     return *this;
   }
@@ -57,8 +57,8 @@ class FieldTable {
         if (name != key) continue;
         try {
           set(value, out);
-        } catch (const std::runtime_error& e) {
-          throw std::runtime_error(key + ": " + e.what());
+        } catch (const std::runtime_error& error) {
+          throw std::runtime_error(key + ": " + error.what());
         }
         ++copied;
       }
@@ -67,11 +67,13 @@ class FieldTable {
   }
 
  private:
-  static void Assign(const Value& v, double* out) { *out = v.AsDouble(); }
-  static void Assign(const Value& v, int* out) { *out = v.AsInt(); }
-  static void Assign(const Value& v, bool* out) { *out = v.AsBool(); }
-  static void Assign(const Value& v, std::vector<double>* out) {
-    *out = v.AsDoubles();
+  static void Assign(const Value& value, double* out) {
+    *out = value.AsDouble();
+  }
+  static void Assign(const Value& value, int* out) { *out = value.AsInt(); }
+  static void Assign(const Value& value, bool* out) { *out = value.AsBool(); }
+  static void Assign(const Value& value, std::vector<double>* out) {
+    *out = value.AsDoubles();
   }
 
   std::vector<std::pair<std::string, std::function<void(const Value&, T*)>>>

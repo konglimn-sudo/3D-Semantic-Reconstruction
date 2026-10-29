@@ -60,23 +60,28 @@ class ContinuousTrajectory {
   double gyro_coverage() const { return gyro_coverage_; }
   double wheel_coverage() const { return wheel_coverage_; }
 
-  // world_from_vehicle at `t`; extrapolated up to `extrapolation` beyond
+  // world_from_vehicle at `time`; extrapolated up to `extrapolation` beyond
   // [start_time(), end_time()] and clamped further out.
-  Pose At(double t) const;
+  Pose At(double time) const;
   std::vector<Pose> PosesAt(const std::vector<double>& times) const;
 
  private:
-  // Appends the samples of knot interval k to the table (without its end).
-  void SampleInterval(size_t k, const ImuSamples& imu,
+  // Extrapolate's directions.
+  static constexpr int kBackward = -1;
+  static constexpr int kForward = 1;
+
+  // Appends the samples of knot interval `interval` to the table (without
+  // its end) and says whether they used the gyro and the wheel speed.
+  void SampleInterval(size_t interval, const ImuSamples& imu,
                       const std::vector<double>& bias_stamps,
                       const std::vector<Vec3>& gyro_biases,
-                      const WheelSamples& wheel, double step, bool& used_gyro,
-                      bool& used_wheel);
+                      const WheelSamples& wheel, double step, bool* used_gyro,
+                      bool* used_wheel);
   void Build(const ImuSamples& imu, const std::vector<double>& bias_stamps,
              const std::vector<Vec3>& gyro_biases, const WheelSamples& wheel,
              const TrajectoryOptions& options);
-  // Table samples over `duration` before the first knot (direction -1) or
-  // after the last one (+1), in time order.
+  // Table samples over `duration` before the first knot (direction
+  // kBackward) or after the last one (kForward), in time order.
   std::vector<std::pair<double, Pose>> Extrapolate(
       int direction, const ImuSamples& imu,
       const std::vector<double>& bias_stamps,
@@ -94,9 +99,15 @@ class ContinuousTrajectory {
 
 // Moves every point of a sweep into the LiDAR frame at `stamp` (the end of
 // the sweep) with the trajectory. `times` are relative to `stamp` (<= 0).
+// DeskewSweep evaluates the trajectory at this many instants by default,
+// and at least at kMinDeskewSamples (the start and the end of the sweep).
+inline constexpr int kDefaultTrajectoryDeskewSamples = 32;
+inline constexpr int kMinDeskewSamples = 2;
+
 Points DeskewSweep(const Points& points, const std::vector<double>& times,
                    double stamp, const ContinuousTrajectory& trajectory,
-                   const Pose& vehicle_from_lidar, int samples = 32);
+                   const Pose& vehicle_from_lidar,
+                   int samples = kDefaultTrajectoryDeskewSamples);
 
 struct SweepSamples {
   Points points;

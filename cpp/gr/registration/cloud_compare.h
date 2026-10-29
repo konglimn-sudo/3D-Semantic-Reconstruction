@@ -19,6 +19,7 @@
 
 #include "gr/core/pose.h"
 #include "gr/core/types.h"
+#include "gr/registration/registration.h"
 
 namespace gr {
 
@@ -44,15 +45,21 @@ std::optional<CoarseAlignment> AlignGravityAligned(
     const Points& source, const Points& reference,
     const CoarseAlignConfig& config = {});
 
+// AlignGravityAlignedCandidates keeps the height peaks reaching this share
+// of the best one by default; kBestPeakOnly keeps the best alone.
+inline constexpr double kDefaultZPeakRatio = 0.5;
+inline constexpr double kBestPeakOnly = 1.0;
+
 // Every hypothesis of the search above for a verification by ICP: the four
 // yaw candidates (best occupancy score first), each with the height shifts
 // whose correlation is a local maximum reaching `z_peak_ratio` of the best
-// (levels of the same layout give one peak per level spacing; 1 keeps the
-// best only). `ambiguity` is that of the best yaw. Empty if either cloud has
-// too little vertical structure.
+// (levels of the same layout give one peak per level spacing). `ambiguity`
+// is that of the best yaw. Empty if either cloud has too little vertical
+// structure.
 std::vector<CoarseAlignment> AlignGravityAlignedCandidates(
     const Points& source, const Points& reference,
-    const CoarseAlignConfig& config = {}, double z_peak_ratio = 0.5);
+    const CoarseAlignConfig& config = {},
+    double z_peak_ratio = kDefaultZPeakRatio);
 
 // Placement of a gravity-aligned cloud on a reference cloud without any
 // initial guess: every hypothesis of AlignGravityAlignedCandidates above
@@ -65,13 +72,14 @@ std::vector<CoarseAlignment> AlignGravityAlignedCandidates(
 // localize a vehicle that has no prior pose (localization.h).
 struct PlacementConfig {
   double voxel = 0.2;  // Both clouds are downsampled to it.
-  std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};
-  int icp_iters = 40;
-  double min_score = 0.3;     // Coarse: fraction of structure cells matched.
-  double z_peak_ratio = 0.5;  // Height hypotheses per yaw.
-  int max_candidates = 8;
+  std::vector<double> icp_schedule = {2.0, 1.0, 0.5, 0.3};  // Gates (m).
+  int icp_iters = kDefaultMultiScaleIterations;
+  double min_score = 0.3;  // Coarse: fraction of structure cells matched.
+  double z_peak_ratio = kDefaultZPeakRatio;  // Height hypotheses per yaw.
+  int max_candidates = 8;    // Hypotheses refined by ICP at most.
   double min_fitness = 0.5;  // ICP: inliers / source points.
   double max_rmse = 0.2;     // m
+  // The best fitness must beat a distinct hypothesis by this much.
   double min_fitness_gap = 0.03;
   double distinct_t = 1.0;  // m
   double distinct_r = 5.0;  // deg
@@ -82,8 +90,8 @@ struct Placement {
   // "placed", "ambiguous", "ICP rejected" or "no coarse hypothesis".
   std::string verdict = "no coarse hypothesis";
   Pose reference_from_source;  // Best ICP fit (also when not placed).
-  double score = 0.0;      // Coarse score of the best fit.
-  double fitness = 0.0;    // Its ICP fitness and RMSE.
+  double score = 0.0;          // Coarse score of the best fit.
+  double fitness = 0.0;        // Its ICP fitness and RMSE.
   double rmse = 0.0;
   double runner_up = 0.0;  // Best ICP fitness of a distinct hypothesis.
   int hypotheses = 0;      // Refined by ICP.

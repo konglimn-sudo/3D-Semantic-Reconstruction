@@ -12,6 +12,36 @@ namespace gr {
 namespace {
 
 constexpr double kInfinity = std::numeric_limits<double>::infinity();
+// Every polyline edge gets at least its two ends as samples; runs need at
+// least kMinRunPoints visible samples.
+constexpr int kMinEdgeSamples = 2;
+constexpr size_t kMinRunPoints = 2;
+// Sobel: weight of the centre row / column of the [1, 2, 1] smoothing.
+constexpr double kSobelCentreWeight = 2.0;
+// Edge strengths are normalised by this percentile (at least kMinEdgeScale).
+constexpr double kEdgeScalePercentile = 95.0;
+constexpr double kMinEdgeScale = 1e-6;
+// Directions of shorter vectors have no meaning.
+constexpr double kMinNorm = 1e-9;
+// The frame z-buffer: splats of kMinSplatRadius to kMaxSplatRadius pixels,
+// points from kMinRenderRange (m) to kRenderRangeMargin (m) beyond the label
+// range; boxes up to kBoxRangeMargin (m) beyond it.
+constexpr int kMinSplatRadius = 1;
+constexpr int kMaxSplatRadius = 4;
+constexpr double kMinRenderRange = 0.1;
+constexpr double kRenderRangeMargin = 2.0;
+constexpr double kBoxRangeMargin = 5.0;
+// The lifting z-buffer: splats of at most kMaxLiftSplatRadius pixels, points
+// up to kLiftRangeSlack (m) beyond the range.
+constexpr int kMaxLiftSplatRadius = 3;
+constexpr double kLiftRangeSlack = 1e-6;
+// Outlines and markings are lifted this far (m) above the floor so that the
+// floor does not occlude them.
+constexpr double kFloorLift = 0.01;
+// The entrance is the first edge of a slot outline.
+constexpr int kEntranceEdge = 0;
+// A paint edge needs this many visible samples for a score.
+constexpr int kMinScoredSamples = 5;
 
 struct PolylineSamples {
   Points points;
@@ -26,36 +56,38 @@ PolylineSamples SamplePolyline(const Points& vertices, double step,
   const size_t num_vertices = vertices.size();
   const size_t num_edges =
       closed ? num_vertices : (num_vertices > 0 ? num_vertices - 1 : 0);
-  for (size_t k = 0; k < num_edges; ++k) {
-    const Vec3& a = vertices[k];
-    const Vec3& b = vertices[(k + 1) % num_vertices];
-    const int n =
-        std::max(2, static_cast<int>(std::ceil((b - a).norm() / step)) + 1);
-    const double dt = 1.0 / (n - 1);
-    for (int i = 0; i < n; ++i) {
-      const double t = i == n - 1 ? 1.0 : i * dt;
-      samples.points.push_back(a + t * (b - a));
-      samples.edge.push_back(static_cast<int>(k));
+  for (size_t edge = 0; edge < num_edges; ++edge) {
+    const Vec3& start = vertices[edge];
+    const Vec3& end = vertices[(edge + 1) % num_vertices];
+    const int edge_samples = std::max(
+        kMinEdgeSamples,
+        static_cast<int>(std::ceil((end - start).norm() / step)) + 1);
+    const double fraction_step = 1.0 / (edge_samples - 1);
+    for (int sample = 0; sample < edge_samples; ++sample) {
+      const double fraction =
+          sample == edge_samples - 1 ? 1.0 : sample * fraction_step;
+      samples.points.push_back(start + fraction * (end - start));
+      samples.edge.push_back(static_cast<int>(edge));
     }
   }
   return samples;
 }
 
-// Runs of consecutive visible samples (at least two points each).
+// Runs of consecutive visible samples (at least kMinRunPoints each).
 std::vector<Polyline2> VisibleRuns(const RowMatX2d& uv,
                                    const std::vector<uint8_t>& visible) {
   std::vector<Polyline2> runs;
   Polyline2 current;
-  for (size_t m = 0; m < visible.size(); ++m) {
-    const Eigen::Index row = static_cast<Eigen::Index>(m);
-    if (visible[m]) {
+  for (size_t sample = 0; sample < visible.size(); ++sample) {
+    const Eigen::Index row = static_cast<Eigen::Index>(sample);
+    if (visible[sample]) {
       current.emplace_back(uv(row, 0), uv(row, 1));
     } else if (!current.empty()) {
-      if (current.size() > 1) runs.push_back(current);
+      if (current.size() >= kMinRunPoints) runs.push_back(current);
       current.clear();
     }
   }
-  if (current.size() > 1) runs.push_back(current);
+  if (current.size() >= kMinRunPoints) runs.push_back(current);
   return runs;
 }
 
@@ -72,10 +104,10 @@ bool AnyOf(const std::vector<uint8_t>& flags) {
 }
 
 // scipy.ndimage mode "reflect": (d c b a | a b c d | d c b a).
-int Reflect(int i, int n) {
-  if (i < 0) i = -i - 1;
-  if (i >= n) i = 2 * n - i - 1;
-  return std::clamp(i, 0, n - 1);
+int Reflect(int index, int size) {
+  if (index < 0) index = -index - 1;
+  if (index >= size) index = 2 * size - index - 1;
+  return std::clamp(index, 0, size - 1);
 }
 
 }  // namespace
@@ -105,9 +137,10 @@ class FrameLabeler::Projector {
                           config_.depth_abs_tol, config_.depth_rel_tol);
     Projection projection;
     projection.visible.resize(samples.size());
-    for (size_t m = 0; m < samples.size(); ++m) {
-      projection.visible[m] = result.in_image[m] && result.visible[m] &&
-                              result.range[m] <= config_.max_range;
+    for (size_t sample = 0; sample < samples.size(); ++sample) {
+      projection.visible[sample] = result.in_image[sample] &&
+                                   result.visible[sample] &&
+                                   result.range[sample] <= config_.max_range;
     }
     projection.uv = std::move(result.uv);
     return projection;
@@ -115,9 +148,11 @@ class FrameLabeler::Projector {
 
   // Smallest distance from the camera centre to any of the points.
   double MinDistance(const Points& points) const {
-    double d = kInfinity;
-    for (const Vec3& p : points) d = std::min(d, (p - origin_).norm());
-    return d;
+    double nearest = kInfinity;
+    for (const Vec3& point : points) {
+      nearest = std::min(nearest, (point - origin_).norm());
+    }
+    return nearest;
   }
   const Vec3& origin() const { return origin_; }
 
@@ -132,50 +167,57 @@ class FrameLabeler::Projector {
 std::vector<float> EdgeStrength(const ImageView& image) {
   const int height = image.height;
   const int width = image.width;
-  const size_t n = static_cast<size_t>(std::max(height, 0)) *
-                   static_cast<size_t>(std::max(width, 0));
-  std::vector<float> out(n, 0.0f);
+  const size_t pixels = static_cast<size_t>(std::max(height, 0)) *
+                        static_cast<size_t>(std::max(width, 0));
+  std::vector<float> out(pixels, 0.0f);
   if (image.empty() || image.channels < 1) return out;
-  std::vector<double> gray(n);
+  std::vector<double> gray(pixels);
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const uint8_t* px = image.PixelAt(y, x);
+      const uint8_t* pixel = image.PixelAt(y, x);
       double sum = 0.0;
-      for (int c = 0; c < image.channels; ++c) sum += px[c];
+      for (int channel = 0; channel < image.channels; ++channel) {
+        sum += pixel[channel];
+      }
       gray[static_cast<size_t>(y) * static_cast<size_t>(width) +
            static_cast<size_t>(x)] = sum / image.channels;
     }
   }
-  const auto at = [&](const std::vector<double>& a, int y, int x) {
-    return a[static_cast<size_t>(Reflect(y, height)) *
-                 static_cast<size_t>(width) +
-             static_cast<size_t>(Reflect(x, width))];
+  const auto at = [&](const std::vector<double>& values, int y, int x) {
+    return values[static_cast<size_t>(Reflect(y, height)) *
+                      static_cast<size_t>(width) +
+                  static_cast<size_t>(Reflect(x, width))];
   };
   // Sobel: central difference along one axis, [1, 2, 1] smoothing along the
   // other.
-  std::vector<double> dx(n);
-  std::vector<double> dy(n);
+  std::vector<double> difference_x(pixels);
+  std::vector<double> difference_y(pixels);
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const size_t p = static_cast<size_t>(y) * static_cast<size_t>(width) +
-                       static_cast<size_t>(x);
-      dx[p] = at(gray, y, x + 1) - at(gray, y, x - 1);
-      dy[p] = at(gray, y + 1, x) - at(gray, y - 1, x);
+      const size_t pixel = static_cast<size_t>(y) * static_cast<size_t>(width) +
+                           static_cast<size_t>(x);
+      difference_x[pixel] = at(gray, y, x + 1) - at(gray, y, x - 1);
+      difference_y[pixel] = at(gray, y + 1, x) - at(gray, y - 1, x);
     }
   }
-  std::vector<double> magnitude(n);
+  std::vector<double> magnitude(pixels);
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const size_t p = static_cast<size_t>(y) * static_cast<size_t>(width) +
-                       static_cast<size_t>(x);
-      const double sx = at(dx, y - 1, x) + 2.0 * dx[p] + at(dx, y + 1, x);
-      const double sy = at(dy, y, x - 1) + 2.0 * dy[p] + at(dy, y, x + 1);
-      magnitude[p] = std::hypot(sx, sy);
+      const size_t pixel = static_cast<size_t>(y) * static_cast<size_t>(width) +
+                           static_cast<size_t>(x);
+      const double gradient_x = at(difference_x, y - 1, x) +
+                                kSobelCentreWeight * difference_x[pixel] +
+                                at(difference_x, y + 1, x);
+      const double gradient_y = at(difference_y, y, x - 1) +
+                                kSobelCentreWeight * difference_y[pixel] +
+                                at(difference_y, y, x + 1);
+      magnitude[pixel] = std::hypot(gradient_x, gradient_y);
     }
   }
-  const double scale = std::max(Percentile(magnitude, 95.0), 1e-6);
-  for (size_t p = 0; p < n; ++p) {
-    out[p] = static_cast<float>(magnitude[p] / scale);
+  const double scale =
+      std::max(Percentile(magnitude, kEdgeScalePercentile), kMinEdgeScale);
+  for (size_t pixel = 0; pixel < pixels; ++pixel) {
+    out[pixel] = static_cast<float>(magnitude[pixel] / scale);
   }
   return out;
 }
@@ -193,15 +235,19 @@ FrameLabeler::FrameLabeler(const Points& static_world,
   GR_CHECK(labels_.size() == static_world.size());
   // Markings lie on the floor: use the floor height of the nearest slot.
   marking_z_.assign(markings_.size(), 0.0);
-  for (size_t k = 0; k < markings_.size(); ++k) {
+  for (size_t marking = 0; marking < markings_.size(); ++marking) {
     double best = kInfinity;
     for (const SlotGeometry& slot : slots_) {
-      const Vec2 center = 0.25 * (slot.corners[0] + slot.corners[1] +
-                                  slot.corners[2] + slot.corners[3]);
-      const double d = (center - markings_[k].p0).norm();
-      if (d < best) {
-        best = d;
-        marking_z_[k] = slot.z;
+      Vec2 corner_sum = slot.corners[0];
+      for (int corner = 1; corner < kParkingSlotCorners; ++corner) {
+        corner_sum += slot.corners[corner];
+      }
+      const Vec2 center =
+          corner_sum / static_cast<double>(kParkingSlotCorners);
+      const double distance = (center - markings_[marking].p0).norm();
+      if (distance < best) {
+        best = distance;
+        marking_z_[marking] = slot.z;
       }
     }
   }
@@ -217,23 +263,26 @@ FrameLabels FrameLabeler::Label(const CameraModel& camera,
   const Vec3& origin = exposure.center();
   const double max_range = config_.max_range;
 
-  ZBuffer buffer(camera, exposure, config_.render_spacing, 1, 4, 0.1,
-                 max_range + 2.0);
-  for (int i : index_.RadiusSearch(origin, max_range + 2.0)) {
-    buffer.Splat(index_.points()[static_cast<size_t>(i)],
-                 labels_[static_cast<size_t>(i)], i);
+  ZBuffer buffer(camera, exposure, config_.render_spacing, kMinSplatRadius,
+                 kMaxSplatRadius, kMinRenderRange,
+                 max_range + kRenderRangeMargin);
+  for (int point :
+       index_.RadiusSearch(origin, max_range + kRenderRangeMargin)) {
+    buffer.Splat(index_.points()[static_cast<size_t>(point)],
+                 labels_[static_cast<size_t>(point)], point);
   }
   for (const ObjectBox& box : boxes) {
-    if ((box.center - origin).norm() >= max_range + 5.0) continue;
-    for (const Vec3& p : box.SampleSurface(config_.box_render_step)) {
-      buffer.Splat(p, box.label, -1);
+    if ((box.center - origin).norm() >= max_range + kBoxRangeMargin) continue;
+    for (const Vec3& point : box.SampleSurface(config_.box_render_step)) {
+      buffer.Splat(point, box.label, RenderResult::kEmpty);
     }
   }
   const RenderResult render = buffer.TakeResult();
   labels.label_image.resize(render.label.size());
-  for (size_t p = 0; p < render.label.size(); ++p) {
-    labels.label_image[p] =
-        static_cast<uint8_t>(std::clamp(render.label[p], 0, 255));
+  for (size_t pixel = 0; pixel < render.label.size(); ++pixel) {
+    labels.label_image[pixel] = static_cast<uint8_t>(
+        std::clamp(render.label[pixel], 0,
+                   static_cast<int>(std::numeric_limits<uint8_t>::max())));
   }
 
   const Projector projector(camera, exposure, render.depth, config_);
@@ -247,10 +296,11 @@ FrameLabels FrameLabeler::Label(const CameraModel& camera,
 
 void FrameLabeler::ProjectSlots(const Projector& projector,
                                 FrameLabels& labels) const {
-  for (size_t s = 0; s < slots_.size(); ++s) {
+  for (size_t slot_index = 0; slot_index < slots_.size(); ++slot_index) {
+    const SlotGeometry& geometry = slots_[slot_index];
     Points corners;
-    for (const Vec2& c : slots_[s].corners) {
-      corners.emplace_back(c.x(), c.y(), slots_[s].z + 0.01);
+    for (const Vec2& corner : geometry.corners) {
+      corners.emplace_back(corner.x(), corner.y(), geometry.z + kFloorLift);
     }
     if (projector.MinDistance(corners) > config_.max_range) continue;
     const PolylineSamples outline =
@@ -258,20 +308,20 @@ void FrameLabeler::ProjectSlots(const Projector& projector,
     const Projector::Projection projection = projector.Project(outline.points);
     if (!AnyOf(projection.visible)) continue;
     SlotProjection slot;
-    slot.index = static_cast<int>(s);
+    slot.index = static_cast<int>(slot_index);
     const Projector::Projection corner_projection = projector.Project(corners);
-    for (size_t a = 0; a < 4; ++a) {
-      const Vec2 uv =
-          corner_projection.uv.row(static_cast<Eigen::Index>(a)).transpose();
-      slot.corners_uv[a] = uv.allFinite() ? uv : Vec2(-1.0, -1.0);
-      slot.corner_visible[a] = corner_projection.visible[a] != 0;
+    for (int corner = 0; corner < kParkingSlotCorners; ++corner) {
+      const Vec2 uv = corner_projection.uv.row(corner).transpose();
+      slot.corners_uv[corner] =
+          uv.allFinite() ? uv : Vec2::Constant(SlotProjection::kUnprojected);
+      slot.corner_visible[corner] = corner_projection.visible[corner] != 0;
     }
     size_t entrance = 0;
     size_t entrance_visible = 0;
-    for (size_t m = 0; m < outline.edge.size(); ++m) {
-      if (outline.edge[m] != 0) continue;
+    for (size_t sample = 0; sample < outline.edge.size(); ++sample) {
+      if (outline.edge[sample] != kEntranceEdge) continue;
       ++entrance;
-      entrance_visible += projection.visible[m];
+      entrance_visible += projection.visible[sample];
     }
     slot.entrance_visible = entrance > 0
                                 ? static_cast<double>(entrance_visible) /
@@ -288,9 +338,10 @@ void FrameLabeler::ProjectMarkings(const Projector& projector,
                                    const ImageView& image,
                                    FrameLabels& labels) const {
   std::vector<double> edge_scores;
-  for (size_t k = 0; k < markings_.size(); ++k) {
-    const MarkingGeometry& marking = markings_[k];
-    const double z = marking_z_[k] + 0.01;
+  for (size_t marking_index = 0; marking_index < markings_.size();
+       ++marking_index) {
+    const MarkingGeometry& marking = markings_[marking_index];
+    const double z = marking_z_[marking_index] + kFloorLift;
     const Points line{Vec3(marking.p0.x(), marking.p0.y(), z),
                       Vec3(marking.p1.x(), marking.p1.y(), z)};
     if (projector.MinDistance(line) > config_.max_range) continue;
@@ -299,38 +350,42 @@ void FrameLabeler::ProjectMarkings(const Projector& projector,
     const Projector::Projection projection = projector.Project(samples.points);
     if (!AnyOf(projection.visible)) continue;
     MarkingProjection projected;
-    projected.index = static_cast<int>(k);
+    projected.index = static_cast<int>(marking_index);
     projected.polylines = VisibleRuns(projection.uv, projection.visible);
     labels.markings.push_back(std::move(projected));
     if (edges.empty()) continue;
     // Both paint edges must land on image edges.
-    const Vec2 direction = (marking.p1 - marking.p0) /
-                           std::max((marking.p1 - marking.p0).norm(), 1e-9);
+    const Vec2 direction =
+        (marking.p1 - marking.p0) /
+        std::max((marking.p1 - marking.p0).norm(), kMinNorm);
     const Vec3 offset =
         Vec3(-direction.y(), direction.x(), 0.0) * (marking.width / 2.0);
     for (double sign : {-1.0, 1.0}) {
       Points shifted(samples.points.size());
-      for (size_t a = 0; a < shifted.size(); ++a) {
-        shifted[a] = samples.points[a] + sign * offset;
+      for (size_t sample = 0; sample < shifted.size(); ++sample) {
+        shifted[sample] = samples.points[sample] + sign * offset;
       }
       const Projector::Projection edge_projection = projector.Project(shifted);
       double sum = 0.0;
       int count = 0;
-      for (size_t a = 0; a < shifted.size(); ++a) {
-        const Eigen::Index row = static_cast<Eigen::Index>(a);
+      for (size_t sample = 0; sample < shifted.size(); ++sample) {
+        const Eigen::Index row = static_cast<Eigen::Index>(sample);
         const double u = edge_projection.uv(row, 0);
         const double v = edge_projection.uv(row, 1);
-        if (!edge_projection.visible[a] || !std::isfinite(u) ||
+        if (!edge_projection.visible[sample] || !std::isfinite(u) ||
             !std::isfinite(v)) {
           continue;
         }
-        const int col = std::clamp(static_cast<int>(u), 0, image.width - 1);
-        const int r = std::clamp(static_cast<int>(v), 0, image.height - 1);
-        sum += edges[static_cast<size_t>(r) * static_cast<size_t>(image.width) +
-                     static_cast<size_t>(col)];
+        const int column =
+            std::clamp(static_cast<int>(u), 0, image.width - 1);
+        const int image_row =
+            std::clamp(static_cast<int>(v), 0, image.height - 1);
+        sum += edges[static_cast<size_t>(image_row) *
+                         static_cast<size_t>(image.width) +
+                     static_cast<size_t>(column)];
         ++count;
       }
-      if (count >= 5) edge_scores.push_back(sum / count);
+      if (count >= kMinScoredSamples) edge_scores.push_back(sum / count);
     }
   }
   if (edge_scores.empty()) {
@@ -345,19 +400,19 @@ void FrameLabeler::ProjectMarkings(const Projector& projector,
 void FrameLabeler::ProjectBoxes(const Projector& projector,
                                 const std::vector<ObjectBox>& boxes,
                                 FrameLabels& labels) const {
-  for (size_t b = 0; b < boxes.size(); ++b) {
-    const ObjectBox& box = boxes[b];
+  for (size_t box_index = 0; box_index < boxes.size(); ++box_index) {
+    const ObjectBox& box = boxes[box_index];
     if ((box.center - projector.origin()).norm() > config_.max_range) continue;
     const Points surface = box.SampleSurface(config_.box_sample_step);
     const Projector::Projection projection = projector.Project(surface);
     if (!AnyOf(projection.visible)) continue;
     BoxProjection projected;
-    projected.index = static_cast<int>(b);
+    projected.index = static_cast<int>(box_index);
     Eigen::Vector4d bbox(kInfinity, kInfinity, -kInfinity, -kInfinity);
-    for (size_t a = 0; a < surface.size(); ++a) {
-      if (!projection.visible[a]) continue;
-      const double u = projection.uv(static_cast<Eigen::Index>(a), 0);
-      const double v = projection.uv(static_cast<Eigen::Index>(a), 1);
+    for (size_t sample = 0; sample < surface.size(); ++sample) {
+      if (!projection.visible[sample]) continue;
+      const double u = projection.uv(static_cast<Eigen::Index>(sample), 0);
+      const double v = projection.uv(static_cast<Eigen::Index>(sample), 1);
       bbox[0] = std::min(bbox[0], u);
       bbox[1] = std::min(bbox[1], v);
       bbox[2] = std::max(bbox[2], u);
@@ -387,9 +442,11 @@ void LabelLifter::AddView(const CameraModel& camera,
                           const CameraExposure& exposure, const int32_t* labels,
                           const float* weights) {
   const Vec3& origin = exposure.center();
-  ZBuffer buffer(camera, exposure, spacing_, 1, 3, 0.1, max_range_);
-  for (int i : index_.RadiusSearch(origin, max_range_ + 1e-6)) {
-    buffer.Splat(index_.points()[static_cast<size_t>(i)], -1, i);
+  ZBuffer buffer(camera, exposure, spacing_, kMinSplatRadius,
+                 kMaxLiftSplatRadius, kMinRenderRange, max_range_);
+  for (int point : index_.RadiusSearch(origin, max_range_ + kLiftRangeSlack)) {
+    buffer.Splat(index_.points()[static_cast<size_t>(point)],
+                 RenderResult::kEmpty, point);
   }
   const RenderResult& render = buffer.result();
   const int height = render.height;
@@ -406,11 +463,16 @@ void LabelLifter::AddView(const CameraModel& camera,
                            static_cast<size_t>(x);
       const int point = render.index[pixel];
       const int label = labels[pixel];
-      if (point < 0 || label < 0 || label >= num_classes_) continue;
+      if (point == RenderResult::kEmpty || label < 0 ||
+          label >= num_classes_) {
+        continue;
+      }
       bool uniform = true;  // Skip pixels on label boundaries.
-      for (int dy = -boundary_; dy <= boundary_ && uniform; ++dy) {
-        for (int dx = -boundary_; dx <= boundary_ && uniform; ++dx) {
-          uniform = label_at(y + dy, x + dx) == label;
+      for (int row_offset = -boundary_; row_offset <= boundary_ && uniform;
+           ++row_offset) {
+        for (int column_offset = -boundary_;
+             column_offset <= boundary_ && uniform; ++column_offset) {
+          uniform = label_at(y + row_offset, x + column_offset) == label;
         }
       }
       if (!uniform) continue;
@@ -426,22 +488,23 @@ void LabelLifter::AddView(const CameraModel& camera,
 }
 
 LabelLifter::Lifted LabelLifter::Lift() const {
-  const size_t n = num_views_.size();
+  const size_t points = num_views_.size();
   Lifted lifted;
-  lifted.labels.assign(n, -1);
-  lifted.confidence.assign(n, 0.0);
-  for (size_t i = 0; i < n; ++i) {
-    const float* v = &votes_[i * static_cast<size_t>(num_classes_)];
+  lifted.labels.assign(points, kNoLabel);
+  lifted.confidence.assign(points, 0.0);
+  for (size_t point = 0; point < points; ++point) {
+    const float* point_votes =
+        &votes_[point * static_cast<size_t>(num_classes_)];
     float total = 0.0f;
     int best = 0;
-    for (int c = 0; c < num_classes_; ++c) {
-      total += v[c];
-      if (v[c] > v[best]) best = c;
+    for (int class_id = 0; class_id < num_classes_; ++class_id) {
+      total += point_votes[class_id];
+      if (point_votes[class_id] > point_votes[best]) best = class_id;
     }
     if (total <= 0.0f) continue;
-    lifted.confidence[i] =
-        static_cast<double>(v[best]) / static_cast<double>(total);
-    if (num_views_[i] >= min_views_) lifted.labels[i] = best;
+    lifted.confidence[point] = static_cast<double>(point_votes[best]) /
+                               static_cast<double>(total);
+    if (num_views_[point] >= min_views_) lifted.labels[point] = best;
   }
   return lifted;
 }

@@ -8,12 +8,16 @@ namespace gr {
 std::string StringPrintf(const char* format, ...) {
   va_list args;
   va_start(args, format);
-  va_list copy;
-  va_copy(copy, args);
-  const int n = std::vsnprintf(nullptr, 0, format, copy);
-  va_end(copy);
-  std::string out(n > 0 ? static_cast<size_t>(n) : 0, '\0');
-  if (n > 0) std::vsnprintf(out.data(), out.size() + 1, format, args);
+  // A first pass measures the text, a second writes it.
+  va_list measure_args;
+  va_copy(measure_args, args);
+  const int length = std::vsnprintf(nullptr, 0, format, measure_args);
+  va_end(measure_args);
+  std::string out(length > 0 ? static_cast<size_t>(length) : 0, '\0');
+  if (length > 0) {
+    // vsnprintf also writes the terminating null character.
+    std::vsnprintf(out.data(), out.size() + 1, format, args);
+  }
   va_end(args);
   return out;
 }

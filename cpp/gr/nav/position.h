@@ -43,7 +43,8 @@ struct FloorHeights {
 };
 
 struct EdgePosition {
-  int edge = -1;
+  static constexpr int kNoEdge = -1;
+  int edge = kNoEdge;
   std::string kind;
   double distance = 0.0;  // m from the edge.
   double along = 0.0;     // m from its start.

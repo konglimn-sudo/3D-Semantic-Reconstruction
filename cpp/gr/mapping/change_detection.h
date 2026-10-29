@@ -72,7 +72,7 @@ class ChangeDetector {
 
  private:
   ChangeConfig config_;
-  double inv_;
+  double inverse_voxel_;
   std::unordered_set<VoxelKey, VoxelKeyHash> map_;
   struct Hits {
     int sweeps = 0;
