@@ -23,11 +23,11 @@
 | 位姿骨架 | 已实现：激光里程计、回环、IMU 预积分位姿图、无入口位姿趟次的整趟粗对齐、平面约束的 LiDAR BA（超过 2000 个关键帧时分层，4.1）、连续时间轨迹与重新去畸变、相机时间偏差 / 卷帘快门 / 外参标定、带版本号的位姿集合；控制点锚定、OCR 文字回环候选、按 IMU 等级的噪声与零偏先验、LiDAR–IMU 外参检查（4.4） |
 | 测量点云与验收 | 已实现：多次观测融合且每点带 σ 的测量点云、正射影像上的亚像素矢量拟合、手持真值验收（导入、控制点 / 检查点、报告） |
 | 语义：规则路线 | 已实现：结构、标线、车位、停放 / 移动目标、占据、逐帧标签、车位号（RapidOCR，读每个车位摆正的地面正射小图，合成车库 19 / 20 正确，9.10）、审核队列、导出 |
-| 语义：语言路线 | 链路已实现，用合成真值验证：模型接口、跨视角身份关联、身份级语言特征。语义载体暂用 LiDAR 点；真实模型（SAM 2、SigLIP 2、OCR）的适配器还没有写（见 2 的 D） |
+| 语义：语言路线 | 链路已实现，用合成真值验证：模型接口、跨视角身份关联、身份级语言特征。语义载体暂用 LiDAR 点；真实模型已接（SAM 2.1、OWLv2、SigLIP 2、RapidOCR、DINOv2，见 2 的 D），但 SigLIP 2 零样本分类在真实车库上不可用 |
 | 导航地图 | 已实现（第 6 章）：分层栅格（含净空高度）、路网（骨架 + 按车位排、长墙和采集行驶路线生成的车道线）、单行道（地面箭头、采集行驶方向、禁行 / 单行标志）、车位目标点与属性（充电、无障碍、专用）、地点（入口、出口、门、坡道口）、道闸与减速带、限高（实测净空 + 限高牌）、地址查询、QA、nav2 / GeoJSON / Lanelet2（车位与车道）导出、查看器里的路线规划；实时车位占用、变化检测与路网更新（6.3） |
 | 车端定位 | 已实现（6.2）：在导航地图的固定结构上用 LiDAR 定位；有入口先验时直接跟踪，没有时把里程计子图放到地图上（全局初始化）；退化方向保留里程计；同时给出看到的车位的实时占用和相对地图的结构变化（6.3）。合成车库误差 p95 1.8 cm（相对地图 0.9 cm），10 个随机起点全部正确初始化；露天停车场几何约束不足（9.8） |
 | 工程 | C++ 按功能分文件夹（10.2）；测量点云与动态点可分块建图（与整图逐位相同，峰值内存随块大小下降，9.11）；语义与导航几何已迁到 C++（含标线涂料掩膜与骨架、导航分层、BEV 栅格）；文件格式库 `gr_io`；纯 C++ 程序 `gr_localize`（车端定位）和 `gr_recon`（离线重建的几何阶段：里程计 → 图优化 → 位姿集合 → 测量点云、楼层、动态点），输出与 Python 入口逐字节一致（9.9）；C++ 配置表由绑定自动生成；GitHub Actions CI、`cmake --install` / CPack 打包、Docker 镜像（3.1）；逐帧标签和地面纹理按帧并行（约 5 倍） |
-| 3DGS / DA3 / DINO | 已实现并在 GPU 上实测（第 8 章）：DA3 位姿条件深度与 LiDAR 对齐、gsplat 3DGUT 鱼眼训练（LiDAR 锚定、冻结、剪枝、分块）、留出扫描核验与正射影像、RoMa 相机标定、DINOv2 外观回环。待做：TSDF 网格、逐帧深度渲染、沿 LiDAR 射线的训练损失、SAM 掩膜 |
+| 3DGS / DA3 / DINO | 已实现并在 GPU 上实测（第 8 章）：DA3 位姿条件深度与 LiDAR 对齐、gsplat 3DGUT 鱼眼训练（LiDAR 锚定、冻结、剪枝、分块）、留出扫描核验与正射影像、RoMa 相机标定、DINOv2 外观回环 |
 | 真实数据 | ROS bag 转换（含 LiDAR 时钟同步）、Mandeye 原始记录转换、扫描仪导出导入；已试跑 FusionPortableV2 两个场景、Skierniewice 地下车库（Mandeye）、Oxford Spires Keble College、Hilti 2021 Parking Deck。当前精度见 9.0 |
 
 ## 2. 原则与总体数据流
@@ -52,7 +52,7 @@
 4. **导航的障碍按几何判定。** 车辆高度带内的静态点都是障碍；语义类别只用于分层，类别分错不能让路线穿墙。
    - **现状**：做到。合成数据和两份真实数据上，碰到障碍的路线都是 0（9.4）。
 5. **核心几何算法全部在 C++。** Python 只负责读写文件、把配置映射到 C++ 配置结构，以及按阶段编排。
-   - **现状**：骨架做到了。楼层 / 坡道、结构、标线、亚像素矢量拟合、车位推断还是 Python（numpy）实现（10.1），待移到 C++。
+   - **现状**：做到。骨架、楼层 / 坡道、结构、标线、亚像素矢量拟合、车位、目标跟踪都在 C++（10.1）；剩下的 Python 几何见 12。
 
 ```
 采集（LiDAR / IMU / 轮速 / 相机）
@@ -100,8 +100,8 @@ OCR（`models.ocr`，PP-OCRv4 的 ONNX 模型随包附带，共约 37 MB）：`r
 ```bash
 python3 -m venv --system-site-packages .venv && .venv/bin/pip install pybind11 scikit-build-core "laspy[lazrs]" rosbags pytest
 cmake -S . -B build -DPython_EXECUTABLE=$PWD/.venv/bin/python && cmake --build build -j8
-./build/gr_tests                      # C++ 单元测试 + 纯 C++ 端到端（约 20 秒）
-PYTHONPATH=python .venv/bin/python -m pytest -q   # Python 测试（含一次 tiny 端到端，约 40 秒）
+./build/gr_tests                      # C++ 单元测试 + 纯 C++ 端到端（本机 8 线程约 1.5 分钟）
+PYTHONPATH=python .venv/bin/python -m pytest -q   # Python 测试（含一次 tiny 端到端，约 1 分钟）
 ```
 
 构建产物：静态库 `gr_core`（算法）、`gr_io`（文件格式）和 `gr_pipeline`（重建阶段编排），测试 `gr_tests`，两个不依赖 Python 的程序：车端定位 `gr_localize`（6.2）和离线重建 `gr_recon`（4.1），Python 扩展 `_core`。`-DGR_BUILD_PYTHON=OFF` 只构建 C++ 部分，适合车端部署。
@@ -123,7 +123,9 @@ PYTHONPATH=python .venv/bin/python -m pytest -q   # Python 测试（含一次 ti
   - 函数 / 类型用 CamelCase，变量用 snake_case，类成员带下划线后缀；
   - 位姿命名为 `a_from_b`（如 `world_from_lidar`）；
   - `#define` 头文件保护，80 列；
-  - 格式由 `.clang-format`（Google 风格）统一：`find cpp \( -name '*.h' -o -name '*.cc' \) -print0 | xargs -0 clang-format -i`。
+  - 不用魔法数字：阈值、容差和默认值写成 `constexpr`，注释写明含义和单位；`-1` 一类的哨兵值也起名字（`kNone`、`kNoEdge`、`RenderResult::kEmpty` 等）；多个文件共用的常量放在头文件里（如 `kSpaceDim`、`kParkingSlotCorners`）；
+  - 函数、变量和形参的名字要看得出含义，循环下标 `i / j / k` 和坐标 `x / y / z / u / v` 除外；
+  - 新代码按 `.clang-format`（Google 风格）排版。现有代码是按 Google 风格手工排的，不完全是 clang-format 的输出，所以只格式化改动过的行（`git clang-format` 或 `clang-format --lines`），不要整个文件重排。
 - **错误处理**：核心库 `gr_core` 不使用异常（以 `-fno-exceptions` 编译）。
   - 违反前置条件属于编程错误，由 `GR_CHECK` 报告后终止；
   - 可能"正常失败"的操作返回 `std::optional`；
@@ -440,7 +442,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
 - **基础模型接口**（`models/interfaces.py`）：Segmenter2D、LanguageEncoder、DenseFeatures、Matcher、DepthPrior、OcrReader。
 - **合成真值实现**（`models/oracle.py`）：从真值渲染派生，可设置类别混淆、嵌入噪声、过分割、像素噪声，用来在没有 GPU 和模型权重时验证整条链路。
 - **其他接入点**：
-  - `semantics/adapters.py`：真实模型适配器占位、3D 检测器；
+  - `semantics/adapters.py`：3D 检测器接口（2D 模型的真实适配器在 `models/`，见 5.2）；
   - `recon/stereo.py`：学习式双目；
   - `semantics/markings.py:MarkingSegmenter`。
 
@@ -458,12 +460,13 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
 - Apache 2.0。
 
 **真实模型的接入**（2026-10-22 起，阶段 D）
-- **适配器**：`models/sam.py`、`models/siglip.py`、`models/ocr.py`，`models.sam2` / `models.siglip` / `models.ocr` 配置后启用，默认关闭。三者都是 Apache 2.0。
+- **适配器**：`models/sam.py`、`models/siglip.py`、`models/owlv2.py`、`models/ocr.py`，`models.sam2` / `models.siglip` / `models.owlv2` / `models.ocr` 配置后启用，默认关闭，都是 Apache 2.0。
 
   | 适配器 | 模型 | 做法 |
   |---|---|---|
   | `Sam2Segmenter` | SAM 2.1 Hiera-L | 自动掩膜按面积从大到小绘制成一张掩膜编号图，小物体留在上层 |
   | `Siglip2Encoder` | SigLIP 2 so400m/14-384 | 掩膜外接框加边距裁出，掩膜外置灰（LangSplat 做法） |
+  | `Owlv2Detector` | OWLv2-Large | 开放词表检测，`objects2d` 阶段用（见下） |
   | `RapidOcrReader` | PP-OCR（ONNX） | 中英文和车位号 |
 
 - **FusionPortableV2 地下车库上的第一次试验**（真实车库图像 1024×768）：
@@ -477,7 +480,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
   - **相似度量纲**：SigLIP 的最佳类别余弦中位 0.09。`language.min_score` 默认 0.3 是按合成真值编码器定的，用 SigLIP 时会拒掉全部掩膜，要重新标定。
   - **OCR**：抽查的 4 张图里没有读出文字，包括柱上的标志牌。
   - **几何标签转移到 SAM 掩膜**：逐帧标签覆盖率从 42% 只升到 48%。
-- **结论与下一步**：
+- **结论**：
   - 结构类（地面、墙、顶板、柱、梁）继续由几何规则路线定，SigLIP 不参与；
   - 2D 模型只负责几何叫不出名字的物体：标志牌、灯、道闸、挡轮器、行人、两轮车、消防设施；
   - 这类物体要换成开放词表检测（如 OWLv2，Apache 2.0）+ SAM 框提示，而不是给整图掩膜零样本分类；
@@ -563,7 +566,7 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
    - 原因：3 维自编码器压缩会损失开放词汇能力。
    - 做法：每个身份存一个全维嵌入，即多视角加权平均；高斯（或点）只存身份。
    - 地面、顶板、墙这类背景类，计划保留逐高斯的低维语言场。
-3. **几何冻结**（待 3DGS）：只优化语义属性，语义损失不能把高斯从 LiDAR 锚定的位置拉走。
+3. **几何冻结**（待语言高斯训练）：只优化语义属性，语义损失不能把高斯从 LiDAR 锚定的位置拉走。
 
 先按论文原样实现一版（3 维语言 + 16 维身份）作为基线，再与改造版对比。身份关联、身份级特征、渐进扩展都不依赖高斯：量产用高斯，没有 GPU 的环境用 LiDAR 点作载体。
 
@@ -725,8 +728,8 @@ PYTHONPATH=python .venv/bin/python -m garage_recon.cli recon --trips ... --work 
 | 标记 | 来源 | 用途 | 现状 |
 |---|---|---|---|
 | L | LiDAR 实测，多次观测融合 | 测量级，进入矢量测量 | 已实现（测量点云每点带 σ） |
-| G | 3DGS 几何，经留出的 LiDAR 扫描或多视角一致性验证 | 测量级，σ 按核验结果给出 | 待 3DGS |
-| P | 仅有先验（DA3，或未通过核验的 3DGS） | 只用于可视化和完整度，不进入矢量测量 | 待 DA3 / 3DGS |
+| G | 3DGS 几何，经留出的 LiDAR 扫描或多视角一致性验证 | 测量级，σ 按核验结果给出 | 部分实现：3DGS 核验按来源分开统计（8.3） |
+| P | 仅有先验（DA3，或未通过核验的 3DGS） | 只用于可视化和完整度，不进入矢量测量 | 已实现：DA3 空洞点生成的高斯（8.2、8.3） |
 
 门槛为初定值，需在手持真值车库上标定（`acceptance.thresholds`）：
 
@@ -798,9 +801,9 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - 细杆和管线、标志牌边缘；
 - 背向车道的柱面、顶板上的设备。
 
-规划中的阶段：
-- **重建**：map 之后加 depth_prior（DA3）→ gs（分块训练）→ gs_verify → ortho；
-- **语义**：加 lang_field（语言高斯训练）→ query（类别与实例）。
+阶段：
+- **重建**：map 之后是 depth_prior（DA3）→ gs（3DGS，可分块）→ gs_verify（核验）→ ortho（正射影像），已实现（8.2、8.3）；
+- **语义**：语言高斯训练与查询还没做（见 12）。
 
 ### 8.2 DA3
 
@@ -1083,10 +1086,10 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 | 用途 | 做法 | 现状 |
 |---|---|---|
 | 相机标定与时间同步 | 稠密匹配做粗对应，再细化到亚像素（RoMa 式：DINOv2 粗匹配 + 卷积特征细化）；结合 LiDAR 深度构造重投影残差 | **已接入 RoMa**（`models.roma`，`models/dino.py` 的 `RomaMatcher`），见下 |
-| 回环与多趟对齐 | DINO 全局描述子（AnyLoc 式聚合）给出外观候选，与 Scan Context、OCR 车位号一起排序，仍由 ICP + PCM 判定 | **已实现**（`loops.appearance`，C++ `VerifyAppearanceLoops`），见下；OCR 候选未做 |
-| 语义身份关联 | 掩膜级 DINO 特征相似度，补充 3D 重叠关联 | 特征已接入（`Dinov2Features`，`models.dino`）；掩膜要等 SAM 适配器 |
+| 回环与多趟对齐 | DINO 全局描述子（AnyLoc 式聚合）给出外观候选，与 Scan Context、OCR 车位号一起排序，仍由 ICP + PCM 判定 | **已实现**（`loops.appearance`，C++ `VerifyAppearanceLoops`），见下；OCR 文字候选也已实现（`loops.text`，4.4） |
+| 语义身份关联 | 掩膜级 DINO 特征相似度，补充 3D 重叠关联 | DINO 特征和 SAM 2 掩膜都已接入（`models.dino`、`models.sam2`）；按掩膜特征补充关联还没做 |
 | 手持真值配准 | 手持设备带相机时，用 DINO 匹配给初值，再 ICP | 现在用几何粗配准 |
-| 跨趟变化（可选） | 3DGS 渲染图与新一趟图像的 DINO 特征差 | 待 3DGS |
+| 跨趟变化（可选） | 3DGS 渲染图与新一趟图像的 DINO 特征差 | 未做 |
 
 - **精度**：DINO 的 patch 步长是 14 或 16 像素，只够做粗对应；用作几何约束之前必须细化到亚像素。
 - **复用 DA3 特征**：DA3 的编码器本身是 DINO 结构，可以评估直接复用它的中间特征（`feat_layer`），省一次 DINO 推理。
@@ -1749,8 +1752,6 @@ LiDAR 空洞指累积地图之后仍然没测到或采样很稀的地方：
 - **LiDAR-惯性里程计**（`lio`）；
 - **3DGS 核验**：沿留出扫描的射线渲染，复用已有的 `GaussianRayRenderer`。
 
-仍在规划中：3DGS 约束用的 LiDAR 表面距离场（现在按表面距离剪枝，没有在训练里按距离场加权）。
-
 Python 部分：
 - 数据与标定读写、位姿集合（`recon/pose_set.py`）与产物版本记录（`provenance.py`）、阶段编排；
 - 语义：地面箭头的栅格准备、车位号、规则、导出（目标检测跟踪在 C++ 里，`objects4d.py` 只准备输入、转换框）；
@@ -1760,14 +1761,14 @@ Python 部分：
 - 评测、自检和合成数据；
 - PyTorch 部分：
   - 已有：DA3（`models/da3.py`）、RoMa / DINOv2（`models/dino.py`）的推理，gsplat 3DGUT 训练（`recon/gs.py`）与正射 / 核验（`recon/gs_verify.py`）；
-  - 待做：SAM 2、SigLIP 2。
+  - SAM 2.1（`models/sam.py`）、OWLv2（`models/owlv2.py`）、SigLIP 2（`models/siglip.py`）的推理。
 - OCR 用 ONNX Runtime（RapidOCR，`models/ocr.py`），本机 CPU 上跑。
 
 ### 10.2 目录
 
 | 位置 | 内容 |
 |---|---|
-| `CMakeLists.txt` | C++ 库 `gr_core`、测试 `gr_tests`、pybind11 模块 `_core` |
+| `CMakeLists.txt` | C++ 库 `gr_core`、`gr_io`、`gr_pipeline`，测试 `gr_tests`，程序 `gr_localize`、`gr_recon`，pybind11 模块 `_core` |
 | `pyproject.toml` | Python 包 `garage_recon` |
 | `cpp/gr/` | C++ 核心库（下表） |
 | `cpp/bindings/` | pybind11 绑定，生成 `garage_recon._core`（下表） |
@@ -1792,7 +1793,7 @@ Python 部分：
 | `odometry/` | `odometry`、`lio`、`trajectory` | 每趟前端 `OdometryPipeline`；LiDAR-惯性里程计；连续时间轨迹与重新去畸变 |
 | `backend/` | `keyframes`、`scan_context`、`loop_closure`、`pose_graph`、`plane_factor`、`lidar_ba`、`backend` | 关键帧表；回环门控、排序、ICP 验证、PCM；LM 位姿图；平面因子与 LiDAR BA；整个图优化阶段 |
 | `mapping/` | `static_map`、`tiled_map`、`visibility`、`raycast`、`raster`、`bev`、`levels`、`change_detection` | 测量点云与动态点判断（可分块）；体素遍历与自由空间；栅格化与地面纹理；每层 BEV 栅格；楼层与坡道；结构变化检测 |
-| `semantics/` | `objects`、`occupancy`、`projector`、`labeling`、`identity`、`structure`、`paint`、`markings`、`vector_fit`、`slots`、`slot_paint` | 目标框时间线；每帧语义占据；z-buffer、第一表面深度与点云空间索引；逐帧标签与 2D→3D 投票；跨视角身份关联；柱与墙；标线涂料掩膜；标线矢量化、亚像素拟合与分类；车位组装；车位涂色（充电车位） |
+| `semantics/` | `objects`、`objects4d`、`occupancy`、`projector`、`labeling`、`identity`、`structure`、`paint`、`markings`、`vector_fit`、`slots`、`slot_paint` | 目标框时间线；停放与移动目标的检测和跟踪；每帧语义占据；z-buffer、第一表面深度与点云空间索引；逐帧标签与 2D→3D 投票；跨视角身份关联；柱与墙；标线涂料掩膜；标线矢量化、亚像素拟合与分类；车位组装；车位涂色（充电车位） |
 | `splat/` | `gaussians`、`coverage`、`depth_prior` | LiDAR 锚定高斯与沿射线渲染；相机覆盖与训练掩膜；DA3 深度与 LiDAR 的对齐 |
 | `nav/` | `layers`、`nav_map`、`arrows`、`traffic`、`lanes`、`features`、`position`、`localization`、`trip_localizer`、`slot_state`、`map_update` | 分层；距离变换、细化、骨架提图、路网最短路、栅格 A*；地面箭头；单行判定；车道线；道闸与减速带；路网上的位置；车端定位（逐帧、整趟）；车位实时占用；变化对路网的影响 |
 | `io/` | `value`、`npy`、`tables`、`trip`、`config`（+ 生成的 `config_tables.inc`）、`nav_files`、`recon_files`、`digest` | 文件格式库 `gr_io`：YAML / JSON、npy / npz、CSV / TUM、趟目录、配置、导航地图文件、重建工作目录、内容哈希 |
@@ -1812,14 +1813,14 @@ Python 部分：
 | `bind_nav.cc` | 导航分层、多边形填充、路网、单行判定、车道线、道路要素 |
 | `bind_localization.cc` | 车端定位（逐帧 `Localizer`、整趟 `TripLocalizer`）、路网位置 `nav_position`、重力对齐放置、车位实时占用、变化检测 |
 | `bind_mapping.cc` | 楼层与坡道、BEV 栅格 |
-| `bind_semantics.cc` | 结构、标线（矢量化、过滤、亚像素拟合、分类）、车位组装 |
+| `bind_semantics.cc` | 结构、标线（涂料掩膜、矢量化、过滤、亚像素拟合、分类）、车位组装与涂色、目标检测与跟踪（`run_objects`） |
 | `bind_splat.cc` | 3DGS 支撑：高斯初始化、沿射线渲染、相机覆盖、训练掩膜、DA3 深度对齐 |
 
 **Python 包 `python/garage_recon/`**：
 
 | 位置 | 内容 |
 |---|---|
-| `cli.py` | 命令行：`synth`、`handheld`、`convert`、`import-scan`、`recon`、`semantics`、`qa`、`eval`、`accept`、`view`、`localize`、`update-map`、`calibrate-lidar-imu`、`demo` |
+| `cli.py` | 命令行：`synth`、`handheld`、`convert`、`import-scan`、`recon`、`semantics`、`qa`、`eval`、`accept`、`viewer`、`localize`、`update-map`、`calibrate-lidar-imu`、`demo` |
 | `config.py`、`default_config.yaml` | 默认配置与用户 YAML 的深度合并 |
 | `core_config.py` | YAML 配置 → C++ 配置结构 |
 | `provenance.py` | 每个阶段的产物用的是哪个位姿集合（过期产物由自检拒收） |
@@ -1827,11 +1828,11 @@ Python 部分：
 | `parallel.py` | 逐帧任务的线程池（结果按输入顺序返回，产物与串行一致） |
 | `data/` | 趟目录格式（`dataset.py`）、标定 `rig.yaml`（`schema.py`）；合成车库 `synthetic/`：场景、轨迹、传感器仿真、生成器、真值重渲染（`ground_truth.py`）、模拟手持扫描（`handheld.py`） |
 | `convert/` | 真实数据 → 趟目录：`rosbag.py`（ROS 1 / 2 bag）、`mandeye.py`（Mandeye LAZ）、`frames.py`（摆正、放到地面、rig）、`profile.py`；`profiles/`：FusionPortableV2、Oxford Spires、Mandeye Mid-360、Hilti 2021（`*_recon.yaml` 是对应的重建配置） |
-| `recon/` | 第 4、8 章重建，`pipeline.py` 按阶段编排：`odometry` → `keyframes` / `backend` / `appearance`（回环与图优化）→ `trajectory` / `pose_set`（位姿集合）→ `calibration` → `static_map` → `levels` → `bev` → `floor_texture` → `depth_prior`（DA3）→ `gs`（3DGS）→ `gs_verify`（核验与正射）；`stereo.py`（双目近场深度）、`text_loops.py`（OCR 文字回环候选）、`lidar_imu.py`（LiDAR–IMU 外参检查） |
-| `models/` | 基础模型接口 `interfaces.py`、合成真值实现 `oracle.py`、真实模型 `da3.py`（DA3）与 `dino.py`（RoMa、DINOv2、VLAD），按配置构建的 `registry.py`（第一次使用时加载） |
-| `semantics/` | 第 5 章语义，`pipeline.py` 编排：`structure` → `markings`（`vector_fit` 矢量拟合）→ `slots` → `objects4d` → `occupancy` → `frame_labels` → `language_field`（特征 → 身份 → 语言）→ `numbers`（车位号 OCR）→ `rules`；`lifting`（2D→3D 投票）、`taxonomy`（类别表）、`adapters`（真实模型适配器） |
+| `recon/` | 第 4、8 章重建，`pipeline.py` 按阶段编排：`odometry` → `keyframes` / `backend` / `appearance`（回环与图优化）→ `trajectory` / `pose_set`（位姿集合）→ `calibration` → `static_map` → `levels` → `bev` → `floor_texture` → `depth_prior`（DA3）→ `gs`（3DGS）→ `gs_verify`（核验）→ `ortho`（正射影像）；`stereo.py`（双目近场深度）、`text_loops.py`（OCR 文字回环候选）、`lidar_imu.py`（LiDAR–IMU 外参检查） |
+| `models/` | 基础模型接口 `interfaces.py`、合成真值实现 `oracle.py`；真实模型 `da3.py`（DA3）、`dino.py`（RoMa、DINOv2、VLAD）、`sam.py`（SAM 2.1）、`siglip.py`（SigLIP 2）、`owlv2.py`（OWLv2）、`ocr.py`（RapidOCR）、`detection_language.py`（把检测当作语言路线的实例）；按配置构建的 `registry.py`（第一次使用时加载） |
+| `semantics/` | 第 5 章语义，`pipeline.py` 编排：`structure` → `markings`（`vector_fit` 矢量拟合）→ `slots` → `objects4d` → `objects2d` → `occupancy` → `frame_labels` → `language_field`（特征 → 身份 → 语言，`instances` 合并实例）→ `numbers`（车位号 OCR）→ `rules` → 导航 → 导出；`lifting`（2D→3D 投票）、`taxonomy`（类别表）、`adapters`（3D 检测器接口） |
 | `nav/` | 第 6 章导航地图，`navmap.py` 编排：`layers` → `graph`（路网、桥、坡道）+ `lanes`（按车位排的车道线）→ `traffic`（单行）→ `goals` / `attributes`（地点、净空与限高）→ `address` → `qa` → `export`；`localize`（车端定位、车位实时占用、变化检测，命令 `localize`）；`update`（按变化更新路网，命令 `update-map`） |
-| `eval/` | 对照合成真值评测：`synthetic_eval`、`pose_eval`（零偏 / 标定 / 曝光重投影）、`semantic_eval`（语言路线） |
+| `eval/` | 对照合成真值评测：`synthetic_eval`、`pose_eval`（零偏 / 标定 / 曝光重投影）、`semantic_eval`（语言路线）；对照人工标注：`frame_label_eval`（逐帧检测的查准 / 查全与像素 IoU） |
 | `acceptance/` | 第 7 章手持真值验收：`handheld`（读取）、`scan_import`（扫描导出的裁剪、抽稀、楼层 / 柱草稿）、`registration`（自动 / 控制点配准、柱检查点）、`report`（表面精度、完整度、结论） |
 | `qa/` | 无真值自检 `selfcheck.py`：位姿集合与过期产物、平面厚度、BA 残差、回环与 IMU 残差、标定、多趟重复性、投影与跨视角一致性、规则违例 |
 | `io/` | 交付物导出 `export.py`（LAS 1.4 / PLY / GeoJSON / Lanelet2 OSM）；网页查看器 `viewer.py` 与模板 |
@@ -1884,22 +1885,26 @@ Python 部分：
 
 ## 12. 已知限制与下一步
 
+本章是唯一的差距清单。其他章节只写现状，不再单列待做；差距有变化时改这里。
+
 **下一步**
 - 本机可做：
   - 定位：用地面标线的反射强度补水平约束（露天停车场，9.8）；OCR 文字地标区分布局相同的楼层；
   - 地图更新：变化检测与路网更新已有（6.3），还要在真实数据上验证，并把更新后的路网和定位地图一起发版本。
 - OCR 已装在本机（9.10）。真实车位号还缺数据：已有的真实车库（FusionPortableV2 地下车库、室外停车场）地面上都没有画车位号，需要一份画了车位号的车库采集。
 - 需要 GPU 服务器：
-  - 3DGS 训练：冻结与保护策略、强度损失、核验流程、覆盖率 QA；
-  - DA3 深度对齐；
+  - 3DGS 训练：沿 LiDAR 射线渲染的深度与强度损失（gsplat 没有旋转式 LiDAR 相机模型，现在是图像空间的深度损失）；相机覆盖率按类别进 QA（现在只报冻结比例）；
   - 语言高斯；
-  - 真实模型适配器：SAM 2 / SAM 3、SigLIP 2、DINO / RoMa、Depth Anything 3。
+  - 语义模型的真实效果：SigLIP 2 零样本分类不可用（5.2），要用人工标注逐类标定阈值或换模型；SAM 3 适配器未写；
+  - 3DGS：TSDF 网格、逐帧深度 / 法向渲染、SAM 掩膜、按 LiDAR 表面距离场加权的约束（现在只按表面距离剪枝）、法向损失与多视角几何一致、按趟的变化物体高斯；
+  - 来源 G：经核验的 3DGS 几何还没有进入矢量测量（7.1）；
+  - DINO：按掩膜特征补充身份关联、用 3DGS 渲染图找跨趟变化（8.4）。
 - 之后：点云网络（用审核后的 3D 标签训练），补相机盲区，并作为新车库的第二意见。
 
 **导航**
 - 单行道：箭头、采集行驶方向和 OCR 标志都已用上（6.1）；吊牌上的图形方向箭头（没有文字）还没识别，转弯箭头只取主轴方向。行驶方向只在采集多次同向通过时才算证据，单趟采集给不出。
 - 车道线：车位排、长墙、采集行驶路线三种来源；既没有车位、也没有长墙、又没开过的空地仍是骨架。
-- 道闸、减速带依赖 2D 检测（合成数据用真值），真实模型还没接；道闸开闭状态目前不随时间变化。
+- 道闸、减速带来自 2D 检测（真实数据用 `objects2d` 的 OWLv2 + SAM 2，合成数据用真值）。斑马线、坡道护栏曾被误检，加了几何校验（5.2）；没有人工标注，准确率不知道。道闸开闭状态不随时间变化。
 - 车位属性：绿色涂装与文字；只画了图标（轮椅、充电桩图形）的车位要靠图标检测。
 - 实时占用和变化检测只在合成数据上验证（9.4）；真实数据上停放车的遮挡、行人、施工围挡还要看。
 - 真实场地的车位检测仍有漏检：隔线碎成多段时整排丢失；室外停车场还有车位入口朝向判反的情况。
@@ -1908,7 +1913,7 @@ Python 部分：
 - 只用几何：露天停车场水平方向约束不足（9.8），全局初始化失败，跟踪只能保留里程计；需要 GNSS 先验或标线强度匹配。
 - 布局完全相同的楼层要走更远才能初始化（合成车库最长 80 m），要靠楼层标志的 OCR 或坡道经历区分。
 - 定位地图是静态的，不随车位占用、施工围挡变化；每帧 20 ms 左右（合成），露天 Ouster-128 数据 150–240 ms，还没做实时优化。
-- 只在离线回放上验证，没有接车上的实时数据流和控制。
+- 只在离线回放上验证，没有接车上的实时数据流和控制；车上用什么接口（ROS 2 还是别的）还没定。
 
 **位姿与标定**
 - LiDAR–IMU 外参：有了检查工具（4.4），只报告不改标定；车载数据航向不可观，手持数据与 rig.yaml 差 1.7° 无法裁定。加计标度和轴间误差只能在姿态变化充分的数据上估，Keble 上只加 IMU 因子时仍比纯里程计差（9.6）。
@@ -1918,12 +1923,14 @@ Python 部分：
 - 控制点已能作为锚点（4.4），还没有真实数据验证；没有控制点时绝对坐标只由入口 INS / GNSS 决定。
 
 **真实数据（FusionPortableV2）**
+- 地下车库的手持验收没有通过（9.2）；室外无人车数据只能证明各趟之间可重复。
 - 用新默认（`ba.min_range` 5 m）复测手持数据的 BA；原先怀疑的线束仰角误差在另两台手持设备上没有得到印证（4.3）。
 - 找一份有厘米级参照的车载数据验证绝对精度，例如全站仪控制点或密集地面扫描。
 - 没有柱的车库需要别的检查点，例如墙角、车位角或全站仪靶标（`points.csv`）。
 - 长走廊需要控制点或回环来约束航向。
 
 **真实数据（手持设备：Mandeye、Oxford Spires、Hilti）**
+- **Livox 的标线**：Skierniewice（Mandeye + Livox Mid-360）只检出 2 个车位、16 段标线，Livox 反射率图上的标线检测参数还没调（9.5）。
 - **BA 的近处回波**（已解决，4.3）：近处回波的毫米级偏差曾把手持走廊压弯；BA 现在只用 5 m 起的回波。长走廊竖向弯曲的约束本来就弱，其他系统误差仍可能顺着这个模态放大，验收时要看水平面误差的空间分布，而不只是 p95。
 - **无锚点趟次的粗对齐**（已实现，4.1、9.6）还有两处不足：
   - 各层完全相同、某一趟只走了一层时，几何上分不出楼层，这一趟不会被放置。要靠楼层标志的 OCR 或其他外观线索；
@@ -1948,6 +1955,8 @@ Python 部分：
   - 物体与地面接触处有边界渗漏；
   - 逐帧标签由点云渲染，边界不如 2D 掩膜。
 - 占据 IoU 还没有评测。
+- 没有人工标注，真实数据上给不出语义准确率（标注小样已备好，5.2）。
+- 合成数据上，排头会多检出半个车位（按同排连续编号补成"000"）。
 
 **工程**
 - **耗时**：逐帧标签和地面纹理已经按帧多线程（`frames.workers`、`floor_texture.workers`，0 表示每个 CPU 一个线程）。结果按帧序合并，产物与串行逐字节一致。合成车库（本机 8 核）：
@@ -1965,6 +1974,8 @@ Python 部分：
   - 地面箭头的栅格准备；
   - 路网编辑（合并、接入、碎片剪枝）、车位内缩与目标点、车道投影（shapely），是剩下最大的一块。
 - 部分旧 Python 模块（bev、static_map、数据读写等）仍按约 120 列写，尚未改成 Google 风格。
+- 分块建图默认关闭（`map.tile_size` 0），还没有按车库大小自动开启。
+- `semantics/adapters.py` 里 SAM 2、PaddleOCR 的旧占位已被 `models/` 的适配器取代，可以删掉。
 - 合成路线的转弯很急（每帧最多 45°），转角处的单帧旋转误差可达 1–3°；真实 10 Hz 数据的转角误差会小得多。
 
 ## 参考
